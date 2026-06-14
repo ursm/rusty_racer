@@ -154,6 +154,19 @@ Also available:
   isolate's heap. All realms are mutually same-origin (with a host namespace,
   `NS.contextGlobal(id)` reaches another realm's `globalThis`, like a same-origin
   `iframe.contentWindow`), so this is **not** an isolation boundary.
+- **Zero-copy buffer transfer between isolates** — with a host namespace,
+  `NS.transferOut(arrayBufferOrView)` detaches a buffer (its `byteLength` → 0) and
+  returns an integer token; `NS.transferIn(token)` rebuilds an `ArrayBuffer` over
+  the **same** memory in another isolate with no byte copy (the backing store is
+  heap-external and atomic-refcounted, so the token stays importable even after the
+  exporting isolate is disposed). `NS.transferOut` returns `0` for a non-buffer or
+  non-detachable argument — including a `SharedArrayBuffer`, which is *shared*, not
+  transferred — so the caller can fall back to a copy; `NS.transferIn` returns
+  `undefined` for an unknown token; `NS.transferDrop(token)` releases an exported
+  buffer that is never imported. This is the engine primitive for
+  implementing `postMessage` transferables; `RustyRacer.pending_transfer_count`
+  reports exported-but-not-yet-imported buffers so dropped messages don't leak
+  silently.
 - **`Isolate#perform_microtask_checkpoint`** — manual microtask drain. The default
   `microtasks: :auto` also drains at the end of each outermost eval/call/evaluate;
   `microtasks: :explicit` leaves it fully manual. There is no event loop or timers

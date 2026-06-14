@@ -647,6 +647,44 @@ static NEXT_ISOLATE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::Atomic
 // dispose isolates explicitly on their owner thread before that thread exits.
 static LEAKED_ISOLATES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+// ── zero-copy ArrayBuffer transfer registry ────────────────────────────────
+//
+// A SharedRef<BackingStore> parked here so a large ArrayBuffer can cross from one
+// isolate to another with NO byte copy. A backing store is V8's own heap-external,
+// atomic-refcounted allocation, designed to be co-owned by live ArrayBuffers "even
+// across isolates" (rusty_v8 ArrayBuffer docs). The embedder (capybara-simulated's
+// cross-isolate postMessage transport) exports a buffer from the source realm via
+// NS.transferOut, ships the returned integer token through its normal message
+// plumbing, and rebuilds an ArrayBuffer over the SAME memory in the destination
+// realm via NS.transferIn — replacing the prior copy-out/copy-in of the bytes.
+//
+// SharedRef<BackingStore> is NOT auto-Send (BackingStore is Send but not Sync, so
+// SharedPtrBase's `T: Sync` Send-bound is unmet). It rides in this newtype with a
+// manual Send for the same reason as SendIso/IsoPtr: the registry only ever MOVES
+// the handle between owner threads (insert on the exporter's thread, remove on the
+// importer's) under the Mutex, never sharing &handle concurrently — and shared_ptr's
+// refcount is atomic, so dropping it on either thread is sound. No Sync impl: the
+// handle is never aliased across threads.
+struct SendBackingStore(v8::SharedRef<v8::BackingStore>);
+unsafe impl Send for SendBackingStore {}
+
+// Exported-but-not-yet-imported backing stores, keyed by token. A GLOBAL (not
+// per-isolate): the whole point is to bridge two isolates, and tokens are unique
+// process-wide. An exported buffer that is never imported (a dropped message)
+// pins its memory here until NS.transferDrop releases it — RustyRacer
+// .pending_transfer_count makes that observable.
+static TRANSFER_REGISTRY: std::sync::OnceLock<Mutex<HashMap<u64, SendBackingStore>>> =
+    std::sync::OnceLock::new();
+
+fn transfer_registry() -> &'static Mutex<HashMap<u64, SendBackingStore>> {
+    TRANSFER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// Monotonic token source. Starts at 1 so 0 is free as the JS-side "not
+// transferable — fall back to a copy" sentinel. A token is f64-exact for ~2^53
+// transfers, which a process will never reach.
+static NEXT_TRANSFER_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 // Run a microtask checkpoint with DRAINING set (nesting-safe via save/restore),
 // so a nested Reset/DisposeContext issued by a drained microtask is refused.
 fn checkpoint_draining(scope: &mut v8::PinScope<'_, '_>) {
@@ -1317,6 +1355,105 @@ fn set_promise_reject_handler(
     }
 }
 
+// NS.transferOut(arrayBufferOrView) -> a positive integer token, or 0 when the
+// argument can't be zero-copy transferred so the caller falls back to a copy.
+// Grabs the buffer's backing store, DETACHES the source (transfer semantics: its
+// byteLength -> 0, like a structured-clone transfer list), and parks the store
+// under the returned token. The bytes are untouched — only the source realm
+// loses access. A view transfers its whole underlying ArrayBuffer.
+//
+// Returns 0 (copy fallback) for: a non-buffer argument; a non-detachable buffer
+// (WebAssembly/asm.js memory); and a SharedArrayBuffer or SAB-backed view — a
+// SAB is *shared*, not transferred (detaching it would be a category error), so
+// it has no place in this transfer primitive; sharing it zero-copy across
+// isolates would be a separate feature.
+fn transfer_out(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let value = args.get(0);
+    let ab = if value.is_array_buffer() {
+        v8::Local::<v8::ArrayBuffer>::try_from(value).ok()
+    } else if value.is_array_buffer_view() {
+        v8::Local::<v8::ArrayBufferView>::try_from(value)
+            .ok()
+            .and_then(|view| view.buffer(scope))
+    } else {
+        None
+    };
+    // Only transfer what we can neuter: zero-copy sharing a buffer the source
+    // realm keeps live would alias mutable memory across isolates. Caller copies.
+    let Some(ab) = ab.filter(|ab| ab.is_detachable()) else {
+        rv.set(v8::Number::new(scope, 0.0).into());
+        return;
+    };
+    // Grab the store BEFORE detaching — detach severs the buffer from it; the
+    // SharedRef then keeps the memory alive on its own via the atomic refcount.
+    let store = ab.get_backing_store();
+    // is_detachable() does NOT guarantee detach succeeds: a buffer carrying an
+    // [[ArrayBufferDetachKey]] returns None here and stays live. Register only
+    // once the source is genuinely neutered, else both realms would alias one
+    // backing store. (rusty_racer sets no detach keys today, so this is belt-and-
+    // braces against the safety invariant ever silently breaking.)
+    if ab.detach(None) != Some(true) {
+        rv.set(v8::Number::new(scope, 0.0).into());
+        return;
+    }
+    let token = NEXT_TRANSFER_TOKEN.fetch_add(1, Ordering::Relaxed);
+    transfer_registry()
+        .lock()
+        .unwrap()
+        .insert(token, SendBackingStore(store));
+    rv.set(v8::Number::new(scope, token as f64).into());
+}
+
+// Parse a transfer-token argument: a finite, integral JS number >= 1 (0 is the
+// "not transferable" sentinel transferOut never issues, and tokens are f64-exact
+// only up to 2^53). Rejects NaN / Infinity / fractional / negative / out-of-range
+// values — which a bare `as u64` would truncate or saturate into a COLLISION with
+// a live token, stealing an unrelated transfer — so a malformed token instead
+// reads as "unknown" (transferIn -> undefined, transferDrop -> no-op). Must run
+// before locking the registry: number_value can invoke a user valueOf/
+// Symbol.toPrimitive, i.e. re-enter these callbacks.
+fn transfer_token(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) -> Option<u64> {
+    let n = value.number_value(scope)?;
+    (n.is_finite() && n.fract() == 0.0 && (1.0..=9_007_199_254_740_992.0).contains(&n))
+        .then_some(n as u64)
+}
+
+// NS.transferIn(token) -> a fresh ArrayBuffer over the transferred backing store
+// (no byte copy), or undefined for an unknown token (already imported, or the
+// message was dropped). Consumes the token: the new buffer co-owns the store, so
+// the registry's reference is released.
+fn transfer_in(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(token) = transfer_token(scope, args.get(0)) else {
+        return;
+    };
+    let entry = transfer_registry().lock().unwrap().remove(&token);
+    if let Some(SendBackingStore(store)) = entry {
+        rv.set(v8::ArrayBuffer::with_backing_store(scope, &store).into());
+    }
+}
+
+// NS.transferDrop(token): release a transferred backing store WITHOUT importing
+// it — for when the embedder discards a message whose buffer was exported.
+// A no-op for an unknown token. Without this, an exported-but-never-imported
+// buffer would pin its memory until process exit.
+fn transfer_drop(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    if let Some(token) = transfer_token(scope, args.get(0)) {
+        transfer_registry().lock().unwrap().remove(&token);
+    }
+}
+
 // V8 calls this synchronously on promise rejections with no handler (and the
 // later revocations when a handler IS added). Forwards
 // (event, contextId, promise, reason) to the registered JS recorder — the
@@ -1433,7 +1570,7 @@ fn install_host_namespace(
     let context = v8::Local::new(scope, ctx);
     let scope = &mut v8::ContextScope::new(scope, context);
     let ns = v8::Object::new(scope);
-    let members: [(&str, Option<v8::Local<v8::Function>>); 4] = [
+    let members: [(&str, Option<v8::Local<v8::Function>>); 7] = [
         ("drainMicrotasks", v8::Function::new(scope, drain_microtasks)),
         ("contextGlobal", v8::Function::new(scope, context_global)),
         ("contextOf", v8::Function::new(scope, context_of)),
@@ -1441,6 +1578,9 @@ fn install_host_namespace(
             "setPromiseRejectHandler",
             v8::Function::new(scope, set_promise_reject_handler),
         ),
+        ("transferOut", v8::Function::new(scope, transfer_out)),
+        ("transferIn", v8::Function::new(scope, transfer_in)),
+        ("transferDrop", v8::Function::new(scope, transfer_drop)),
     ];
     for (member, function) in members {
         if let (Some(f), Some(k)) = (function, v8::String::new(scope, member)) {
@@ -2284,6 +2424,17 @@ fn leaked_isolate_count() -> usize {
     LEAKED_ISOLATES.load(Ordering::Relaxed)
 }
 
+// RustyRacer.pending_transfer_count -> Integer: backing stores exported via
+// NS.transferOut but not yet imported (NS.transferIn) or released
+// (NS.transferDrop). PROCESS-WIDE (the registry bridges isolates, so the count
+// aggregates every isolate's outstanding transfers — compare deltas, not the
+// absolute value, when isolates run concurrently). A transport that always pairs
+// an export with one of those keeps its own contribution at 0; a rising count
+// means dropped messages are leaking transferred memory.
+fn pending_transfer_count() -> usize {
+    transfer_registry().lock().unwrap().len()
+}
+
 // Thin magnus-method wrappers.
 // Isolate = the VM and its isolate-level operations; it hands out Contexts.
 impl Isolate {
@@ -2818,5 +2969,6 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     // Observability for the thread-confined lifecycle (see Drop for Core).
     module.define_singleton_method("live_isolate_count", function!(live_isolate_count, 0))?;
     module.define_singleton_method("leaked_isolate_count", function!(leaked_isolate_count, 0))?;
+    module.define_singleton_method("pending_transfer_count", function!(pending_transfer_count, 0))?;
     Ok(())
 }

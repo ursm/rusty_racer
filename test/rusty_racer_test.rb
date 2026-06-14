@@ -1394,6 +1394,129 @@ class RustyRacerTest < Minitest::Test
     assert_equal Encoding::ASCII_8BIT, sab.encoding
   end
 
+  def test_transfer_out_in_round_trips_a_buffer_across_isolates
+    # NS.transferOut hands a buffer's backing store to a global registry and
+    # returns a token; NS.transferIn rebuilds an ArrayBuffer over the SAME memory
+    # in another isolate (zero copy) — the cross-isolate half of postMessage
+    # transferables. The bytes must survive the trip intact.
+    src = RustyRacer::Isolate.new(host_namespace: "NS").context
+    dst = RustyRacer::Isolate.new(host_namespace: "NS").context
+    token = src.eval("NS.transferOut(new Uint8Array([10, 20, 30, 40]).buffer)")
+    assert_operator token, :>, 0
+    dst.eval("globalThis.__t = #{token.to_i}")
+    bytes = dst.eval("Array.from(new Uint8Array(NS.transferIn(__t)))")
+    assert_equal [10, 20, 30, 40], bytes
+  end
+
+  def test_transfer_out_detaches_the_source
+    # transfer semantics: after exporting, the source buffer is neutered
+    # (byteLength 0, detached true) — the memory now belongs to the recipient.
+    ctx = RustyRacer::Isolate.new(host_namespace: "NS").context
+    detached = ctx.eval(<<~JS)
+      const buf = new Uint8Array([1, 2, 3, 4]).buffer;
+      NS.transferOut(buf);
+      buf.byteLength === 0 && buf.detached === true;
+    JS
+    assert_equal true, detached
+  end
+
+  def test_transferred_buffer_survives_source_isolate_dispose
+    # the backing store is V8's heap-external, atomic-refcounted allocation, so a
+    # token stays importable even after the EXPORTING isolate is fully disposed —
+    # the registry's reference keeps the memory alive on its own.
+    src = RustyRacer::Isolate.new(host_namespace: "NS")
+    dst = RustyRacer::Isolate.new(host_namespace: "NS").context
+    token = src.context.eval("NS.transferOut(new Uint8Array([7, 8, 9]).buffer)")
+    src.dispose
+    GC.start
+    dst.eval("globalThis.__t = #{token.to_i}")
+    assert_equal [7, 8, 9], dst.eval("Array.from(new Uint8Array(NS.transferIn(__t)))")
+  end
+
+  def test_transfer_in_works_from_another_thread
+    # csim's window and worker isolates live on different threads, so a token
+    # exported on one thread must import on another — exercises the manual Send on
+    # the backing-store handle (the registry moves it between owner threads).
+    src = RustyRacer::Isolate.new(host_namespace: "NS").context
+    token = src.eval("NS.transferOut(new Uint8Array([100, 101]).buffer)")
+    bytes = Thread.new {
+      dst = RustyRacer::Isolate.new(host_namespace: "NS").context
+      dst.eval("globalThis.__t = #{token.to_i}")
+      dst.eval("Array.from(new Uint8Array(NS.transferIn(__t)))")
+    }.value
+    assert_equal [100, 101], bytes
+  end
+
+  def test_transfer_out_returns_zero_for_non_transferable
+    # a non-ArrayBuffer argument (or a non-detachable buffer) can't be zero-copy
+    # transferred; transferOut returns 0 so the caller falls back to a copy.
+    ctx = RustyRacer::Isolate.new(host_namespace: "NS").context
+    assert_equal true, ctx.eval("NS.transferOut(123) === 0")
+    assert_equal true, ctx.eval("NS.transferOut('not a buffer') === 0")
+  end
+
+  def test_transfer_in_unknown_token_is_undefined
+    # an unknown token (already imported, or a dropped message) yields undefined
+    # rather than throwing, so the recipient can detect a lost transfer.
+    ctx = RustyRacer::Isolate.new(host_namespace: "NS").context
+    assert_equal true, ctx.eval("NS.transferIn(999999) === undefined")
+  end
+
+  def test_transfer_in_rejects_non_integer_tokens_instead_of_truncating
+    # a fractional/NaN/negative token must NOT truncate-and-collide with a live
+    # token (1.9 -> 1 would steal token 1's buffer); it reads as unknown.
+    src = RustyRacer::Isolate.new(host_namespace: "NS").context
+    dst = RustyRacer::Isolate.new(host_namespace: "NS").context
+    token = src.eval("NS.transferOut(new Uint8Array([1, 2, 3]).buffer)")
+    dst.eval("globalThis.__t = #{token.to_i}")
+    # a fractional neighbour of the real token imports nothing and leaves the
+    # real token intact
+    assert_equal true, dst.eval("NS.transferIn(__t + 0.5) === undefined")
+    assert_equal true, dst.eval("NS.transferIn(NaN) === undefined")
+    assert_equal true, dst.eval("NS.transferIn(-1) === undefined")
+    # the genuine integer token still works afterward
+    assert_equal [1, 2, 3], dst.eval("Array.from(new Uint8Array(NS.transferIn(__t)))")
+  end
+
+  def test_transfer_out_returns_zero_for_shared_array_buffer
+    # a SharedArrayBuffer is shared, not transferred — transferOut declines it
+    # (returns 0) rather than detaching it.
+    ctx = RustyRacer::Isolate.new(host_namespace: "NS").context
+    assert_equal true, ctx.eval("NS.transferOut(new SharedArrayBuffer(8)) === 0")
+    assert_equal true, ctx.eval("NS.transferOut(new Uint8Array(new SharedArrayBuffer(8))) === 0")
+  end
+
+  def test_transfer_drop_and_pending_transfer_count_release_memory
+    # an exported-but-never-imported buffer pins its memory; transferDrop releases
+    # it without importing, and pending_transfer_count makes the leak observable.
+    ctx = RustyRacer::Isolate.new(host_namespace: "NS").context
+    before = RustyRacer.pending_transfer_count
+    ctx.eval("globalThis.__tok = NS.transferOut(new Uint8Array([1, 2]).buffer)")
+    assert_equal before + 1, RustyRacer.pending_transfer_count
+    ctx.eval("NS.transferDrop(__tok)")
+    assert_equal before, RustyRacer.pending_transfer_count
+  end
+
+  def test_transfer_round_trip_survives_gc_stress_with_a_large_buffer
+    # a multi-megabyte buffer round-trips byte-for-byte even under GC.stress —
+    # guards the backing-store lifetime across the export/dispose-pressure/import
+    # window.
+    src = RustyRacer::Isolate.new(host_namespace: "NS").context
+    dst = RustyRacer::Isolate.new(host_namespace: "NS").context
+    GC.stress = true
+    begin
+      token = src.eval("const u = new Uint8Array(4 * 1024 * 1024); u[0] = 1; u[u.length - 1] = 255; NS.transferOut(u.buffer)")
+      dst.eval("globalThis.__t = #{token.to_i}")
+      ok = dst.eval(<<~JS)
+        const v = new Uint8Array(NS.transferIn(__t));
+        v.length === 4 * 1024 * 1024 && v[0] === 1 && v[v.length - 1] === 255;
+      JS
+      assert_equal true, ok
+    ensure
+      GC.stress = false
+    end
+  end
+
   def test_binary_symbol_value_raises_curated_encoding_error
     # a binary-encoded Symbol value can't become a JS string; the error is the
     # binding's curated EncodingError, not a raw magnus "expected utf-8" message
