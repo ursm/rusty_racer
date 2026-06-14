@@ -649,23 +649,33 @@ static LEAKED_ISOLATES: std::sync::atomic::AtomicUsize = std::sync::atomic::Atom
 
 // ── zero-copy ArrayBuffer transfer registry ────────────────────────────────
 //
-// A SharedRef<BackingStore> parked here so a large ArrayBuffer can cross from one
-// isolate to another with NO byte copy. A backing store is V8's own heap-external,
+// A SharedRef<BackingStore> parked here so a buffer can cross from one isolate to
+// another with NO byte copy. A backing store is V8's own heap-external,
 // atomic-refcounted allocation, designed to be co-owned by live ArrayBuffers "even
 // across isolates" (rusty_v8 ArrayBuffer docs). The embedder (capybara-simulated's
-// cross-isolate postMessage transport) exports a buffer from the source realm via
-// NS.transferOut, ships the returned integer token through its normal message
-// plumbing, and rebuilds an ArrayBuffer over the SAME memory in the destination
-// realm via NS.transferIn — replacing the prior copy-out/copy-in of the bytes.
+// cross-isolate postMessage transport) exports a buffer from the source realm,
+// ships the returned integer token through its normal message plumbing, and
+// rebuilds a buffer over the SAME memory in the destination realm — replacing the
+// prior copy-out/copy-in of the bytes. Two flavours share this registry:
+//   - TRANSFER (NS.transferOut/transferIn): an ArrayBuffer; the source is detached
+//     (moved). The recipient gets an ArrayBuffer.
+//   - SHARE (NS.shareOut/shareIn): a SharedArrayBuffer; the source stays live and
+//     both realms see each other's writes (Atomics work across them). The
+//     recipient gets a SharedArrayBuffer.
+// `shared` records which, so the matching import rebuilds the right type and a
+// crossed import (transferIn of a share token, or vice versa) is refused.
 //
 // SharedRef<BackingStore> is NOT auto-Send (BackingStore is Send but not Sync, so
-// SharedPtrBase's `T: Sync` Send-bound is unmet). It rides in this newtype with a
+// SharedPtrBase's `T: Sync` Send-bound is unmet). It rides in this struct with a
 // manual Send for the same reason as SendIso/IsoPtr: the registry only ever MOVES
 // the handle between owner threads (insert on the exporter's thread, remove on the
 // importer's) under the Mutex, never sharing &handle concurrently — and shared_ptr's
 // refcount is atomic, so dropping it on either thread is sound. No Sync impl: the
 // handle is never aliased across threads.
-struct SendBackingStore(v8::SharedRef<v8::BackingStore>);
+struct SendBackingStore {
+    store: v8::SharedRef<v8::BackingStore>,
+    shared: bool,
+}
 unsafe impl Send for SendBackingStore {}
 
 // Exported-but-not-yet-imported backing stores, keyed by token. A GLOBAL (not
@@ -1363,10 +1373,9 @@ fn set_promise_reject_handler(
 // loses access. A view transfers its whole underlying ArrayBuffer.
 //
 // Returns 0 (copy fallback) for: a non-buffer argument; a non-detachable buffer
-// (WebAssembly/asm.js memory); and a SharedArrayBuffer or SAB-backed view — a
-// SAB is *shared*, not transferred (detaching it would be a category error), so
-// it has no place in this transfer primitive; sharing it zero-copy across
-// isolates would be a separate feature.
+// (WebAssembly/asm.js memory); and a SharedArrayBuffer or SAB-backed view — a SAB
+// is *shared*, not transferred (detaching it would be a category error), so it
+// belongs to NS.shareOut, not here.
 fn transfer_out(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -1404,12 +1413,36 @@ fn transfer_out(
     transfer_registry()
         .lock()
         .unwrap()
-        .insert(token, SendBackingStore(store));
+        .insert(token, SendBackingStore { store, shared: false });
+    rv.set(v8::Number::new(scope, token as f64).into());
+}
+
+// NS.shareOut(sharedArrayBuffer) -> a positive integer token, or 0 for a
+// non-SharedArrayBuffer argument (so the caller falls back to a copy). Unlike
+// transferOut this does NOT detach: a SAB is *shared*, so the source realm keeps
+// its live SAB and the recipient's shareIn'd SAB sees the same memory (Atomics
+// work across them). Takes a bare SAB; for a SAB-backed view the caller passes
+// view.buffer.
+fn share_out(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Ok(sab) = v8::Local::<v8::SharedArrayBuffer>::try_from(args.get(0)) else {
+        rv.set(v8::Number::new(scope, 0.0).into());
+        return;
+    };
+    let store = sab.get_backing_store();
+    let token = NEXT_TRANSFER_TOKEN.fetch_add(1, Ordering::Relaxed);
+    transfer_registry()
+        .lock()
+        .unwrap()
+        .insert(token, SendBackingStore { store, shared: true });
     rv.set(v8::Number::new(scope, token as f64).into());
 }
 
 // Parse a transfer-token argument: a finite, integral JS number >= 1 (0 is the
-// "not transferable" sentinel transferOut never issues, and tokens are f64-exact
+// "not transferable" sentinel the *Out fns never issue, and tokens are f64-exact
 // only up to 2^53). Rejects NaN / Infinity / fractional / negative / out-of-range
 // values — which a bare `as u64` would truncate or saturate into a COLLISION with
 // a live token, stealing an unrelated transfer — so a malformed token instead
@@ -1422,10 +1455,23 @@ fn transfer_token(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>)
         .then_some(n as u64)
 }
 
+// Consume a token whose kind matches |want_shared| (a transfer token for
+// transferIn, a share token for shareIn). Peeks the kind under the lock and only
+// removes on a match, so a crossed import (transferIn of a share token, or vice
+// versa) leaves the entry intact and reads as undefined instead of rebuilding the
+// wrong buffer type over the memory.
+fn take_store(token: u64, want_shared: bool) -> Option<v8::SharedRef<v8::BackingStore>> {
+    let mut reg = transfer_registry().lock().unwrap();
+    match reg.get(&token) {
+        Some(e) if e.shared == want_shared => reg.remove(&token).map(|e| e.store),
+        _ => None,
+    }
+}
+
 // NS.transferIn(token) -> a fresh ArrayBuffer over the transferred backing store
-// (no byte copy), or undefined for an unknown token (already imported, or the
-// message was dropped). Consumes the token: the new buffer co-owns the store, so
-// the registry's reference is released.
+// (no byte copy), or undefined for an unknown/crossed token (already imported, the
+// message was dropped, or it was a share token). Consumes the token: the new
+// buffer co-owns the store, so the registry's reference is released.
 fn transfer_in(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -1434,16 +1480,30 @@ fn transfer_in(
     let Some(token) = transfer_token(scope, args.get(0)) else {
         return;
     };
-    let entry = transfer_registry().lock().unwrap().remove(&token);
-    if let Some(SendBackingStore(store)) = entry {
+    if let Some(store) = take_store(token, false) {
         rv.set(v8::ArrayBuffer::with_backing_store(scope, &store).into());
     }
 }
 
-// NS.transferDrop(token): release a transferred backing store WITHOUT importing
-// it — for when the embedder discards a message whose buffer was exported.
-// A no-op for an unknown token. Without this, an exported-but-never-imported
-// buffer would pin its memory until process exit.
+// NS.shareIn(token) -> a fresh SharedArrayBuffer over the shared backing store
+// (same memory as the source's SAB), or undefined for an unknown/crossed token.
+fn share_in(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(token) = transfer_token(scope, args.get(0)) else {
+        return;
+    };
+    if let Some(store) = take_store(token, true) {
+        rv.set(v8::SharedArrayBuffer::with_backing_store(scope, &store).into());
+    }
+}
+
+// NS.transferDrop(token): release a parked backing store (transfer OR share)
+// WITHOUT importing it — for when the embedder discards a message whose buffer was
+// exported. A no-op for an unknown token. Without this, an exported-but-never-
+// imported buffer would pin its memory until process exit.
 fn transfer_drop(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -1570,7 +1630,7 @@ fn install_host_namespace(
     let context = v8::Local::new(scope, ctx);
     let scope = &mut v8::ContextScope::new(scope, context);
     let ns = v8::Object::new(scope);
-    let members: [(&str, Option<v8::Local<v8::Function>>); 7] = [
+    let members: [(&str, Option<v8::Local<v8::Function>>); 9] = [
         ("drainMicrotasks", v8::Function::new(scope, drain_microtasks)),
         ("contextGlobal", v8::Function::new(scope, context_global)),
         ("contextOf", v8::Function::new(scope, context_of)),
@@ -1580,6 +1640,8 @@ fn install_host_namespace(
         ),
         ("transferOut", v8::Function::new(scope, transfer_out)),
         ("transferIn", v8::Function::new(scope, transfer_in)),
+        ("shareOut", v8::Function::new(scope, share_out)),
+        ("shareIn", v8::Function::new(scope, share_in)),
         ("transferDrop", v8::Function::new(scope, transfer_drop)),
     ];
     for (member, function) in members {

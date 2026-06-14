@@ -1517,6 +1517,60 @@ class RustyRacerTest < Minitest::Test
     end
   end
 
+  def test_share_out_in_shares_memory_across_isolates
+    # a SharedArrayBuffer is *shared*, not transferred: shareOut keeps the source
+    # live and shareIn rebuilds a SharedArrayBuffer over the SAME memory, so a
+    # write in one isolate is visible in the other (and Atomics work across them).
+    src = RustyRacer::Isolate.new(host_namespace: "NS").context
+    dst = RustyRacer::Isolate.new(host_namespace: "NS").context
+    token = src.eval("globalThis.s = new SharedArrayBuffer(8); new Uint8Array(s).set([1, 2, 3, 4]); NS.shareOut(s)")
+    assert_operator token, :>, 0
+    # source is NOT detached (unlike transferOut)
+    assert_equal 8, src.eval("s.byteLength")
+    dst.eval("globalThis.shared = NS.shareIn(#{token.to_i})")
+    assert_equal true, dst.eval("shared instanceof SharedArrayBuffer")
+    assert_equal [1, 2, 3, 4], dst.eval("Array.from(new Uint8Array(shared, 0, 4))")
+    # write in dst, read in src — proves it is the SAME backing memory
+    dst.eval("new Uint8Array(shared)[0] = 99; Atomics.store(new Int32Array(shared), 1, 7)")
+    assert_equal 99, src.eval("new Uint8Array(s)[0]")
+    assert_equal 7, src.eval("Atomics.load(new Int32Array(s), 1)")
+  end
+
+  def test_share_works_across_threads_with_atomics
+    # csim's window and worker isolates share a SAB across threads; a worker-thread
+    # Atomics write must be visible to the main thread through the shared memory.
+    main = RustyRacer::Isolate.new(host_namespace: "NS").context
+    token = main.eval("globalThis.s = new SharedArrayBuffer(16); NS.shareOut(s)")
+    Thread.new {
+      w = RustyRacer::Isolate.new(host_namespace: "NS").context
+      w.eval("const ia = new Int32Array(NS.shareIn(#{token.to_i})); Atomics.store(ia, 0, 42); Atomics.store(ia, 1, 1234)")
+    }.join
+    assert_equal [42, 1234], main.eval("[Atomics.load(new Int32Array(s), 0), Atomics.load(new Int32Array(s), 1)]")
+  end
+
+  def test_share_out_returns_zero_for_non_shared_array_buffer
+    # shareOut only accepts a SharedArrayBuffer; a plain ArrayBuffer (which would
+    # go through transferOut) or a non-buffer returns 0.
+    ctx = RustyRacer::Isolate.new(host_namespace: "NS").context
+    assert_equal true, ctx.eval("NS.shareOut(new ArrayBuffer(4)) === 0")
+    assert_equal true, ctx.eval("NS.shareOut(42) === 0")
+  end
+
+  def test_transfer_and_share_tokens_do_not_cross
+    # a token's kind is enforced: transferIn refuses a share token and shareIn
+    # refuses a transfer token (rebuilding the wrong buffer type over the memory),
+    # and the refused token stays parked (not consumed).
+    src = RustyRacer::Isolate.new(host_namespace: "NS").context
+    dst = RustyRacer::Isolate.new(host_namespace: "NS").context
+    share_tok = src.eval("NS.shareOut(new SharedArrayBuffer(8))")
+    xfer_tok  = src.eval("NS.transferOut(new Uint8Array([1, 2]).buffer)")
+    assert_equal true, dst.eval("NS.transferIn(#{share_tok.to_i}) === undefined")
+    assert_equal true, dst.eval("NS.shareIn(#{xfer_tok.to_i}) === undefined")
+    # the correctly-typed imports still work afterward (tokens were not consumed)
+    assert_equal true, dst.eval("NS.shareIn(#{share_tok.to_i}) instanceof SharedArrayBuffer")
+    assert_equal [1, 2], dst.eval("Array.from(new Uint8Array(NS.transferIn(#{xfer_tok.to_i})))")
+  end
+
   def test_binary_symbol_value_raises_curated_encoding_error
     # a binary-encoded Symbol value can't become a JS string; the error is the
     # binding's curated EncodingError, not a raw magnus "expected utf-8" message
