@@ -574,7 +574,7 @@ fn op_reset(scope: &mut v8::PinScope<'_, '_, ()>, context_id: i32) -> VmReply {
                 .into(),
         )))
     } else {
-        let fresh = new_realm(scope, context_id);
+        let fresh = new_realm(scope);
         {
             let realms = &mut istate!(scope).realms;
             if context_id == 0 {
@@ -596,7 +596,7 @@ fn op_create_context(scope: &mut v8::PinScope<'_, '_, ()>) -> VmReply {
         realms.next_context_id += 1;
         id
     };
-    let fresh = new_realm(scope, id);
+    let fresh = new_realm(scope);
     istate!(scope).realms.contexts.insert(id, fresh);
     VmReply::Done(Ok(JsVal::Int(id as i64)))
 }
