@@ -534,11 +534,6 @@ struct V8State {
     promise_reject_handler: Option<(i32, v8::Global<v8::Function>)>,
 }
 
-// Context embedder-data slot holding the realm id (an Integer), stamped by
-// new_realm so id_of_context is O(1). Slot 0 is the embedder's own first slot
-// (the binding adds INTERNAL_SLOT_COUNT); nothing else here uses embedder data.
-const REALM_ID_SLOT: i32 = 0;
-
 // (STATE/MODULES/SCRIPTS/ACTIVE_REALMS/INSTANTIATING/WATCHDOG_FIRED/
 // AUTO_MICROTASKS/DRAINING moved into IsolateState in the isolate slot, reached
 // via istate!(scope). Their invariants are documented on IsolateState's fields.)
@@ -1015,17 +1010,35 @@ fn finish_dynamic_import(
     }
 }
 
-// The id of |context|, read O(1) from the realm-id stamped in by new_realm.
-// None when the context is not a LIVE realm of this isolate — a context reset
-// away still carries its old stamp, so confirm the id currently maps back to
-// this very context before trusting it.
+// The id of |context| among this isolate's LIVE realms, or None when it isn't
+// one (e.g. a context that was reset or disposed away). Scans the realm table:
+// realm counts are small (a handful of frames) and this only runs off the hot
+// path (promise rejection, dynamic import, contextOf), so the scan is cheap.
+//
+// We deliberately do NOT stamp the id into the context's embedder data. Using a
+// context slot makes V8 attach a ContextAnnex carrying a guaranteed-finalizer
+// weak handle to every realm, and that finalizer has crashed the process at
+// isolate teardown (a first-pass weak callback re-fired during disposal,
+// panicking on an already-taken handle). Keeping realms free of context slots
+// keeps teardown clear of that hazard.
 fn id_of_context(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::Context>) -> Option<i32> {
-    let id = context
-        .get_embedder_data(scope, REALM_ID_SLOT)
-        .and_then(|v| v.int32_value(scope))?;
-    let current = context_for(istate!(scope), id);
-    let live = current.is_some_and(|g| v8::Local::new(scope, &g) == context);
-    live.then_some(id)
+    // The main realm (id 0) is overwhelmingly the common case — check it first,
+    // without cloning the whole table.
+    let main = istate!(scope).realms.main_context.clone();
+    if main.is_some_and(|g| v8::Local::new(scope, &g) == context) {
+        return Some(0);
+    }
+    // Extra realms: snapshot the (cloned) Globals so no IsolateState borrow is
+    // held while we mint Locals from `scope`.
+    let extras: Vec<(i32, v8::Global<v8::Context>)> = istate!(scope)
+        .realms
+        .contexts
+        .iter()
+        .map(|(id, g)| (*id, g.clone()))
+        .collect();
+    extras
+        .into_iter()
+        .find_map(|(id, g)| (v8::Local::new(scope, &g) == context).then_some(id))
 }
 
 // Pick the Global context for a realm id: 0 = main, N = an extra realm (None
@@ -1363,18 +1376,11 @@ unsafe extern "C" fn promise_reject_cb(message: v8::PromiseRejectMessage) {
 // Build a fresh v8::Context and install the host namespace (from STATE) into
 // it — the single definition of "a realm of this isolate", shared by boot,
 // reset and create_context so realms can't drift apart.
-fn new_realm(scope: &mut v8::PinScope<'_, '_, ()>, id: i32) -> v8::Global<v8::Context> {
+fn new_realm(scope: &mut v8::PinScope<'_, '_, ()>) -> v8::Global<v8::Context> {
     let fresh = {
         let context = v8::Context::new(scope, Default::default());
         v8::Global::new(scope, context)
     };
-    // Stamp the realm id into the context so id_of_context is O(1) (it would
-    // otherwise scan every realm on every promise rejection / contextOf call).
-    {
-        let context = v8::Local::new(scope, &fresh);
-        let id_val: v8::Local<v8::Value> = v8::Integer::new(scope, id).into();
-        context.set_embedder_data(REALM_ID_SLOT, id_val);
-    }
     // DESIGN DECISION: every realm of an isolate shares ONE security token, so
     // they are all mutually same-origin — the model is "a group of same-origin
     // frames sharing one heap", and NS.contextGlobal gives full cross-realm
@@ -1620,7 +1626,7 @@ impl Isolate {
         // namespace from the slot (seeded above).
         {
             v8::scope!(let scope, &mut isolate);
-            let main_context = new_realm(scope, 0);
+            let main_context = new_realm(scope);
             istate!(scope).realms.main_context = Some(main_context);
         }
         // Box the OwnedIsolate so it has a STABLE address, then capture a raw ptr

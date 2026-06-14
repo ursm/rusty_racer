@@ -465,6 +465,32 @@ class RustyRacerTest < Minitest::Test
     end
   end
 
+  def test_realm_churn_and_teardown_survive_gc
+    # Realms used to stamp their id into the V8 context's embedder data, which
+    # makes V8 attach a ContextAnnex carrying a guaranteed-finalizer weak handle
+    # to every realm. At isolate teardown a first-pass weak callback could re-fire
+    # during disposal and abort the process. id_of_context now scans the realm
+    # table instead, so realms carry no context slots. Churn realms (create, use,
+    # dispose) and tear the isolate down under GC.stress: the path that built and
+    # finalized those weak handles must complete without aborting.
+    GC.stress = true
+    begin
+      10.times do
+        iso = RustyRacer::Isolate.new
+        5.times do
+          realm = iso.create_context
+          realm.eval("var a = []; for (let i = 0; i < 500; i++) a.push({x: i}); a.length")
+          realm.dispose
+          iso.context.eval("({ ok: true })")
+        end
+        iso.dispose
+      end
+    ensure
+      GC.stress = false
+    end
+    pass
+  end
+
   def test_context_default_timeout
     ctx = RustyRacer::Isolate.new(timeout_ms: 50).context
     assert_raises(RustyRacer::ScriptTerminatedError) { ctx.eval("for(;;){}") }
