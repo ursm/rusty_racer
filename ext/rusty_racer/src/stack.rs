@@ -6,6 +6,9 @@
 // STACK_DEBUG (set at init); everything else is private to this module.
 
 use std::ffi::c_void;
+// Only native_stack_bounds (linux) needs it; gated so non-linux builds (macOS)
+// don't warn it unused.
+#[cfg(target_os = "linux")]
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
 
