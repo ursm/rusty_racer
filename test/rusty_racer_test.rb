@@ -625,12 +625,53 @@ class RustyRacerTest < Minitest::Test
     assert_raises(RustyRacer::RuntimeError) { @ctx.call("(()=>42)") }
   end
 
-  def test_js_map_marshals_to_ruby_hash
+  def test_js_map_marshals_to_ruby_jsmap
     h = @ctx.eval('new Map([["a", 1], [2, "two"], ["nested", {x: 9}]])')
+    # surfaces as RustyRacer::JSMap, a Hash subclass — reads like a Hash...
+    assert_instance_of RustyRacer::JSMap, h
     assert_kind_of Hash, h
     assert_equal 1, h["a"]
     assert_equal "two", h[2]            # non-string key preserved
     assert_equal({"x" => 9}, h["nested"])
+  end
+
+  def test_js_map_round_trips_back_to_a_js_map
+    # JS Map -> Ruby JSMap -> JS Map: the type is preserved (not degraded to a
+    # plain object), and non-string / object keys survive the round-trip. This is
+    # what lets csim postMessage a Map window<->worker without losing it.
+    src = RustyRacer::Isolate.new.context
+    dst = RustyRacer::Isolate.new.context
+    m = src.eval('new Map([["a", 1], [2, "two"], [{k: 9}, [3, 4]]])')
+    dst.eval(<<~JS)
+      function probe(x) {
+        return [
+          x instanceof Map,
+          x.get("a"),
+          x.get(2),                                   // numeric key
+          Array.from(x.keys()).map((k) => typeof k),  // key types preserved
+          x.size,
+        ];
+      }
+    JS
+    assert_equal [true, 1, "two", %w[string number object], 3], dst.call("probe", m)
+  end
+
+  def test_ruby_jsmap_marshals_to_js_map
+    # a Ruby-constructed RustyRacer::JSMap becomes a JS Map (a plain Hash stays a
+    # JS object — see the next test), so the embedder can hand a Map to JS.
+    jm = RustyRacer::JSMap.new
+    jm["a"] = 1
+    jm[2] = "two"
+    @ctx.eval('function probe(x) { return [x instanceof Map, x.get(2), x.size] }')
+    assert_equal [true, "two", 2], @ctx.call("probe", jm)
+  end
+
+  def test_plain_hash_still_marshals_to_js_object
+    # regression: only a JSMap becomes a Map; an ordinary Hash (incl. one with
+    # non-string keys) must still marshal to a plain JS object as before.
+    @ctx.eval('function kindOf(x) { return x instanceof Map ? "Map" : x.constructor.name }')
+    assert_equal "Object", @ctx.call("kindOf", {"x" => 1})
+    assert_equal "Object", @ctx.call("kindOf", {1 => "a"})
   end
 
   def test_js_set_marshals_to_ruby_set

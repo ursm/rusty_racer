@@ -15,7 +15,10 @@ Embed [V8](https://v8.dev/) in Ruby, built on [rusty_v8](https://crates.io/crate
   not just classic scripts.
 - **Faithful value marshalling**: `BigInt`, `Date`, `Map`, `Set`, typed binary
   (`Uint8Array`/`ArrayBuffer` ↔ binary `String`), and shared/cyclic object
-  graphs all round-trip — no lossy JSON hop.
+  graphs all round-trip — no lossy JSON hop. A JS `Map` surfaces in Ruby as a
+  `RustyRacer::JSMap` (a `Hash` subclass — it reads like a `Hash` but keeps its
+  non-string keys) and marshals back to a JS `Map`; a plain `Hash` still maps to a
+  JS object.
 - **In-thread execution** — V8 runs on the calling Ruby thread, with no dedicated
   V8 thread and no per-op thread hop; fast when you run many small ops.
 - **Drop-in [ExecJS](#execjs) runtime** — any ExecJS consumer switches with no
@@ -58,7 +61,7 @@ ctx.eval("1 + 1")                        # => 2
 ctx.eval("({a: 1, b: [true, 'x']})")     # => {"a"=>1, "b"=>[true, "x"]}
 
 # Call a JS function with marshalled args (BigInt/Date/Map/Set/shared refs
-# all round-trip faithfully).
+# all round-trip faithfully; a JS Map surfaces as a RustyRacer::JSMap).
 ctx.eval("function add(a, b) { return a + b }")
 ctx.call("add", 20, 22)                  # => 42
 ctx.call_void("doSideEffect")            # runs it; never marshals the return
