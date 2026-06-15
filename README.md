@@ -38,12 +38,15 @@ Embed [V8](https://v8.dev/) in Ruby, built on [rusty_v8](https://crates.io/crate
 incumbent — if you want a battle-tested binding or **Windows** support, reach for
 it. rusty_racer differs where it counts for some workloads: native **ES modules +
 dynamic import** (mini_racer is eval/classic-script oriented); **richer
-marshalling** (the types above round-trip natively instead of through a
-JSON-shaped projection); and **in-thread execution** with no per-op thread hop,
+marshalling** (`BigInt`/`Date`/`Map`/`Set` and shared/cyclic graphs cross as
+distinct Ruby types, where mini_racer does a narrower value conversion); and
+**in-thread execution** with no per-op thread hop,
 which is faster for overhead-dominated workloads (lots of tiny `eval`/`call`) and
-at parity once the per-op JS work dominates. Both axes of resource limiting are
-covered — a `timeout_ms` (time) and a `memory_limit` (space), each catchable. It
-is also younger and **experimental** — fewer miles, no Windows yet. Parity with
+at parity once the per-op JS work dominates. Resource limiting is *not* a
+differentiator — both bindings cap time (`timeout_ms`; mini_racer's `timeout`) and
+memory (`memory_limit`; its `max_memory`) with a catchable error, so it's table
+stakes either way. It is also younger and **experimental** — fewer miles, no
+Windows yet. Parity with
 mini_racer is not a goal; the overlap is convergent evolution, not a port.
 
 ## What it can do
