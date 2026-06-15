@@ -42,11 +42,8 @@ marshalling** (`BigInt`/`Date`/`Map`/`Set` and shared/cyclic graphs cross as
 distinct Ruby types, where mini_racer does a narrower value conversion); and
 **in-thread execution** with no per-op thread hop,
 which is faster for overhead-dominated workloads (lots of tiny `eval`/`call`) and
-at parity once the per-op JS work dominates. Resource limiting is *not* a
-differentiator — both bindings cap time (`timeout_ms`; mini_racer's `timeout`) and
-memory (`memory_limit`; its `max_memory`) with a catchable error, so it's table
-stakes either way. It is also younger and **experimental** — fewer miles, no
-Windows yet. Parity with
+at parity once the per-op JS work dominates. It is also younger and
+**experimental** — fewer miles, no Windows yet. Parity with
 mini_racer is not a goal; the overlap is convergent evolution, not a port.
 
 ## What it can do
