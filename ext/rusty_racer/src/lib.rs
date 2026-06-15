@@ -3019,6 +3019,13 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     jsmodule.define_method("dispose", method!(JsModule::dispose, 0))?;
     jsmodule.define_method("disposed?", method!(JsModule::disposed, 0))?;
 
+    // A JS Map marshals to this Hash subclass (not a plain Hash) so the reverse
+    // direction can tell it apart from a JS Object — also a Hash — and rebuild a
+    // JS Map instead of a plain object. It behaves exactly like a Hash (so
+    // `assert_kind_of Hash` / `h[k]` still work); users may also construct one to
+    // hand a JS Map to JS. See marshal.rs.
+    module.define_class("JSMap", ruby.class_object().const_get::<_, magnus::RClass>("Hash")?)?;
+
     let platform = module.define_module("Platform")?;
     platform.define_singleton_method("set_flags!", function!(platform_set_flags, -1))?;
 

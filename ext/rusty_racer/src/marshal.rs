@@ -48,8 +48,11 @@ pub(crate) enum JsVal {
     Array { id: u32, items: Vec<JsVal> },
     // JS object / Ruby Hash with string keys. Insertion order preserved.
     Obj { id: u32, entries: Vec<(String, JsVal)> },
-    // JS Map <-> Ruby Hash. Keys are arbitrary values (not just strings), so
-    // this is distinct from Obj. Insertion order preserved.
+    // JS Map <-> Ruby RustyRacer::JSMap (a Hash subclass). Keys are arbitrary
+    // values (not just strings), so this is distinct from Obj. Insertion order
+    // preserved. The JSMap subclass is what lets a Map round-trip: a plain Ruby
+    // Hash marshals to Obj (a JS Object), a JSMap to Map — the return leg tells
+    // them apart by class (Ruby has no native Map type).
     Map { id: u32, pairs: Vec<(JsVal, JsVal)> },
     // JS Set <-> Ruby Set (stdlib).
     Set { id: u32, items: Vec<JsVal> },
@@ -431,6 +434,15 @@ pub(crate) fn jsval_to_ruby(ruby: &Ruby, val: &JsVal) -> Result<Value, Error> {
 // reference. This invariant is load-bearing: do NOT refactor an arm to stash a
 // value in `built` without keeping it rooted by a live local until it's grafted.
 
+// The RustyRacer::JSMap class (a Hash subclass), defined in init. A JS Map
+// marshals to an instance of it so the reverse direction can distinguish it from
+// a plain Hash (a JS Object) and rebuild a JS Map. Errors only if init didn't run.
+fn js_map_class(ruby: &Ruby) -> Result<magnus::RClass, Error> {
+    ruby.class_object()
+        .const_get::<_, magnus::RModule>("RustyRacer")?
+        .const_get::<_, magnus::RClass>("JSMap")
+}
+
 fn jsval_to_ruby_d(
     ruby: &Ruby,
     val: &JsVal,
@@ -494,16 +506,27 @@ fn jsval_to_ruby_d(
             }
             h.as_value()
         }
-        // JS Map -> Ruby Hash (arbitrary marshalled keys, not just strings).
+        // JS Map -> RustyRacer::JSMap, a Hash subclass: arbitrary marshalled keys
+        // (not just strings) AND distinguishable from a JS Object (a plain Hash),
+        // so ruby_to_jsval can rebuild a JS Map rather than a plain object. Build
+        // empty then aset so a cyclic Map (a value referring back to the Map)
+        // resolves through the Ref table.
+        //
+        // LIMITATION: keys collapse by Ruby Hash equality (eql?/hash), but a JS
+        // Map keys by identity (SameValueZero). Primitive keys (string/number/
+        // bool/bigint) round-trip exactly; two distinct-but-structurally-equal
+        // OBJECT keys (e.g. `{}` and `{}`) become ONE entry — inherent to a Hash
+        // representation, and object identity can't survive copy-marshalling anyway.
         JsVal::Map { id, pairs } => {
-            let h = ruby.hash_new();
-            built.insert(*id, h.as_value());
+            let map_obj: Value = js_map_class(ruby)?.funcall("new", ())?;
+            built.insert(*id, map_obj);
+            let h = RHash::from_value(map_obj).expect("JSMap is a Hash");
             for (k, v) in pairs {
                 let kk = jsval_to_ruby_d(ruby, k, built)?;
                 let vv = jsval_to_ruby_d(ruby, v, built)?;
                 let _ = h.aset(kk, vv);
             }
-            h.as_value()
+            map_obj
         }
         // JS Set -> Ruby Set (stdlib); build empty then add so a cyclic Set
         // (a Set containing itself) resolves through the Ref table.
@@ -725,6 +748,31 @@ fn ruby_to_jsval_d(val: Value, seen: &mut RbSeen, depth: u32) -> Result<JsVal, E
             items.push(ruby_to_jsval_d(el, seen, depth + 1)?);
         }
         return Ok(JsVal::Array { id, items });
+    }
+    // RustyRacer::JSMap (a Hash subclass) -> JS Map, preserving arbitrary keys as
+    // real JS values (NOT string-coerced like a plain Hash -> JS Object). Must come
+    // BEFORE the Hash branch, since a JSMap IS-A Hash. This is what makes a JS Map
+    // round-trip (JS Map -> JSMap -> JS Map) instead of degrading to an object.
+    if let Ok(js_map) = js_map_class(&ruby) {
+        if val.is_kind_of(js_map) {
+            let id = match rb_container_id(seen, val, depth)? {
+                RbId::New(id) => id,
+                RbId::Reuse(jv) => return Ok(jv),
+            };
+            let hash = RHash::from_value(val).expect("JSMap is a Hash");
+            let pairs = RefCell::new(Vec::new());
+            hash.foreach(|k: Value, v: Value| {
+                pairs.borrow_mut().push((
+                    ruby_to_jsval_d(k, seen, depth + 1)?,
+                    ruby_to_jsval_d(v, seen, depth + 1)?,
+                ));
+                Ok(magnus::r_hash::ForEach::Continue)
+            })?;
+            return Ok(JsVal::Map {
+                id,
+                pairs: pairs.into_inner(),
+            });
+        }
     }
     if let Ok(hash) = RHash::try_convert(val) {
         let id = match rb_container_id(seen, val, depth)? {
