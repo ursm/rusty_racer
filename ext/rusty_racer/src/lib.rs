@@ -242,6 +242,8 @@ fn relabel_oom(reply: VmReply) -> VmReply {
         VmReply::ModuleCompiled(r) => VmReply::ModuleCompiled(fix(r)),
         VmReply::ScriptCompiled(r) => VmReply::ScriptCompiled(fix(r)),
         VmReply::CodeCache(r) => VmReply::CodeCache(fix(r)),
+        // Carries no Result and can't OOM (no JS allocation) — pass through.
+        VmReply::Heap(s) => VmReply::Heap(s),
     }
 }
 
@@ -519,6 +521,48 @@ struct ScriptReg {
 struct V8State {
     main_context: Option<v8::Global<v8::Context>>,
     contexts: HashMap<i32, v8::Global<v8::Context>>,
+    // Each realm gets its OWN v8::MicrotaskQueue (created in new_realm, owned
+    // here, keyed like the contexts: main_queue for id 0, queues for the rest).
+    // Why per-realm rather than the isolate-wide default: reset/dispose can then
+    // DISCARD a torn-down realm's pending microtasks by simply dropping its queue
+    // — without that, a queued promise reaction (it captures its creation realm)
+    // sits in the shared queue forever and pins the old v8::Context, so a warm
+    // isolate that Context#resets per visit leaks one whole realm per reset (V8
+    // counts it as a live native context; even a full GC can't reclaim it). The
+    // queue must outlive its context: dropping the UniqueRef DESTRUCTs the queue,
+    // which removes it from V8's per-isolate ring (so V8 won't scan it) and frees
+    // its microtasks. reset/dispose don't drop it directly — they move the old
+    // (context, queue) into `retiring` so flush_retiring can repoint then free it
+    // safely (see those fields).
+    main_queue: Option<v8::UniqueRef<v8::MicrotaskQueue>>,
+    queues: HashMap<i32, v8::UniqueRef<v8::MicrotaskQueue>>,
+    // A long-lived, never-drained queue a retired realm's context is repointed to
+    // before its own queue is freed. V8 enqueues a promise reaction into the
+    // HANDLER's context's queue, and rusty's realms are mutually accessible (one
+    // shared security token + NS.contextGlobal), so a LIVE realm can still hold —
+    // and later resolve — a promise whose handler lives in a realm we tore down;
+    // if that realm's queue were already freed the enqueue would be a
+    // use-after-free. Repointing to the graveyard makes any such late enqueue land
+    // in valid memory (the microtask simply never runs). Created once per isolate,
+    // dropped only at isolate teardown.
+    //
+    // TRADEOFF: the graveyard is never drained, so a microtask landed there lives
+    // until isolate teardown — a small, bounded-per-occurrence leak on the narrow
+    // "resolve a promise into an already-disposed realm" path. Vastly smaller than
+    // the whole-realm-per-reset leak this design fixes, and empty in normal use
+    // (you don't resolve a disposed realm's promises), so it is an accepted cost of
+    // keeping that late enqueue memory-safe.
+    graveyard_queue: Option<v8::UniqueRef<v8::MicrotaskQueue>>,
+    // Realms retired by reset/dispose, awaiting teardown. We can't free a realm's
+    // queue at reset/dispose time: (1) Context::SetMicrotaskQueue (the graveyard
+    // repoint) requires NO context entered, which fails for a NESTED reset (an
+    // outer eval's context is on the stack); (2) freeing before repointing risks
+    // the cross-realm use-after-free above. So we stash (old context, old queue)
+    // here — both stay alive, so no dangling pointer and no unbounded leak — and
+    // flush_retiring drains this list at the end of the outermost request, when
+    // no context is entered: it repoints each context to the graveyard, then drops
+    // the queues (discarding their pending microtasks — the actual leak fix).
+    retiring: Vec<(v8::Global<v8::Context>, v8::UniqueRef<v8::MicrotaskQueue>)>,
     next_context_id: i32,
     host_namespace: Option<String>,
     // One security token shared by every realm of this isolate: the
@@ -695,12 +739,44 @@ fn transfer_registry() -> &'static Mutex<HashMap<u64, SendBackingStore>> {
 // transfers, which a process will never reach.
 static NEXT_TRANSFER_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+// Drain EVERY realm's microtask queue once. Each realm has its own queue (see
+// V8State::queues), so a single scope.perform_microtask_checkpoint() — which only
+// touches the isolate's default queue — would run NOTHING (every realm's promises
+// land in the realm's own queue). This restores the old isolate-wide "drain
+// everything" semantics: a microtask queued in ANY realm runs, regardless of
+// which realm the checkpoint was requested from. V8 drains each queue until empty
+// and enters each microtask's own realm, so same-realm cascades fully resolve in
+// one pass; a cross-realm cascade (a microtask in realm A enqueueing into realm B
+// that was already drained this pass) resolves on the next checkpoint — callers
+// that need full quiescence loop (csim does).
+fn drain_all_realms(scope: &mut v8::PinScope<'_, '_>) {
+    // Snapshot the queue pointers, then drain without holding the IsolateState
+    // borrow (a microtask re-enters host fns that borrow it). The queue OBJECTS
+    // are address-stable (owned via UniqueRef, heap-allocated by V8), so the
+    // snapshot survives a queues-HashMap realloc (e.g. a microtask creating a
+    // realm); and reset/dispose — the only things that free a queue — are refused
+    // while draining (checkpoint_draining set the flag), so no pointer dangles.
+    let queues: Vec<*const v8::MicrotaskQueue> = {
+        let st = istate!(scope);
+        st.realms
+            .main_queue
+            .iter()
+            .chain(st.realms.queues.values())
+            .map(|q| &**q as *const v8::MicrotaskQueue)
+            .collect()
+    };
+    for q in queues {
+        unsafe { (*q).perform_checkpoint(&mut ***scope) };
+    }
+}
+
 // Run a microtask checkpoint with DRAINING set (nesting-safe via save/restore),
-// so a nested Reset/DisposeContext issued by a drained microtask is refused.
+// so a nested Reset/DisposeContext issued by a drained microtask is refused —
+// which also keeps drain_all_realms's queue snapshot from dangling.
 fn checkpoint_draining(scope: &mut v8::PinScope<'_, '_>) {
     let prev = istate!(scope).draining;
     istate!(scope).draining = true;
-    scope.perform_microtask_checkpoint();
+    drain_all_realms(scope);
     istate!(scope).draining = prev;
 }
 
@@ -1297,7 +1373,9 @@ fn drain_microtasks(
     _args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    scope.perform_microtask_checkpoint();
+    // Drain every realm's queue (isolate-wide semantics), under the draining
+    // guard so a microtask can't reset/dispose a realm mid-drain.
+    checkpoint_draining(scope);
 }
 
 // NS.contextGlobal(id) -> the globalThis of context |id|. Cross-context
@@ -1572,10 +1650,20 @@ unsafe extern "C" fn promise_reject_cb(message: v8::PromiseRejectMessage) {
 
 // Build a fresh v8::Context and install the host namespace (from STATE) into
 // it — the single definition of "a realm of this isolate", shared by boot,
-// reset and create_context so realms can't drift apart.
-fn new_realm(scope: &mut v8::PinScope<'_, '_, ()>) -> v8::Global<v8::Context> {
+// reset and create_context so realms can't drift apart. Returns the context
+// Global AND its dedicated microtask queue; the caller owns the queue in
+// V8State alongside the context (see V8State::queues for why per-realm).
+fn new_realm(
+    scope: &mut v8::PinScope<'_, '_, ()>,
+) -> (v8::Global<v8::Context>, v8::UniqueRef<v8::MicrotaskQueue>) {
+    // Explicit policy like the isolate's: rusty drives every drain by hand
+    // (auto_drain / NS.drainMicrotasks), so V8 must never auto-run this queue.
+    let mut queue = v8::MicrotaskQueue::new(&mut **scope, v8::MicrotasksPolicy::Explicit);
     let fresh = {
-        let context = v8::Context::new(scope, Default::default());
+        let context = v8::Context::new(scope, v8::ContextOptions {
+            microtask_queue: Some(&mut *queue as *mut _),
+            ..Default::default()
+        });
         v8::Global::new(scope, context)
     };
     // DESIGN DECISION: every realm of an isolate shares ONE security token, so
@@ -1615,7 +1703,44 @@ fn new_realm(scope: &mut v8::PinScope<'_, '_, ()>) -> v8::Global<v8::Context> {
     if let Some(name) = host_namespace {
         install_host_namespace(scope, &fresh, &name);
     }
-    fresh
+    (fresh, queue)
+}
+
+// Tear down every realm parked in `retiring` (by reset/dispose): repoint each old
+// context at the graveyard queue, then free the old queues (discarding their
+// pending microtasks — the leak fix). MUST run with NO context entered, because
+// Context::SetMicrotaskQueue requires it — so the only caller is the OUTERMOST
+// service_request, after its op (and all nested ones) have unwound their
+// ContextScopes. A no-op when nothing is retired.
+fn flush_retiring(scope: &mut v8::PinScope<'_, '_, ()>) {
+    if istate!(scope).realms.retiring.is_empty() {
+        return;
+    }
+    let graveyard: *const v8::MicrotaskQueue = match istate!(scope).realms.graveyard_queue.as_ref() {
+        Some(q) => &**q as *const _,
+        // The graveyard is created at boot and never cleared, so with entries
+        // waiting this is unreachable; assert so a future refactor that defers its
+        // creation fails loudly instead of silently stranding `retiring` (which
+        // would quietly resurrect the whole-realm leak). Bail without taking the
+        // list, so nothing is lost if it somehow happens in release.
+        None => {
+            debug_assert!(false, "graveyard queue missing while realms are retiring");
+            return;
+        }
+    };
+    let retiring = std::mem::take(&mut istate!(scope).realms.retiring);
+    for (ctx, _queue) in &retiring {
+        let local = v8::Local::new(scope, ctx);
+        // SAFETY: the graveyard queue is owned by V8State for the isolate's whole
+        // life, so the pointer is valid for this set_microtask_queue call. Repoint
+        // BEFORE the queues drop below, so a cross-realm reference that keeps `ctx`
+        // alive can't be left holding a freed queue.
+        local.set_microtask_queue(unsafe { &*graveyard });
+    }
+    // Dropping `retiring` here frees each old queue (and its now-discarded pending
+    // microtasks) and each old context Global. Every context was just repointed to
+    // the graveyard, so no live context holds a freed queue pointer.
+    drop(retiring);
 }
 
 // Inject globalThis.<name> = { drainMicrotasks } into a context. Re-run on
@@ -1828,8 +1953,12 @@ impl Isolate {
         // namespace from the slot (seeded above).
         {
             v8::scope!(let scope, &mut isolate);
-            let main_context = new_realm(scope);
+            let (main_context, main_queue) = new_realm(scope);
             istate!(scope).realms.main_context = Some(main_context);
+            istate!(scope).realms.main_queue = Some(main_queue);
+            // The shared graveyard for retired realms' contexts (see V8State).
+            let graveyard = v8::MicrotaskQueue::new(&mut **scope, v8::MicrotasksPolicy::Explicit);
+            istate!(scope).realms.graveyard_queue = Some(graveyard);
         }
         // Box the OwnedIsolate so it has a STABLE address, then capture a raw ptr
         // INTO the box (a `&mut Isolate` is `&mut NonNull<RealIsolate>`, pointing
@@ -2147,6 +2276,35 @@ impl Core {
             timeout_ms: self.default_timeout_ms,
         })?;
         Self::reply_value(ruby, reply)
+    }
+
+    // Isolate#heap_statistics -> a Symbol-keyed Hash of v8::HeapStatistics
+    // (bytes; the two *_contexts entries are counts). See Request::HeapStatistics.
+    fn heap_statistics(&self, ruby: &Ruby) -> Result<Value, Error> {
+        let reply = self.run(ruby, Request::HeapStatistics)?;
+        let VmReply::Heap(s) = reply else {
+            return Err(Error::new(
+                ruby.exception_runtime_error(),
+                "internal: unexpected heap reply",
+            ));
+        };
+        let h = ruby.hash_new();
+        h.aset(ruby.to_symbol("used_heap_size"), s.used_heap_size)?;
+        h.aset(ruby.to_symbol("total_heap_size"), s.total_heap_size)?;
+        h.aset(ruby.to_symbol("heap_size_limit"), s.heap_size_limit)?;
+        h.aset(ruby.to_symbol("malloced_memory"), s.malloced_memory)?;
+        h.aset(ruby.to_symbol("peak_malloced_memory"), s.peak_malloced_memory)?;
+        h.aset(ruby.to_symbol("external_memory"), s.external_memory)?;
+        h.aset(ruby.to_symbol("number_of_native_contexts"), s.number_of_native_contexts)?;
+        h.aset(ruby.to_symbol("number_of_detached_contexts"), s.number_of_detached_contexts)?;
+        Ok(h.as_value())
+    }
+
+    // Isolate#low_memory_notification: ask V8 to run a full GC now.
+    fn low_memory_notification(&self, ruby: &Ruby) -> Result<(), Error> {
+        let reply = self.run(ruby, Request::LowMemoryNotification)?;
+        Self::reply_value(ruby, reply)?;
+        Ok(())
     }
 
     fn eval_t(
@@ -2558,6 +2716,17 @@ impl Isolate {
     }
     fn perform_microtask_checkpoint(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
         rb_self.core.drain_microtasks(ruby)
+    }
+    // Isolate#heap_statistics -> Hash. A diagnostic window into the V8 heap;
+    // watch number_of_native_contexts / number_of_detached_contexts to spot a
+    // realm leak across Context#reset.
+    fn heap_statistics(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
+        rb_self.core.heap_statistics(ruby)
+    }
+    // Isolate#low_memory_notification: full GC now. Reclaims dead realms between
+    // visits, and distinguishes reclaimable garbage from a genuine leak.
+    fn low_memory_notification(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
+        rb_self.core.low_memory_notification(ruby)
     }
     // dynamic_import_resolver = ->(specifier, referrer_url) { module } for import().
     fn set_dynamic_import_resolver(rb_self: &Self, proc: Proc) {
@@ -3005,6 +3174,11 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     isolate.define_method(
         "_set_dynamic_import_resolver",
         method!(Isolate::set_dynamic_import_resolver, 1),
+    )?;
+    isolate.define_method("heap_statistics", method!(Isolate::heap_statistics, 0))?;
+    isolate.define_method(
+        "low_memory_notification",
+        method!(Isolate::low_memory_notification, 0),
     )?;
     isolate.define_method("dispose", method!(Isolate::dispose, 0))?;
     isolate.define_method("disposed?", method!(Isolate::disposed, 0))?;

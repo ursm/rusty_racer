@@ -465,6 +465,159 @@ class RustyRacerTest < Minitest::Test
     end
   end
 
+  def test_heap_statistics_reports_v8_heap
+    iso = RustyRacer::Isolate.new
+    ctx = iso.context
+    ctx.eval('var a = []; for (let i = 0; i < 10000; i++) a.push({x: i}); a.length')
+    s = iso.heap_statistics
+    assert_equal(
+      %i[
+        external_memory
+        heap_size_limit
+        malloced_memory
+        number_of_detached_contexts
+        number_of_native_contexts
+        peak_malloced_memory
+        total_heap_size
+        used_heap_size
+      ],
+      s.keys.sort
+    )
+    s.each_value {|v| assert_kind_of Integer, v }
+    assert_operator s[:used_heap_size], :>, 0
+    assert_operator s[:heap_size_limit], :>, s[:used_heap_size]
+    assert_operator s[:number_of_native_contexts], :>=, 1
+  end
+
+  def test_low_memory_notification_runs_and_isolate_stays_usable
+    iso = RustyRacer::Isolate.new
+    ctx = iso.context
+    ctx.eval('var junk = []; for (let i = 0; i < 50000; i++) junk.push({x: i}); junk = null;')
+    assert_nil iso.low_memory_notification
+    # The isolate is still fully usable after a forced GC.
+    assert_equal 3, ctx.eval('1 + 2')
+  end
+
+  def test_context_reset_does_not_leak_native_contexts
+    # A quiescent Context#reset swaps in a fresh realm and rusty drops the old
+    # context's handle, so after a full GC the detached contexts are reclaimed
+    # and the LIVE native-context count stays bounded — it must NOT grow with the
+    # number of resets (a realm leak would make it climb ~1 per reset).
+    iso = RustyRacer::Isolate.new
+    ctx = iso.context
+    ctx.eval('1 + 1')
+    iso.low_memory_notification
+    baseline = iso.heap_statistics[:number_of_native_contexts]
+
+    50.times do
+      ctx.eval('var a = []; for (let i = 0; i < 200; i++) a.push({x: i}); a.length')
+      ctx.reset
+    end
+    iso.low_memory_notification
+    after = iso.heap_statistics[:number_of_native_contexts]
+
+    assert_operator(
+      after, :<=, baseline + 3,
+      "live native contexts grew #{baseline} -> #{after} across 50 resets (realm leak?)"
+    )
+  end
+
+  def test_context_reset_with_pending_microtasks_does_not_leak_the_realm
+    # THE leak this whole change targets: a reset with an UNDRAINED microtask
+    # (a Promise reaction) used to leak the entire old realm — the queued callback
+    # captures its creation realm and sat in the isolate-wide microtask queue
+    # forever, pinning the old v8::Context (V8 counted it live; even a full GC
+    # couldn't reclaim it), so a warm isolate that resets per visit climbed ~1
+    # native context (~1 MB) per reset until it pinned the heap cap and GC
+    # thrashed. With a per-realm microtask queue, reset drops the old realm's
+    # queue (discarding its pending microtasks), so the count stays bounded.
+    iso = RustyRacer::Isolate.new(microtasks: :explicit)
+    ctx = iso.context
+    iso.low_memory_notification
+    baseline = iso.heap_statistics[:number_of_native_contexts]
+
+    100.times do
+      # Schedule a microtask capturing a big array, then RESET without draining.
+      ctx.eval(<<~JS)
+        (function () {
+          const big = new Array(20000).fill(0).map((_, j) => ({x: j}));
+          Promise.resolve().then(() => { big.length; });
+        })();
+      JS
+      ctx.reset
+    end
+    iso.low_memory_notification
+    after = iso.heap_statistics[:number_of_native_contexts]
+
+    # Before the fix this was baseline + 100. A few realms of slack covers V8's
+    # own bookkeeping and GC timing.
+    assert_operator(
+      after, :<=, baseline + 3,
+      "live native contexts grew #{baseline} -> #{after} across 100 resets with pending microtasks (realm leak)"
+    )
+  end
+
+  def test_cross_realm_promise_resolved_after_dispose_does_not_use_freed_queue
+    # V8 enqueues a promise reaction into the HANDLER's realm's microtask queue.
+    # rusty's realms are mutually accessible, so a live realm can hold — and later
+    # resolve — a promise whose handler lives in a realm that was disposed/reset.
+    # Dropping that realm's queue frees it, but a cross-realm handle keeps the
+    # realm's context alive, so the late resolution would enqueue into freed memory
+    # — unless retire_realm_to_graveyard repointed the context first. Drive exactly
+    # that under GC.stress; it must not corrupt the heap.
+    GC.stress = true
+    begin
+      iso = RustyRacer::Isolate.new(host_namespace: 'NS', microtasks: :explicit)
+      main = iso.context
+      10.times do
+        frame = iso.create_context
+        frame.eval(<<~JS)
+          globalThis.fire = null;
+          globalThis.p = new Promise(r => { globalThis.fire = r }).then(() => 1);
+        JS
+        # main grabs the frame's global BEFORE dispose, keeping the frame context
+        # alive across the dispose that frees the frame's queue.
+        main.eval("globalThis.F = NS.contextGlobal(#{frame.id});")
+        frame.dispose
+        # Resolve the disposed frame's promise from main: the reaction's handler
+        # realm is the freed frame, so V8 enqueues into the frame context's queue —
+        # which must be the graveyard, not freed memory.
+        main.eval('globalThis.F.fire(); globalThis.F = null;')
+        iso.perform_microtask_checkpoint
+      end
+      iso.dispose
+    ensure
+      GC.stress = false
+    end
+    pass
+  end
+
+  def test_reset_and_dispose_drop_realm_queues_under_gc_stress
+    # reset/dispose now DROP the old realm's v8::MicrotaskQueue (the leak fix).
+    # Dropping it DESTRUCTs the queue (it leaves V8's per-isolate ring) and frees
+    # its pending microtasks. Churn that path hard under GC.stress — reset and
+    # dispose realms that have undrained microtasks and live cross-realm handles,
+    # then tear the isolate down — to catch any use-after-free in the queue drop.
+    GC.stress = true
+    begin
+      5.times do
+        iso = RustyRacer::Isolate.new(host_namespace: 'NS')
+        main = iso.context
+        10.times do
+          main.eval('Promise.resolve().then(() => { const a = [1, 2, 3]; a.length; });')
+          frame = iso.create_context
+          frame.eval('Promise.resolve().then(() => 1); var x = {y: 1};')
+          main.reset
+          frame.dispose
+        end
+        iso.dispose
+      end
+    ensure
+      GC.stress = false
+    end
+    pass
+  end
+
   def test_cross_isolate_reentrancy_keeps_the_entered_isolate_straight
     # A host callback on isolate A can run Ruby that evals isolate B, whose own
     # callback re-enters A. A is then on the V8 stack (a re-entrant op) while B

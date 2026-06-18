@@ -137,6 +137,18 @@ pub(crate) enum Request {
     ModuleCodeCache {
         module_id: i32,
     },
+    // Isolate-level memory introspection / hint (realm-independent). Read
+    // v8::HeapStatistics — used/total/limit, malloced + external bytes, and the
+    // live (number_of_native_contexts) and detached (number_of_detached_contexts)
+    // native-context counts. The two context counts are the lever for diagnosing
+    // a realm leak across Context#reset: a healthy warm isolate's live+detached
+    // count plateaus, a leak makes it climb.
+    HeapStatistics,
+    // Ask V8 to run a full GC now (Isolate::LowMemoryNotification) — lets the
+    // embedder reclaim dead realms between visits without waiting for the
+    // near-heap-limit callback, and tells reclaimable garbage apart from a real
+    // leak (memory that survives this is genuinely retained).
+    LowMemoryNotification,
 }
 
 // compile_module result: the module's id plus any produced bytecode cache and
@@ -145,6 +157,20 @@ pub(crate) struct Compiled {
     pub(crate) id: i32,
     pub(crate) cached_data: Option<Vec<u8>>,
     pub(crate) cache_rejected: bool,
+}
+
+// A snapshot of v8::HeapStatistics, in bytes (counts for the context fields).
+// Plain copyable numbers so it crosses out of the V8 op into a Ruby Hash without
+// any handle. See Request::HeapStatistics for what the context counts tell you.
+pub(crate) struct HeapStats {
+    pub(crate) used_heap_size: u64,
+    pub(crate) total_heap_size: u64,
+    pub(crate) heap_size_limit: u64,
+    pub(crate) malloced_memory: u64,
+    pub(crate) peak_malloced_memory: u64,
+    pub(crate) external_memory: u64,
+    pub(crate) number_of_native_contexts: u64,
+    pub(crate) number_of_detached_contexts: u64,
 }
 
 // The terminal reply of an op: service_request returns it straight up to
@@ -158,6 +184,8 @@ pub(crate) enum VmReply {
     // Script#/Module#create_code_cache: the serialized bytes, or None when V8
     // can't produce a cache (or the handle's realm is gone).
     CodeCache(Result<Option<Vec<u8>>, VmError>),
+    // Isolate#heap_statistics: a snapshot of v8::HeapStatistics.
+    Heap(HeapStats),
 }
 
 pub(crate) fn run_source(scope: &mut v8::PinScope<'_, '_>, source: &str, filename: &str) -> Result<JsVal, VmError> {
@@ -315,6 +343,12 @@ pub(crate) fn service_request(scope: &mut v8::PinScope<'_, '_, ()>, request: Req
         istate!(scope).watchdog_fired = false;
         scope.cancel_terminate_execution();
     }
+    // Free realms retired by this request (or a nested reset/dispose) now that the
+    // stack has fully unwound and NO context is entered — Context::SetMicrotaskQueue
+    // (the graveyard repoint inside) requires that.
+    if outermost {
+        flush_retiring(scope);
+    }
     reply
 }
 
@@ -342,7 +376,9 @@ fn request_realm(state: &IsolateState, request: &Request) -> Option<i32> {
         | Request::DisposeModule { .. }
         | Request::DisposeScript { .. }
         | Request::ScriptCodeCache { .. }
-        | Request::ModuleCodeCache { .. } => None,
+        | Request::ModuleCodeCache { .. }
+        | Request::HeapStatistics
+        | Request::LowMemoryNotification => None,
     }
 }
 
@@ -417,7 +453,33 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
         // It needs the module's context entered (unlike UnboundScript), so
         // a gone realm yields nil.
         Request::ModuleCodeCache { module_id } => op_module_code_cache(scope, module_id),
+        Request::HeapStatistics => op_heap_statistics(scope),
+        Request::LowMemoryNotification => op_low_memory_notification(scope),
     }
+}
+
+// Snapshot v8::HeapStatistics. No handles, no JS — a PinScope<()> derefs to the
+// Isolate, so the stats read straight off it.
+fn op_heap_statistics(scope: &mut v8::PinScope<'_, '_, ()>) -> VmReply {
+    let s = scope.get_heap_statistics();
+    VmReply::Heap(HeapStats {
+        used_heap_size: s.used_heap_size() as u64,
+        total_heap_size: s.total_heap_size() as u64,
+        heap_size_limit: s.heap_size_limit() as u64,
+        malloced_memory: s.malloced_memory() as u64,
+        peak_malloced_memory: s.peak_malloced_memory() as u64,
+        external_memory: s.external_memory() as u64,
+        number_of_native_contexts: s.number_of_native_contexts() as u64,
+        number_of_detached_contexts: s.number_of_detached_contexts() as u64,
+    })
+}
+
+// Hint V8 to free as much as it can right now (a full GC). Runs entered, under
+// the GVL-released op, on the owner thread — the same place the OOM recovery
+// already calls it.
+fn op_low_memory_notification(scope: &mut v8::PinScope<'_, '_, ()>) -> VmReply {
+    scope.low_memory_notification();
+    VmReply::Done(Ok(JsVal::Undefined))
 }
 
 fn op_eval(scope: &mut v8::PinScope<'_, '_, ()>, context_id: i32, source: String, filename: String, timeout_ms: u64, outermost: bool) -> VmReply {
@@ -574,13 +636,22 @@ fn op_reset(scope: &mut v8::PinScope<'_, '_, ()>, context_id: i32) -> VmReply {
                 .into(),
         )))
     } else {
-        let fresh = new_realm(scope);
+        let (fresh, fresh_queue) = new_realm(scope);
         {
             let realms = &mut istate!(scope).realms;
-            if context_id == 0 {
-                realms.main_context = Some(fresh);
+            // Swap in the fresh realm and PARK the old context + queue in
+            // `retiring` (don't drop the queue here): freeing it now could strand a
+            // freed pointer in the old context if a cross-realm reference outlives
+            // this reset, and the graveyard repoint can't run while a context is
+            // entered (nested reset). flush_retiring frees them safely at the next
+            // outermost request boundary.
+            let (old_ctx, old_queue) = if context_id == 0 {
+                (realms.main_context.replace(fresh), realms.main_queue.replace(fresh_queue))
             } else {
-                realms.contexts.insert(context_id, fresh);
+                (realms.contexts.insert(context_id, fresh), realms.queues.insert(context_id, fresh_queue))
+            };
+            if let (Some(c), Some(q)) = (old_ctx, old_queue) {
+                realms.retiring.push((c, q));
             }
         }
         // Drop modules bound to this context — their realm just changed.
@@ -596,8 +667,9 @@ fn op_create_context(scope: &mut v8::PinScope<'_, '_, ()>) -> VmReply {
         realms.next_context_id += 1;
         id
     };
-    let fresh = new_realm(scope);
+    let (fresh, fresh_queue) = new_realm(scope);
     istate!(scope).realms.contexts.insert(id, fresh);
+    istate!(scope).realms.queues.insert(id, fresh_queue);
     VmReply::Done(Ok(JsVal::Int(id as i64)))
 }
 
@@ -614,9 +686,17 @@ fn op_dispose_context(scope: &mut v8::PinScope<'_, '_, ()>, context_id: i32) -> 
                 .into(),
         )))
     } else {
-        // Dropping the Global lets V8 collect the context. id 0 is the
-        // default context and never disposed independently.
-        istate!(scope).realms.contexts.remove(&context_id);
+        // Park the context + queue in `retiring` rather than dropping them here:
+        // freeing the queue could strand a freed pointer in a cross-realm-reachable
+        // context, and the graveyard repoint needs no context entered.
+        // flush_retiring frees them at the next outermost request boundary, which
+        // is what finally lets V8 collect the context. id 0 is the default context
+        // and never disposed independently.
+        let old_ctx = istate!(scope).realms.contexts.remove(&context_id);
+        let old_queue = istate!(scope).realms.queues.remove(&context_id);
+        if let (Some(c), Some(q)) = (old_ctx, old_queue) {
+            istate!(scope).realms.retiring.push((c, q));
+        }
         // Reclaim the modules compiled in it (else they leak until
         // isolate teardown).
         drop_context_artifacts(istate!(scope), context_id);
