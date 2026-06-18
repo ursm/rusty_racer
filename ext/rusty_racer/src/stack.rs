@@ -1,9 +1,13 @@
 // V8 stack limit + conservative-GC-scan retargeting (in-thread: V8 runs on the
 // calling Ruby thread's stack — a native pthread stack, or a Ruby Fiber's
-// separate mmap'd stack). Self-contained: only raw pointers, std, libc, and the
-// exported V8 symbols below — no IsolateState/JsVal/marshalling. The crate uses
-// discover_scan_start_field (once per isolate), set_v8_stack_limit (per op), and
-// STACK_DEBUG (set at init); everything else is private to this module.
+// separate mmap'd stack), plus the current-isolate query the reentry path needs.
+// Self-contained: only raw pointers, std, libc, and the exported V8 symbols below
+// — no IsolateState/JsVal/marshalling. It also hosts current_real_isolate() (the
+// entered-isolate query) since that too is just one of the exported V8 symbols
+// below, kept here so the FFI block stays in one place. The crate uses
+// discover_scan_start_field (once per isolate), set_v8_stack_limit (per op),
+// current_real_isolate (per reentrant op), and STACK_DEBUG (set at init);
+// everything else is private to this module.
 
 use std::ffi::c_void;
 // Only native_stack_bounds (linux) needs it; gated so non-linux builds (macOS)
@@ -32,6 +36,19 @@ unsafe extern "C" {
     fn v8__internal__Heap__SetStackStart(heap: *mut c_void);
     #[link_name = "_ZN2v84base5Stack13GetStackStartEv"]
     fn v8__base__Stack__GetStackStart() -> usize;
+    // rusty_v8's C binding for v8::Isolate::GetCurrent() — the thread-local
+    // "currently entered" isolate. No #[link_name]: the exported symbol is
+    // literally this name (rusty_v8's binding glue), same as the crate's own
+    // private declaration. Lets a re-entrant op tell whether ITS isolate is the
+    // one currently entered, or a foreign isolate was entered on top of it (the
+    // cross-isolate reentry case — see Core::run).
+    fn v8__Isolate__GetCurrent() -> *mut c_void;
+}
+
+// The raw v8::Isolate* currently entered on this native thread (null if none).
+// Compared by identity against an isolate's own raw pointer.
+pub(crate) fn current_real_isolate() -> *mut c_void {
+    unsafe { v8__Isolate__GetCurrent() }
 }
 
 // Locate V8's conservative-GC-scan stack_start field
