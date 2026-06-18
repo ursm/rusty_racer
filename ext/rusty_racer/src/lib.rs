@@ -54,7 +54,7 @@ use marshal::{js_to_jsval, jsval_to_js, jsval_to_ruby, ruby_to_jsval, JsVal};
 mod ops;
 use ops::{run_source, service_request, Compiled, Request, VmReply};
 mod stack;
-use stack::{discover_scan_start_field, set_v8_stack_limit, STACK_DEBUG};
+use stack::{current_real_isolate, discover_scan_start_field, set_v8_stack_limit, STACK_DEBUG};
 mod watchdog;
 use watchdog::{
     arm_watchdog, disarm_watchdog, run_js_bracketed, watchdog_loop, WatchdogShared, WATCHDOG_DEBUG,
@@ -2127,22 +2127,57 @@ impl Core {
                 unsafe { (*iso).exit() };
                 reply
             } else {
-                // Re-entrant (a host callback, having reacquired the GVL to run a
-                // proc that issued this op, is on the V8 stack): the isolate is
-                // already entered by the depth-0 op on THIS native thread, so
-                // bootstrap onto the ambient HandleScope rather than re-enter.
+                // Re-entrant (a host callback or module resolver, having
+                // reacquired the GVL to run a proc that issued this op, is on the
+                // V8 stack). USUALLY the JS on the stack belongs to THIS isolate
+                // (same-isolate reentry) — which is therefore already entered on
+                // THIS native thread — so we bootstrap onto the ambient
+                // HandleScope without re-entering.
+                //
+                // But an embedder driving MANY isolates (e.g. capybara-simulated's
+                // windows) can interleave them: a host callback on isolate A runs
+                // Ruby that evals isolate B, whose own callback re-enters A. Now A
+                // is on the V8 stack (depth > 0) yet B — not A — is the isolate
+                // CURRENTLY entered on this thread, so bootstrapping a scope on A
+                // and opening a ContextScope would trip V8's "scope and Context do
+                // not belong to the same Isolate" panic (it checks the scope's
+                // isolate against Isolate::GetCurrent()). Detect that case and
+                // properly enter A on top of B, restoring B on exit. Entering an
+                // already-current isolate is also harmless (V8's entered-isolate
+                // stack nests), so this is correct for same-isolate reentry too —
+                // we only pay the enter/exit when a FOREIGN isolate is on top.
+                //
                 // The stack limit + scan-start set at depth 0 are NOT re-pointed
                 // here: reentry runs in DEEPER frames of the SAME stack, so the
-                // depth-0 values still bound it correctly. The one exception is a
+                // depth-0 values still bound it correctly (whichever isolate is
+                // current — each tracks its own limit). The one exception is a
                 // host callback that SWITCHES stacks — e.g. resumes a Ruby Fiber
                 // that itself evals — where the depth-0 (native) settings are
                 // stale for the fiber; that nested-fiber-under-callback case is an
                 // unsupported edge (the realistic fiber path is a depth-0 eval).
-                std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    v8::callback_scope!(unsafe scope, unsafe { &mut *iso });
-                    service_request(scope, request, false)
+                let foreign = unsafe { *(iso as *const *mut c_void) } != current_real_isolate();
+                if foreign {
+                    unsafe { (*iso).enter() };
+                }
+                let reply = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    if foreign {
+                        // A had no ambient scope under B's entry — open a fresh
+                        // HandleScope on A, exactly as the depth-0 path does.
+                        v8::scope!(let scope, unsafe { &mut *iso });
+                        service_request(scope, request, false)
+                    } else {
+                        v8::callback_scope!(unsafe scope, unsafe { &mut *iso });
+                        service_request(scope, request, false)
+                    }
                 }))
-                .ok()
+                .ok();
+                // Pop A back off (restoring B as current). Safe even after a
+                // panic unwind: the scope's Drop ran but left A entered, and
+                // exit() asserts A == GetCurrent(), which holds here.
+                if foreign {
+                    unsafe { (*iso).exit() };
+                }
+                reply
             }
         });
         self.depth.fetch_sub(1, Ordering::SeqCst);

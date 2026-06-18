@@ -618,6 +618,34 @@ class RustyRacerTest < Minitest::Test
     pass
   end
 
+  def test_cross_isolate_reentrancy_keeps_the_entered_isolate_straight
+    # A host callback on isolate A can run Ruby that evals isolate B, whose own
+    # callback re-enters A. A is then on the V8 stack (a re-entrant op) while B
+    # is the isolate V8 currently has ENTERED on this thread. The re-entrant
+    # path used to assume "depth > 0 => my isolate is still the entered one" and
+    # bootstrap a scope on A regardless; opening a context scope on A while B was
+    # entered tripped V8's "scope and Context do not belong to the same Isolate"
+    # panic, which poisoned A (every later op, including reset, then failed with
+    # "disposed context"). Drive exactly that A -> B -> A interleave; the
+    # innermost A eval must return normally and A must stay usable afterwards.
+    a = RustyRacer::Isolate.new.context
+    b = RustyRacer::Isolate.new.context
+
+    # Innermost hop: B's callback re-enters A.
+    b.attach('reenterA', proc { a.eval('1 + 2') })
+    b.eval('function callA() { return reenterA() }')
+
+    # A's callback hops into B (which hops back into A).
+    a.attach('intoB', proc { b.eval('callA()') })
+
+    assert_equal 3, a.eval('intoB()')
+
+    # A wasn't poisoned: it still evals and resets.
+    assert_equal 4, a.eval('2 + 2')
+    a.reset
+    assert_equal 5, a.eval('2 + 3')
+  end
+
   def test_realm_churn_and_teardown_survive_gc
     # Realms used to stamp their id into the V8 context's embedder data, which
     # makes V8 attach a ContextAnnex carrying a guaranteed-finalizer weak handle
