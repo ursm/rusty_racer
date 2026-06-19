@@ -26,7 +26,14 @@ module RustyRacer
   class EvalError < Error; end
   class ParseError < EvalError; end
   class RuntimeError < EvalError; end
-  class ScriptTerminatedError < EvalError; end
+  class ScriptTerminatedError < EvalError
+    # The JS stack at the moment the call timed out (watchdog), as
+    # ["func (script:line:col)", ...], top frame first — captured on the isolate
+    # thread just before TerminateExecution. [] when no stack was captured (e.g. a
+    # bare Isolate#terminate rather than a timeout). The same frames are also set
+    # as the exception's #backtrace when present.
+    def js_backtrace = @js_backtrace || []
+  end
   # Raised when JS allocation exceeds the isolate's heap ceiling (the configured
   # memory_limit, or V8's default ceiling when none was set). Catchable like any
   # eval error — a runaway script fails its own eval instead of aborting the

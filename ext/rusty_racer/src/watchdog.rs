@@ -12,12 +12,21 @@
 // op handlers and isolate setup (still in lib.rs) call them;
 // report_watchdog_anomaly is private to this module.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::istate;
 use crate::{IsolateState, JsVal, VmError};
+
+// Top N JS frames captured at a timeout — enough to name the culprit without
+// walking a pathological deep stack.
+const MAX_TIMEOUT_FRAMES: usize = 32;
+// Per-frame string cap. Function names and (especially) script URLs are
+// attacker-controlled JS and can be arbitrarily long (a multi-KB data: URL);
+// cap each so a runaway can't bloat the error message / backtrace.
+const MAX_FRAME_NAME: usize = 256;
 
 // The watchdog runs on ONE persistent thread per isolate rather than a fresh
 // std::thread per request: spawning + joining a thread on every op cost ~16µs
@@ -27,6 +36,11 @@ use crate::{IsolateState, JsVal, VmError};
 pub(crate) struct WatchdogShared {
     inner: Mutex<WatchdogInner>,
     cv: Condvar,
+    // The owning isolate's raw `*mut v8::Isolate` as a usize (0 until wired up by
+    // set_iso_ptr, right after the isolate is boxed). The loop needs it to address
+    // the RequestInterrupt callback's `data` at fire time; kept as an atomic
+    // (outside the Mutex) so the loop reads it without serialising on arm/disarm.
+    iso_ptr: AtomicUsize,
 }
 
 impl WatchdogShared {
@@ -40,7 +54,15 @@ impl WatchdogShared {
                 shutdown: false,
             }),
             cv: Condvar::new(),
+            iso_ptr: AtomicUsize::new(0),
         })
+    }
+
+    // Wire up the isolate pointer once it is stable (after the OwnedIsolate is
+    // boxed). Called before any op can arm a deadline, so the loop always sees it
+    // set by the time it could fire.
+    pub(crate) fn set_iso_ptr(&self, iso_ptr: *mut std::ffi::c_void) {
+        self.iso_ptr.store(iso_ptr as usize, Ordering::Relaxed);
     }
 
     // Signal the loop to stop and wake it. Called once at isolate teardown,
@@ -94,8 +116,21 @@ pub(crate) fn watchdog_loop(shared: Arc<WatchdogShared>, handle: v8::IsolateHand
             Some(frame) => {
                 let now = Instant::now();
                 if now >= frame.deadline {
-                    handle.terminate_execution();
                     inner.fired_generation = Some(frame.generation);
+                    // Don't terminate directly: request an interrupt so the stack
+                    // is captured on the isolate thread (with JS live) before the
+                    // terminate — see timeout_interrupt. fired_generation is set
+                    // FIRST and we still hold `inner`, so the callback (which locks
+                    // `inner` to read it) can't run until we release, and will see
+                    // it set. Fall back to a direct terminate if the isolate ptr
+                    // isn't wired yet (can't happen once an op has armed) — never
+                    // leave a runaway un-terminated.
+                    let iso = shared.iso_ptr.load(Ordering::Relaxed);
+                    if iso != 0 {
+                        handle.request_interrupt(timeout_interrupt, iso as *mut c_void);
+                    } else {
+                        handle.terminate_execution();
+                    }
                     // Drop the fired frame so the loop moves on to the next
                     // deadline instead of re-firing this one every wakeup.
                     inner.frames.retain(|f| f.generation != frame.generation);
@@ -109,6 +144,92 @@ pub(crate) fn watchdog_loop(shared: Arc<WatchdogShared>, handle: v8::IsolateHand
 }
 
 // (The watchdog Arc now lives in IsolateState; arm/disarm reach it via istate!.)
+
+// The RequestInterrupt callback the watchdog fires when a deadline passes. It
+// runs on the ISOLATE thread with the runaway JS still on the stack, so it can
+// snapshot the stack BEFORE TerminateExecution unwinds it. `data` is the
+// `*mut v8::Isolate` (the same pointer near_heap_limit_cb uses); the
+// UnsafeRawIsolatePtr arg is ignored.
+//
+// GUARDED by fired_generation: a RequestInterrupt callback can't be cancelled, so
+// one still pending after its op already disarmed must NOT capture+terminate the
+// NEXT op. It acts only while some fired deadline is still awaiting its terminate
+// (fired_generation set) — which is exactly when a terminate is warranted, for
+// whatever op is currently on the stack.
+unsafe extern "C" fn timeout_interrupt(_isolate: v8::UnsafeRawIsolatePtr, data: *mut c_void) {
+    let isolate = unsafe { &mut *(data as *mut v8::Isolate) };
+    let pending = isolate
+        .get_slot::<IsolateState>()
+        .map(|s| s.watchdog.inner.lock().unwrap().fired_generation.is_some())
+        .unwrap_or(false);
+    if !pending {
+        return;
+    }
+    // Enter SOME realm (the main one — always present) just to get a
+    // context-typed scope, which StackTrace::current_stack_trace requires.
+    // CurrentStackTrace reads the ISOLATE's running stack regardless of which
+    // realm is entered, so this captures the real runaway frames even if they're
+    // in another realm. Capture, stash for the unwinding op's error, THEN
+    // terminate (so the stack is still live when we snapshot it).
+    v8::scope!(let scope, isolate);
+    let Some(main) = istate!(scope).realms.main_context.clone() else {
+        scope.terminate_execution();
+        return;
+    };
+    let context = v8::Local::new(scope, &main);
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let frames = capture_js_backtrace(scope, MAX_TIMEOUT_FRAMES);
+    istate!(scope).timeout_backtrace = Some(frames);
+    scope.terminate_execution();
+}
+
+// Snapshot up to |max_frames| of the current JS stack as "func (script:line:col)"
+// strings, top frame first. Empty when there's no JS stack (e.g. already
+// terminating) — best-effort, never fatal.
+fn capture_js_backtrace(scope: &mut v8::PinScope<'_, '_>, max_frames: usize) -> Vec<String> {
+    let Some(trace) = v8::StackTrace::current_stack_trace(scope, max_frames) else {
+        return Vec::new();
+    };
+    let count = trace.get_frame_count();
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let Some(frame) = trace.get_frame(scope, i) else {
+            continue;
+        };
+        let func = clamp_name(
+            frame
+                .get_function_name(scope)
+                .map(|s| s.to_rust_string_lossy(scope))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "<anonymous>".to_string()),
+        );
+        let script = clamp_name(
+            frame
+                .get_script_name_or_source_url(scope)
+                .map(|s| s.to_rust_string_lossy(scope))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "<unknown>".to_string()),
+        );
+        out.push(format!(
+            "{func} ({script}:{}:{})",
+            frame.get_line_number(),
+            frame.get_column()
+        ));
+    }
+    out
+}
+
+// Cap a frame name/script string at MAX_FRAME_NAME chars (on a char boundary),
+// appending an ellipsis when truncated, so an attacker-controlled long name can't
+// bloat the error.
+fn clamp_name(mut s: String) -> String {
+    if s.len() > MAX_FRAME_NAME {
+        let end = (0..=MAX_FRAME_NAME).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0);
+        s.truncate(end);
+        s.push('…');
+    }
+    s
+}
 
 // Arm the watchdog for this request: push a frame with its own deadline and
 // wake the loop. Returns the generation token to hand to `disarm_watchdog`

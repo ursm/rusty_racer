@@ -682,6 +682,89 @@ class RustyRacerTest < Minitest::Test
     assert_raises(RustyRacer::ScriptTerminatedError) { ctx.call("spin") }
   end
 
+  def test_timeout_error_carries_the_js_backtrace
+    ctx = RustyRacer::Isolate.new(timeout_ms: 50).context
+    err = assert_raises(RustyRacer::ScriptTerminatedError) do
+      ctx.eval(<<~JS, filename: 'app.js')
+        function spin() { while (true) {} }
+        function outer() { spin() }
+        outer();
+      JS
+    end
+    bt = err.js_backtrace
+    assert_kind_of Array, bt
+    refute_empty bt, 'expected the JS stack captured at the timeout'
+    # Top frame names the running function, formatted "func (script:line:col)".
+    assert_match(/spin/, bt.first)
+    assert_match(/app\.js:\d+:\d+/, bt.first)
+    # The message names the culprit, and the JS stack is the exception backtrace.
+    assert_match(/spin/, err.message)
+    assert_equal bt, err.backtrace
+    # No leaked terminate: the isolate is still usable.
+    assert_equal 3, ctx.eval('1 + 2')
+  end
+
+  def test_nested_timeout_culprit_surfaces_even_when_re_thrown
+    # A host fn issues a nested eval that runs away and times out. The nested
+    # ScriptTerminatedError propagates through the host fn (re-thrown into JS), so
+    # the outer eval surfaces it — possibly relabelled as a RuntimeError. Either
+    # way the culprit must still be named (the top frame is in the message).
+    iso = RustyRacer::Isolate.new
+    ctx = iso.context
+    ctx.attach('nested', proc { ctx.eval('function hot() { while (true) {} } hot()', timeout_ms: 50, filename: 'nested.js') })
+    err = assert_raises(RustyRacer::EvalError) do # RuntimeError or ScriptTerminatedError
+      ctx.eval('nested()', filename: 'outer.js')
+    end
+    assert_match(/hot/, err.message)
+    assert_equal 3, ctx.eval('1 + 2')
+  end
+
+  def test_escalated_outer_timeout_error_still_carries_the_backtrace
+    # A nested eval times out; its terminate is isolate-global, so even though the
+    # host fn rescues the nested ScriptTerminatedError, the leftover terminate
+    # escalates and the OUTER eval also surfaces a ScriptTerminatedError. That
+    # outer error must NOT be empty — reply_value clones the capture rather than
+    # consuming it at the nested frame, so the escalated outer error still names
+    # the runaway. (With a consuming take it would have been [].)
+    iso = RustyRacer::Isolate.new
+    ctx = iso.context
+    ctx.attach('nested', proc {
+      ctx.eval('function inner() { while (true) {} } inner()', timeout_ms: 50, filename: 'nested.js') rescue nil
+      1
+    })
+    err = assert_raises(RustyRacer::ScriptTerminatedError) do
+      ctx.eval('function f() { nested() } f()', filename: 'outer.js')
+    end
+    refute_empty err.js_backtrace
+    assert_match(/inner/, err.js_backtrace.join("\n"), err.js_backtrace.inspect)
+    assert_equal 3, ctx.eval('1 + 2')
+  end
+
+  def test_repeated_timeouts_do_not_leak_terminate_or_backtrace
+    # The watchdog now fires via RequestInterrupt (to capture the stack), which
+    # can't be cancelled — so a guard must keep a leftover interrupt from
+    # terminating the NEXT op or attaching a stale backtrace. Hammer it.
+    ctx = RustyRacer::Isolate.new(timeout_ms: 50).context
+    5.times do
+      assert_raises(RustyRacer::ScriptTerminatedError) { ctx.eval('while (true) {}') }
+      # The very next op must run normally and cleanly.
+      assert_equal 4, ctx.eval('2 + 2')
+    end
+  end
+
+  def test_bare_terminate_has_empty_js_backtrace
+    # A non-timeout stop (Isolate#terminate) goes through a direct terminate, not
+    # the watchdog interrupt, so no JS stack is captured: #js_backtrace is [] and
+    # the exception keeps its ordinary Ruby backtrace.
+    iso = RustyRacer::Isolate.new # no timeout
+    ctx = iso.context
+    stopper = Thread.new { sleep 0.1; iso.terminate }
+    err = assert_raises(RustyRacer::ScriptTerminatedError) { ctx.eval('for(;;){}') }
+    stopper.join
+    assert_equal [], err.js_backtrace
+    ctx.eval('1') # cancel the leftover terminate
+  end
+
   def test_host_fn_invoked_from_microtask_during_checkpoint
     # csim's settle model: a Promise resolved via a host callback. The host fn
     # fires from a microtask during the checkpoint and must still route to Ruby.
