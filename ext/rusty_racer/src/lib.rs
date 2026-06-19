@@ -629,6 +629,12 @@ struct IsolateState {
     // platform-derived default, whose value we don't otherwise know — so we restore
     // to this captured initial instead. 0 until the callback has fired at least once.
     oom_initial_limit: usize,
+    // The JS stack captured at a watchdog timeout: when a deadline fires, the
+    // watchdog requests an interrupt that runs on THIS thread with JS still live
+    // (see timeout_interrupt) and snapshots the stack here BEFORE terminating, so
+    // the ScriptTerminatedError can name what was running. Taken (cleared) when the
+    // terminated op's error is built; None for any non-timeout outcome.
+    timeout_backtrace: Option<Vec<String>>,
 }
 
 impl IsolateState {
@@ -652,6 +658,7 @@ impl IsolateState {
             watchdog: WatchdogShared::new(),
             oom_fired: false,
             oom_initial_limit: 0,
+            timeout_backtrace: None,
         }
     }
 }
@@ -1972,6 +1979,10 @@ impl Isolate {
         // Registered unconditionally — with memory_limit it guards that ceiling,
         // without one it guards V8's default ceiling (catchable, not a process abort).
         boxed.add_near_heap_limit_callback(near_heap_limit_cb, iso_ptr.0 as *mut c_void);
+        // Wire the watchdog's interrupt target now that iso_ptr is stable: on a
+        // timeout the loop requests an interrupt against this ptr to capture the JS
+        // stack on the isolate thread before terminating (see timeout_interrupt).
+        watchdog.set_iso_ptr(iso_ptr.0 as *mut c_void);
         let iso_id = NEXT_ISOLATE_ID.fetch_add(1, Ordering::SeqCst);
         isolates().lock().unwrap().insert(iso_id, SendIso(boxed));
         // Root the owner Thread VALUE so its address can't be reused while this
@@ -2049,6 +2060,16 @@ impl Core {
         self.ensure_owner_and_live(ruby)?;
         let iso = self.iso_ptr.0;
         let depth = self.depth.fetch_add(1, Ordering::SeqCst);
+        // Drop any prior timeout's captured stack at the START of an OUTERMOST op,
+        // so it can't leak onto this op's error. Cleared only at depth 0 (not for
+        // nested ops) on purpose: a nested timeout's terminate is isolate-global
+        // and tears down the whole op stack, so EVERY frame's error (nested and the
+        // escalated outer one) should surface the same culprit — reply_value peeks
+        // (clones) rather than takes, leaving it readable for the outer frame until
+        // the next outermost op clears it here.
+        if depth == 0 {
+            istate!(unsafe { &mut *iso }).timeout_backtrace = None;
+        }
         // EVERYTHING that touches V8 — enter, the scope, the JS run, the scope
         // drop, exit — happens inside ONE without_gvl, hence on ONE native thread
         // with no GVL boundary in between: M:N could otherwise migrate us to a
@@ -2196,15 +2217,32 @@ impl Core {
     }
 
     // Map a terminal reply to a Ruby value (the common eval/call/run shape).
-    fn reply_value(ruby: &Ruby, reply: VmReply) -> Result<Value, Error> {
+    // &self so a Terminated outcome can pick up the JS stack the watchdog snapshot
+    // captured (see timeout_interrupt / take_timeout_backtrace).
+    fn reply_value(&self, ruby: &Ruby, reply: VmReply) -> Result<Value, Error> {
         match reply {
             VmReply::Done(Ok(val)) => jsval_to_ruby(ruby, &val),
+            // Clone (don't take): a nested timeout's terminate unwinds the whole op
+            // stack, so the escalated outer frame's error should name the same
+            // culprit too. The capture is dropped at the next outermost op's start
+            // (run), which keeps it from leaking onto an unrelated later op.
+            VmReply::Done(Err(VmError::Terminated)) => {
+                Err(terminated_error(ruby, self.peek_timeout_backtrace()))
+            }
             VmReply::Done(Err(e)) => Err(vm_err(ruby, e)),
             _ => Err(Error::new(
                 ruby.exception_runtime_error(),
                 "internal: unexpected reply kind",
             )),
         }
+    }
+
+    // Clone the JS stack the watchdog's interrupt captured at the last timeout.
+    // Owner thread, isolate live — called right after run() returns, the same
+    // access pattern as swap_instantiate. Does NOT clear it (run() clears at the
+    // next outermost op) so a nested timeout's outer frame can read it too.
+    fn peek_timeout_backtrace(&self) -> Option<Vec<String>> {
+        istate!(unsafe { &mut *self.iso_ptr.0 }).timeout_backtrace.clone()
     }
 
     fn call_proc(
@@ -2268,14 +2306,14 @@ impl Core {
             void,
             timeout_ms: self.default_timeout_ms,
         })?;
-        Self::reply_value(ruby, reply)
+        self.reply_value(ruby, reply)
     }
 
     fn drain_microtasks(&self, ruby: &Ruby) -> Result<Value, Error> {
         let reply = self.run(ruby, Request::DrainMicrotasks {
             timeout_ms: self.default_timeout_ms,
         })?;
-        Self::reply_value(ruby, reply)
+        self.reply_value(ruby, reply)
     }
 
     // Isolate#heap_statistics -> a Symbol-keyed Hash of v8::HeapStatistics
@@ -2303,7 +2341,7 @@ impl Core {
     // Isolate#low_memory_notification: ask V8 to run a full GC now.
     fn low_memory_notification(&self, ruby: &Ruby) -> Result<(), Error> {
         let reply = self.run(ruby, Request::LowMemoryNotification)?;
-        Self::reply_value(ruby, reply)?;
+        self.reply_value(ruby, reply)?;
         Ok(())
     }
 
@@ -2321,7 +2359,7 @@ impl Core {
             filename,
             timeout_ms,
         })?;
-        Self::reply_value(ruby, reply)
+        self.reply_value(ruby, reply)
     }
 
     fn attach(&self, ruby: &Ruby, context_id: i32, name: String, proc: Proc) -> Result<Value, Error> {
@@ -2335,7 +2373,7 @@ impl Core {
             host_fn_id,
             timeout_ms: self.default_timeout_ms,
         })?;
-        Self::reply_value(ruby, reply)
+        self.reply_value(ruby, reply)
     }
 
     // attach_many: install several host fns in ONE round-trip to the V8 thread
@@ -2367,7 +2405,7 @@ impl Core {
             entries: named_ids,
             timeout_ms: self.default_timeout_ms,
         })?;
-        Self::reply_value(ruby, reply)
+        self.reply_value(ruby, reply)
     }
 
     // Release the GC roots of the procs attached into |context_id| — its
@@ -2381,7 +2419,7 @@ impl Core {
 
     fn reset(&self, ruby: &Ruby, context_id: i32) -> Result<Value, Error> {
         let reply = self.run(ruby, Request::Reset { context_id })?;
-        let out = Self::reply_value(ruby, reply)?;
+        let out = self.reply_value(ruby, reply)?;
         // Only on success — a refused reset (unknown/suspended realm) keeps
         // its attached fns callable.
         self.release_context_procs(context_id);
@@ -2391,13 +2429,13 @@ impl Core {
     // Build a new context; returns its id (replied as an Int).
     fn create_context(&self, ruby: &Ruby) -> Result<i32, Error> {
         let reply = self.run(ruby, Request::CreateContext)?;
-        let id = Self::reply_value(ruby, reply)?;
+        let id = self.reply_value(ruby, reply)?;
         i32::try_convert(id)
     }
 
     fn dispose_context(&self, ruby: &Ruby, context_id: i32) -> Result<(), Error> {
         let reply = self.run(ruby, Request::DisposeContext { context_id })?;
-        Self::reply_value(ruby, reply)?;
+        self.reply_value(ruby, reply)?;
         self.release_context_procs(context_id);
         Ok(())
     }
@@ -2470,7 +2508,7 @@ impl Core {
         if let Some(exc) = resolver_err {
             return Err(Error::from(*exc));
         }
-        Self::reply_value(ruby, reply?)
+        self.reply_value(ruby, reply?)
     }
 
     fn evaluate_module(&self, ruby: &Ruby, module_id: i32) -> Result<Value, Error> {
@@ -2478,22 +2516,22 @@ impl Core {
             module_id,
             timeout_ms: self.default_timeout_ms,
         })?;
-        Self::reply_value(ruby, reply)
+        self.reply_value(ruby, reply)
     }
 
     fn module_namespace(&self, ruby: &Ruby, module_id: i32) -> Result<Value, Error> {
         let reply = self.run(ruby, Request::ModuleNamespace { module_id })?;
-        Self::reply_value(ruby, reply)
+        self.reply_value(ruby, reply)
     }
 
     fn module_status(&self, ruby: &Ruby, module_id: i32) -> Result<Value, Error> {
         let reply = self.run(ruby, Request::ModuleStatus { module_id })?;
-        Self::reply_value(ruby, reply)
+        self.reply_value(ruby, reply)
     }
 
     fn dispose_module(&self, ruby: &Ruby, module_id: i32) -> Result<(), Error> {
         let reply = self.run(ruby, Request::DisposeModule { module_id })?;
-        Self::reply_value(ruby, reply).map(|_| ())
+        self.reply_value(ruby, reply).map(|_| ())
     }
 
     // Classic script: compile, run, dispose.
@@ -2531,12 +2569,12 @@ impl Core {
             script_id,
             timeout_ms: self.default_timeout_ms,
         })?;
-        Self::reply_value(ruby, reply)
+        self.reply_value(ruby, reply)
     }
 
     fn dispose_script(&self, ruby: &Ruby, script_id: i32) -> Result<(), Error> {
         let reply = self.run(ruby, Request::DisposeScript { script_id })?;
-        Self::reply_value(ruby, reply).map(|_| ())
+        self.reply_value(ruby, reply).map(|_| ())
     }
 
     // Serialize a fresh bytecode cache from a compiled handle's current state
@@ -3085,6 +3123,36 @@ fn vm_err(ruby: &Ruby, e: VmError) -> Error {
             err_class(ruby, "V8OutOfMemoryError"),
             "JavaScript exceeded the isolate memory_limit",
         ),
+    }
+}
+
+// Build a RustyRacer::ScriptTerminatedError, attaching the JS stack the watchdog
+// snapshotted at the timeout (top frame first) as both #js_backtrace and — when
+// non-empty — the exception's Ruby backtrace, plus the top frame in the message
+// so even plain logging names what was running. js_backtrace is None for a stop
+// that isn't a watchdog timeout (e.g. Isolate#terminate), where no stack was
+// captured; then #js_backtrace is [] and the Ruby backtrace is left intact.
+fn terminated_error(ruby: &Ruby, js_backtrace: Option<Vec<String>>) -> Error {
+    let class = err_class(ruby, "ScriptTerminatedError");
+    let frames = js_backtrace.unwrap_or_default();
+    let message = match frames.first() {
+        Some(top) => format!("JavaScript was terminated (timeout or stop); running: {top}"),
+        None => "JavaScript was terminated (timeout or stop)".to_string(),
+    };
+    let exc: Value = match class.funcall("new", (message.as_str(),)) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    // Always expose #js_backtrace (even []) so the accessor is never nil.
+    let _ = exc.funcall::<_, _, Value>("instance_variable_set", ("@js_backtrace", frames.clone()));
+    // Only override the Ruby backtrace when we actually have JS frames — for a
+    // bare stop, keep Ruby's own backtrace (the eval call site) instead of [].
+    if !frames.is_empty() {
+        let _ = exc.funcall::<_, _, Value>("set_backtrace", (frames,));
+    }
+    match magnus::Exception::from_value(exc) {
+        Some(e) => Error::from(e),
+        None => Error::new(class, message),
     }
 }
 
