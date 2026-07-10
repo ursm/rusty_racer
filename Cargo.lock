@@ -543,7 +543,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_racer"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "libc",
  "magnus",
@@ -713,9 +713,9 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
 name = "v8"
-version = "150.0.0"
+version = "150.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0536cf89ae8d8cbc1665a76c7bc121cad55bd7e12fa67e30d766aa9db393ed72"
+checksum = "0ee8c3ecd446c44ce7d74dc2ea8e25e2ad91ef4bfbd954762831b2188b5b7781"
 dependencies = [
  "bindgen",
  "bitflags",

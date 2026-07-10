@@ -3,7 +3,7 @@
 # as their own PRs (they usually want a human look).
 version: 2
 updates:
-  # GitHub Actions used by cibuildgem.yaml / libv8-rusty.yml.
+  # GitHub Actions used by cibuildgem.yaml / test.yml.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
@@ -22,11 +22,10 @@ updates:
         update-types: ["minor", "patch"]
     ignore:
       # The v8 crate is pinned and bumped by HAND, never by Dependabot: a version
-      # change is a coordinated, multi-step job — rebuild the library-TLS
-      # librusty_v8.a archive (libv8-rusty.yml), re-verify the V8-internal-symbol
-      # FFI in set_v8_stack_limit/discover_scan_start_field, and re-check the
-      # fiber stack handling against the new V8. A lone Cargo.toml bump can't even
-      # build in CI (cibuildgem links the version-matched prebuilt archive).
+      # change reaches into V8 internals, so it needs a coordinated look — re-verify
+      # the V8-internal-symbol FFI in set_v8_stack_limit/discover_scan_start_field
+      # and re-check the fiber stack handling against the new V8. (The build itself
+      # is now a plain Cargo.toml bump — the v8 crate downloads the stock prebuilt.)
       - dependency-name: "v8"
 
   # Ruby dev dependencies (Gemfile + gemspec: rake, rake-compiler, rb_sys, …).
