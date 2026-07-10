@@ -6,7 +6,7 @@
 [package]
 name = "rusty_racer"
 version = "0.1.11"
-edition = "2021"
+edition = "2024"
 publish = false
 
 [lib]
