@@ -278,13 +278,12 @@ builds the extension at install time — see below.
 
 ## Building from source
 
-The stock `v8` crate prebuilt links as a binary (initial-exec TLS), which a Ruby
-extension's shared object can't use. A source build therefore needs a
-**library-TLS** `librusty_v8.a`. Either:
-
-- point `RUSTY_V8_ARCHIVE` at a prebuilt library-TLS archive, or
-- set `V8_FROM_SOURCE=1` to build V8 from the `denoland/rusty_v8` git tree
-  (large: lots of disk, RAM, and time).
+Building the source gem needs only a Rust toolchain — the `v8` crate downloads
+Deno's stock prebuilt `rusty_v8` archive and links it statically. Since rusty_v8
+150.1.0 that archive is shared-library-safe on Linux too (it no longer emits the
+`R_X86_64_TPOFF32`-under-`-shared` relocation that used to block linking V8 into
+an extension's shared object), so no `RUSTY_V8_ARCHIVE` override or from-source V8
+build is required on any supported platform.
 
 ## License
 

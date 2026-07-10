@@ -1,11 +1,10 @@
 require "mkmf"
 require "rb_sys/mkmf"
 
-# NOTE: V8 must be built from source so the extension links the library-TLS V8
-# a cdylib needs (the prebuilt librusty_v8 is initial-exec TLS -> R_X86_64_TPOFF32
-# under -shared). V8_FROM_SOURCE has to be in the *process environment* of the
-# `cargo` invocation, which make spawns separately from this extconf — so it is
-# set in the CI workflow env (and must be exported in the shell for local
-# `rake compile`), NOT here, where it would not propagate.
+# The v8 crate downloads Deno's stock prebuilt rusty_v8 archive and links it
+# statically — no build config needed here. As of rusty_v8 150.1.0 (PR #2008) the
+# Linux archive is built shared-library-safe (v8_monolithic_for_shared_library),
+# so it links into the extension cdylib without the R_X86_64_TPOFF32-under-shared
+# error that used to force a from-source library-TLS build on linux.
 
 create_rust_makefile("rusty_racer/rusty_racer")

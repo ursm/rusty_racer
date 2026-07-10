@@ -1,11 +1,12 @@
 # Standalone (detached from the spike workspace) so it builds as a normal gem
-# extension. The cdylib is the Ruby extension; V8 is baked in (a from-source V8
-# build links library-TLS on linux, so the .so loads fine — no separate
-# libv8-rusty needed under the cibuildgem native-per-platform model).
+# extension. The cdylib is the Ruby extension; V8 is baked in — the v8 crate
+# downloads Deno's stock prebuilt rusty_v8 archive and links it statically. Since
+# rusty_v8 150.1.0 that archive is shared-library-safe on linux too, so the .so
+# links and loads with no custom archive.
 [package]
 name = "rusty_racer"
-version = "0.1.10"
-edition = "2021"
+version = "0.1.11"
+edition = "2024"
 publish = false
 
 [lib]
@@ -20,9 +21,9 @@ rb-sys = "0.9"
 # simdutf: SIMD-accelerated UTF-8/UTF-16 transcoding in rusty_v8's String
 # conversion (to_rust_string_lossy etc.), the path every V8->Ruby string crosses.
 # ~6-8x faster marshalling for non-ASCII results (measured); ASCII is unaffected.
-# Needs the linked archive built with rusty_v8_enable_simdutf=true (libv8-rusty.yml
-# for linux; the v8 crate auto-fetches Deno's _simdutf prebuilt on macOS).
-v8 = { version = "150.0.0", features = ["simdutf"] }
+# The feature makes the v8 crate fetch Deno's _simdutf prebuilt archive variant
+# (which is built with rusty_v8_enable_simdutf=true) on every platform.
+v8 = { version = "150.1.0", features = ["simdutf"] }
 # pthread stack-bounds query, to set V8's stack limit per op relative to the
 # current native thread (in-thread V8 runs on the Ruby thread's stack).
 libc = "0.2"
