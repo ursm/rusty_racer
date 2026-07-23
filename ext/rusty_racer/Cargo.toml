@@ -5,7 +5,7 @@
 # links and loads with no custom archive.
 [package]
 name = "rusty_racer"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2024"
 publish = false
 
@@ -23,7 +23,7 @@ rb-sys = "0.9"
 # ~6-8x faster marshalling for non-ASCII results (measured); ASCII is unaffected.
 # The feature makes the v8 crate fetch Deno's _simdutf prebuilt archive variant
 # (which is built with rusty_v8_enable_simdutf=true) on every platform.
-v8 = { version = "150.2.0", features = ["simdutf"] }
+v8 = { version = "150.3.0", features = ["simdutf"] }
 # pthread stack-bounds query, to set V8's stack limit per op relative to the
 # current native thread (in-thread V8 runs on the Ruby thread's stack).
 libc = "0.2"
