@@ -37,7 +37,7 @@ jobs:
     name: "Tag matches the gem version"
     runs-on: "ubuntu-22.04"
     steps:
-      - uses: "actions/checkout@v6"
+      - uses: "actions/checkout@v7"
       - name: "On a tag push, the tag must equal lib/rusty_racer/version.rb"
         run: |
           set -euo pipefail
@@ -64,7 +64,7 @@ jobs:
     runs-on: "${{ matrix.os }}"
     steps:
       - name: "Checkout code"
-        uses: "actions/checkout@v6"
+        uses: "actions/checkout@v7"
       - name: "Setup Ruby"
         uses: "ruby/setup-ruby@v1"
         with:
@@ -91,7 +91,7 @@ jobs:
       RUSTY_RACER_WATCHDOG_DEBUG: "1"
     steps:
       - name: "Checkout code"
-        uses: "actions/checkout@v6"
+        uses: "actions/checkout@v7"
       - name: "Setup Ruby"
         uses: "ruby/setup-ruby@v1"
         with:
