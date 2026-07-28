@@ -157,8 +157,9 @@ fn native_stack_bounds() -> (usize, usize) {
 // a deep fiber recursion overflows the real stack and SEGVs the unmapped guard.
 // (0, 0) if unknown.
 //
-// Cached per native thread, several regions at a time, because a miss re-parses
-// all of /proc/self/maps and costs far more than the op it serves: with ONE slot
+// Cached per native thread, several regions at a time, because a miss asks the
+// OS for the whole memory map and costs far more than the op it serves: with ONE
+// slot
 // a workload that alternates between fibers missed on every single op, and an
 // eval went from 1.2us to 31us as soon as two fibers took turns (measured on a
 // 212-line maps; a Rails process has many times that). Ruby pools fiber stacks,
@@ -275,16 +276,16 @@ fn current_region_bounds_cached(addr: usize) -> (usize, usize) {
     })
 }
 
-// The [start, end) of the /proc/self/maps mapping containing `addr`. Linux only;
-// (0, 0) elsewhere (and the caller falls back). Reads the file fresh — slow, so
-// only called on a cache miss (a new fiber).
+// The [start, end) of the mapping containing `addr`, or (0, 0) when it can't be
+// established. Only called on a cache miss (a new fiber), because it is slow.
 //
-// Everything that needs a FIBER's real bounds degrades on the (0, 0) platforms,
-// macOS being the shipped one: the stack limit drops to a fixed budget below the
-// SP (see StackScope::enter), and a nested op can no longer widen its GC-scan
-// start to the enclosing op's, so it narrows to its own frame. Both are the
-// pre-fiber-support behaviour rather than a crash, but a darwin implementation
-// (mach_vm_region on the current task) would close the gap.
+// (0, 0) is the fail-safe answer, not an error: every caller falls back to a
+// fixed budget below the SP, which is what this gem did on every platform before
+// any of these lookups existed. So a platform without an implementation, or a
+// lookup that returns something we can't vouch for, degrades to a smaller JS
+// stack rather than to a wrong one.
+//
+// Linux reads /proc/self/maps fresh each time.
 #[cfg(target_os = "linux")]
 fn query_region_bounds(addr: usize) -> (usize, usize) {
     use std::io::Read;
@@ -314,7 +315,73 @@ fn query_region_bounds(addr: usize) -> (usize, usize) {
     (0, 0)
 }
 
-#[cfg(not(target_os = "linux"))]
+// macOS has no /proc, so ask the Mach VM directly. mach_vm_region reports the
+// region containing `addr` — or, when `addr` sits in a hole, the next one ABOVE
+// it — so the answer is checked for containment rather than trusted. It is also
+// checked for being readable and writable: a stack always is, and a protection
+// that isn't tells us we either walked into something that is not a stack or
+// misread the reply, in which case the fixed-budget fallback is the safer answer.
+#[cfg(target_os = "macos")]
+fn query_region_bounds(addr: usize) -> (usize, usize) {
+    // Not in libc, which points at the `mach2` crate instead; these are the only
+    // entry points we need, so declare them here rather than take the dependency.
+    // (libc does carry mach_task_self_, but deprecated for the same reason.)
+    unsafe extern "C" {
+        static mach_task_self_: libc::mach_port_t;
+        fn mach_vm_region(
+            target_task: libc::vm_map_t,
+            address: *mut libc::mach_vm_address_t,
+            size: *mut libc::mach_vm_size_t,
+            flavor: libc::c_int,
+            info: *mut u32,
+            info_count: *mut libc::mach_msg_type_number_t,
+            object_name: *mut libc::mach_port_t,
+        ) -> libc::kern_return_t;
+        fn mach_port_deallocate(
+            task: libc::mach_port_t,
+            name: libc::mach_port_t,
+        ) -> libc::kern_return_t;
+    }
+    // VM_REGION_BASIC_INFO_64, and the width of vm_region_basic_info_data_64_t
+    // in u32s. Only `protection` (its first field) is read.
+    const VM_REGION_BASIC_INFO_64: libc::c_int = 9;
+    const VM_REGION_BASIC_INFO_COUNT_64: libc::mach_msg_type_number_t = 9;
+    const KERN_SUCCESS: libc::kern_return_t = 0;
+    const VM_PROT_READ_WRITE: u32 = 0x1 | 0x2;
+
+    unsafe {
+        let mut start = addr as libc::mach_vm_address_t;
+        let mut size: libc::mach_vm_size_t = 0;
+        let mut info = [0u32; VM_REGION_BASIC_INFO_COUNT_64 as usize];
+        let mut count = VM_REGION_BASIC_INFO_COUNT_64;
+        let mut object_name: libc::mach_port_t = 0;
+        let kr = mach_vm_region(
+            mach_task_self_,
+            &mut start,
+            &mut size,
+            VM_REGION_BASIC_INFO_64,
+            info.as_mut_ptr(),
+            &mut count,
+            &mut object_name,
+        );
+        // Documented to come back MACH_PORT_NULL for this flavor, but a leaked
+        // port name in a per-fiber path would accumulate, so hand it back.
+        if object_name != 0 {
+            mach_port_deallocate(mach_task_self_, object_name);
+        }
+        if kr != KERN_SUCCESS || size == 0 || info[0] & VM_PROT_READ_WRITE != VM_PROT_READ_WRITE {
+            return (0, 0);
+        }
+        let (lo, hi) = (start as usize, start.saturating_add(size) as usize);
+        if addr >= lo && addr < hi {
+            (lo, hi)
+        } else {
+            (0, 0) // `addr` was in a hole; this is the region after it
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn query_region_bounds(_addr: usize) -> (usize, usize) {
     (0, 0)
 }
@@ -337,8 +404,8 @@ pub(crate) static STACK_DEBUG: AtomicBool = AtomicBool::new(false);
 //   * Too low (below the real bottom) and a deep recursion grows past the
 //     mapped stack and SEGVs the unmapped guard page below it.
 // So detect the stack by comparing the SP to the cached native bounds: on the
-// native stack, anchor to its pthread bottom; on a fiber, find the bottom of the
-// /proc/self/maps region holding the SP (the fiber's real bottom — anchoring to
+// native stack, anchor to its pthread bottom; on a fiber, look up the bottom of
+// the mapping holding the SP (the fiber's real bottom — anchoring to
 // SP minus a fixed guard punched through the bottom of Avo's small/deep Capybara
 // fibers and SEGV'd).
 //
@@ -433,8 +500,8 @@ impl<'a> StackScope<'a> {
         let limit = if on_native {
             nbottom + NATIVE_GUARD
         } else {
-            // Anchor to the FIBER's real bottom (the /proc/self/maps region
-            // holding the SP), not the SP: SP - fixed_guard can punch through the
+            // Anchor to the FIBER's real bottom (the mapping holding the SP),
+            // not the SP: SP - fixed_guard can punch through the
             // bottom of a small/deep fiber stack and SEGV (Avo's deep Capybara
             // filter chain). Reserve FIBER_RESERVE above the bottom for the
             // throw, but keep the limit below the SP so we don't false-overflow;
@@ -448,15 +515,16 @@ impl<'a> StackScope<'a> {
             if region.0 != 0 {
                 (region.0 + FIBER_RESERVE).min(sp.saturating_sub(8 * 1024))
             } else {
-                // Region unknown — only Linux can look a fiber's bounds up (see
-                // query_region_bounds), so this is the macOS path. Best effort:
-                // hand JS a fixed budget below the SP and hope the fiber is that
+                // Region unknown. Both shipped platforms implement the lookup,
+                // so reaching this on one of them means the lookup FAILED (see
+                // query_region_bounds for what it refuses to vouch for) — worth
+                // chasing rather than assuming, since the budget here is only a
+                // guess: a fixed reserve below the SP, hoping the fiber is that
                 // deep. It usually is for an OUTERMOST fiber op, whose SP sits
                 // near the fiber's top, and much less reliably for a NESTED one,
                 // whose SP is already far down the fiber — there this can land
                 // below the fiber's mapped bottom, and V8 then grows through the
-                // guard page (SEGV) instead of throwing. Fixing that properly
-                // means a mach_vm_region lookup for darwin.
+                // guard page (SEGV) instead of throwing.
                 sp.saturating_sub(64 * 1024)
             }
         };
@@ -519,7 +587,7 @@ impl<'a> StackScope<'a> {
         //   * a fiber we ENTERED (the enclosing op is elsewhere) — this op's
         //     `stack_top`, which keeps the range between two real stack pointers
         //     (marker..stack_top) and so guaranteed mapped. We can't use the
-        //     /proc/maps region top: that mapping isn't reliably contiguous, so
+        //     looked-up region's top: that mapping isn't reliably contiguous, so
         //     the scan could still hit a hole below it.
         //   * a fiber we were ALREADY on (a nested op under a host callback that
         //     didn't switch stacks) — the enclosing op's start, which is above

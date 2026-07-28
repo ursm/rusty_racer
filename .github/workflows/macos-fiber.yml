@@ -1,0 +1,61 @@
+# The macOS half of the fiber stack-bounds work, on demand and on its own.
+#
+# Fiber bounds come from mach_vm_region there, which cannot be exercised from a
+# Linux checkout at all, so CI is the only oracle — and waiting out the 13-job
+# test matrix to learn one number is a poor iteration loop. This runs the fiber
+# tests on both macOS architectures and nothing else, then prints the numbers a
+# failure would need, so a red run explains itself instead of just going red.
+#
+# workflow_dispatch only works once this file is on the default branch, hence the
+# branch-prefix trigger as well: push to macos-something and it runs from there.
+name: "macos-fiber"
+on:
+  workflow_dispatch:
+  push:
+    branches: ["macos-**"]
+
+concurrency:
+  group: "macos-fiber-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  fiber:
+    name: "fiber (${{ matrix.os }})"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["macos-latest", "macos-26-intel"]
+    runs-on: "${{ matrix.os }}"
+    steps:
+      - uses: "actions/checkout@v7"
+      - uses: "dtolnay/rust-toolchain@stable"
+      - uses: "ruby/setup-ruby@v1"
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+      - name: "Compile"
+        id: "compile"
+        run: "bundle exec rake compile"
+      - name: "Fiber tests"
+        run: "bundle exec ruby -Ilib -Itest test/rusty_racer_test.rb -n '/fiber|stack_bounds|headroom/i'"
+      # Runs even when the tests fail, because this is exactly what such a
+      # failure needs explaining — but not when the build did, where it would
+      # only repeat the compiler's own error under a second red X. The depths
+      # must GROW with the fiber stack size; if they don't, the region lookup
+      # isn't in effect and every fiber is on the fixed fallback budget. The
+      # debug line then shows what bounds the lookup actually came back with.
+      - name: "Diagnostics"
+        if: "always() && steps.compile.outcome == 'success'"
+        run: |
+          for size in 524288 1048576 4194304; do
+            RUBY_FIBER_MACHINE_STACK_SIZE=$size bundle exec ruby -Ilib -e '
+              ctx = (require "rusty_racer"; RustyRacer::Isolate.new.context)
+              ctx.eval("globalThis.probe = function () { let d = 0; function r() { d++; r() } try { r() } catch (e) { return d } }")
+              puts "fiber stack #{ENV["RUBY_FIBER_MACHINE_STACK_SIZE"].to_i / 1024}KB -> JS depth #{Fiber.new { ctx.eval("probe()") }.resume}"
+            '
+          done
+          echo "--- per-op stack decisions (fiber=true lines are the ones that matter) ---"
+          RUSTY_RACER_STACK_DEBUG=1 bundle exec ruby -Ilib -e '
+            ctx = (require "rusty_racer"; RustyRacer::Isolate.new.context)
+            3.times { Fiber.new { ctx.eval("1 + 1") }.resume }
+          ' 2>&1 | grep 'rusty stack' | tail -6

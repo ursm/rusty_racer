@@ -2061,29 +2061,49 @@ class RustyRacerTest < Minitest::Test
     assert_equal 2, @ctx.eval('1 + 1')
   end
 
-  def test_alternating_fibers_each_get_their_own_stack_bounds
-    # Only Linux looks a fiber's stack bounds up (/proc/self/maps has no darwin
-    # equivalent here), so elsewhere every fiber runs on a fixed fallback budget:
-    # there are no cached bounds to get wrong, and none of the headroom the
-    # depths below assume.
-    skip 'fiber stack bounds are only looked up on Linux' unless RUBY_PLATFORM.include?('linux')
+  def test_fiber_js_headroom_follows_the_fibers_real_stack_size
+    # Proves the limit is derived from the fiber's ACTUAL bounds and not from a
+    # fixed budget below the SP — the fallback taken when the platform can't look
+    # a region up. Absolute depths differ per platform and architecture, so assert
+    # the RELATIONSHIP instead: quadruple the fiber stack and the reachable JS
+    # depth has to grow with it. A fixed budget would return the same depth for
+    # both. Ruby reads the size at boot, hence the subprocesses.
+    # Both shipped platforms implement the lookup; the source gem builds on
+    # others, where the stub leaves every fiber on the fallback budget and the
+    # relationship this asserts cannot hold.
+    skip 'fiber stack bounds are only looked up on Linux and macOS' unless RUBY_PLATFORM.match?(/linux|darwin/)
 
-    # Those bounds are cached per thread, a few regions at a time so that ops
-    # alternating between fibers don't re-parse the file every time. Each fiber
-    # must still come back with ITS OWN bottom: handing one fiber another's
-    # (lower) bottom would tell V8 it has far more headroom than the fiber really
-    # has, and the recursion below would run through the guard page instead of
+    small_bytes = 512 * 1024
+    large_bytes = 4 * 1024 * 1024
+    small = fiber_js_depth(small_bytes)
+    large = fiber_js_depth(large_bytes)
+    assert_operator large, :>, small * 3,
+                    'JS headroom on a fiber is not tracking its stack size ' \
+                    "(#{small_bytes / 1024}KB -> #{small}, #{large_bytes / 1024}KB -> #{large}); " \
+                    'the region lookup is not in effect and the fixed fallback budget is being used'
+  end
+
+  def test_alternating_fibers_each_get_their_own_stack_bounds
+    # Stack bounds are cached per thread, a few regions at a time so that ops
+    # alternating between fibers don't look them up every time. Each fiber must
+    # still come back with ITS OWN bottom: handing one fiber another's (lower)
+    # bottom would tell V8 it has far more headroom than the fiber really has,
+    # and the recursion below would run through the guard page instead of
     # throwing. Run more fibers than FIBER_REGION_SLOTS (16, in stack.rs) so
     # entries are evicted and re-queried rather than all sitting resident — raise
     # that constant past this count and the test quietly stops covering eviction.
+    #
     # probe() reports how deep it got before overflowing, which catches BOTH ways
-    # the bounds can be wrong. Too low a bottom (another fiber's) hands V8 megabytes
-    # of headroom on a 644KB stack and the recursion leaves the mapping — a SEGV,
-    # so the process dies rather than the assertion failing. Too high a bottom
-    # clamps the limit to SP - 8KB and starves the fiber instead, which is silent
-    # unless the depth is checked: a healthy fiber reaches ~5700-8200 here (the
-    # main stack reaches ~147000), a starved one a few hundred.
+    # the bounds can be wrong. Too low a bottom (another fiber's) hands V8 far
+    # more headroom than the stack has and the recursion leaves the mapping — a
+    # SEGV, so the process dies rather than the assertion failing. Too high a
+    # bottom clamps the limit just under the SP and starves the fiber instead,
+    # which is silent unless the depth is checked. Compare against a lone fiber
+    # measured here rather than an absolute floor: fibers differ in size across
+    # platforms, but every fiber in one process should reach the same order of
+    # depth as any other.
     @ctx.eval('globalThis.probe = function () { let d = 0; function r() { d++; r() } try { r() } catch (e) { return d } }')
+    alone = Fiber.new { @ctx.eval('probe()') }.resume
     fibers = Array.new(20) {
       Fiber.new {
         loop do
@@ -2093,7 +2113,7 @@ class RustyRacerTest < Minitest::Test
     }
     2.times do
       fibers.each do |f|
-        assert_operator f.resume, :>, 2_000
+        assert_operator f.resume, :>, alone / 2
       end
     end
     assert_equal 2, @ctx.eval('1 + 1')
@@ -2605,6 +2625,24 @@ class RustyRacerTest < Minitest::Test
 
   def call_with_deadline(ctx, name)
     ctx.call(name)
+  end
+
+  # How deep JS recursion gets inside a Fiber whose machine stack is
+  # `stack_bytes`. Ruby sizes fiber stacks from the environment at boot, so this
+  # has to be a fresh process; the child inherits this one's $LOAD_PATH so it
+  # loads the extension under test rather than an installed gem.
+  def fiber_js_depth(stack_bytes)
+    script = <<~'RUBY'
+      require 'rusty_racer'
+      ctx = RustyRacer::Isolate.new.context
+      ctx.eval('globalThis.probe = function () { let d = 0; function r() { d++; r() } try { r() } catch (e) { return d } }')
+      print Fiber.new { ctx.eval('probe()') }.resume
+    RUBY
+    env = {'RUBY_FIBER_MACHINE_STACK_SIZE' => stack_bytes.to_s}
+    argv = [RbConfig.ruby, *$LOAD_PATH.flat_map {|d| ['-I', d] }, '-e', script]
+    out = IO.popen(env, argv, &:read)
+    assert_predicate $?, :success?, "probe subprocess failed: #{out}"
+    Integer(out)
   end
 
   def deadline_thread(&block)
