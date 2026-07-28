@@ -1,11 +1,6 @@
 # Static checks on the Rust extension, on the same triggers as test.yml but as
 # its own workflow: one linux job instead of a 12-entry matrix, so a lint
 # regression is obvious without reading through the test results.
-#
-# clippy only. The crate is deliberately NOT rustfmt-formatted — running it
-# rewrites ~100 hunks of hand-laid-out code (import order, struct literals,
-# signature wrapping) for no readability gain — so `cargo fmt --check` is not
-# part of the gate.
 name: "lint"
 on:
   push:
@@ -18,13 +13,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  clippy:
+  rust:
     runs-on: "ubuntu-22.04"
     steps:
       - uses: "actions/checkout@v7"
       - uses: "dtolnay/rust-toolchain@stable"
         with:
-          components: "clippy"
+          components: "clippy, rustfmt"
+      # Default config (style edition comes from the crate's edition = 2024).
+      # Needs no Ruby and no V8 download, so it runs first and fails fast.
+      - name: "cargo fmt"
+        run: "cargo fmt --manifest-path ext/rusty_racer/Cargo.toml --check"
       # rb-sys's build script introspects the running Ruby for the headers and
       # link flags, so even `cargo clippy` needs one on PATH. No bundler-cache:
       # nothing here goes through Bundler.
