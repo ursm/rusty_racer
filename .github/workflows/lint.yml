@@ -1,0 +1,44 @@
+# Static checks on the Rust extension, on the same triggers as test.yml but as
+# its own workflow: one linux job instead of a 12-entry matrix, so a lint
+# regression is obvious without reading through the test results.
+name: "lint"
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+# A new push to a branch/PR cancels its still-running lint run.
+concurrency:
+  group: "lint-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: "ubuntu-22.04"
+    steps:
+      - uses: "actions/checkout@v7"
+      - uses: "dtolnay/rust-toolchain@stable"
+        with:
+          components: "clippy, rustfmt"
+      # Default config (style edition comes from the crate's edition = 2024).
+      # Needs no Ruby and no V8 download, so it runs first and fails fast.
+      # Workspace-wide, not --manifest-path: the root is a workspace, and a
+      # second member added later must land inside the gate, not beside it.
+      - name: "cargo fmt"
+        run: "cargo fmt --all --check"
+      # Only clippy needs this, so it sits AFTER the fmt gate: a formatting slip
+      # still fails without waiting on a cache restore. Worth having, because
+      # clippy builds the v8 crate's build script, which downloads Deno's
+      # prebuilt rusty_v8 archive into target/ — minutes per run otherwise.
+      - uses: "Swatinem/rust-cache@v2"
+      # rb-sys's build script introspects the running Ruby for the headers and
+      # link flags, so even `cargo clippy` needs one on PATH. No bundler-cache:
+      # nothing here goes through Bundler.
+      - uses: "ruby/setup-ruby@v1"
+        with:
+          ruby-version: "3.4"
+      # -D warnings makes this a gate rather than advice. clippy comes from the
+      # stable toolchain, so a new release can introduce a lint that fails an
+      # otherwise-unchanged PR; fix it or #[allow] it with a reason.
+      - name: "cargo clippy"
+        run: "cargo clippy --workspace --all-targets -- -D warnings"

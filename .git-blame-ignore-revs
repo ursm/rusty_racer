@@ -1,0 +1,7 @@
+# Revisions that only reformat. Skipped by `git blame` so they don't sit on
+# top of every line. GitHub honours this file automatically; locally, run
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+# once per clone.
+
+# Format the extension with rustfmt
+7cab4a46889296afa68b87f697f79699a0309fcd

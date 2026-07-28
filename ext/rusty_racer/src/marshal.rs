@@ -10,7 +10,7 @@ use std::ffi::c_void;
 
 use magnus::value::ReprValue;
 use magnus::{
-    prelude::*, Error, ExceptionClass, IntoValue, RArray, RHash, RString, Ruby, TryConvert, Value,
+    Error, ExceptionClass, IntoValue, RArray, RHash, RString, Ruby, TryConvert, Value, prelude::*,
 };
 
 // ---------------------------------------------------------------------------
@@ -32,12 +32,18 @@ pub(crate) enum JsVal {
     // Some) registers it in the Ref table so a binary blob aliased in a graph
     // keeps ONE identity instead of being duplicated; None = not identity-tracked
     // (e.g. a to_str result).
-    Bytes { id: Option<u32>, bytes: Vec<u8> },
+    Bytes {
+        id: Option<u32>,
+        bytes: Vec<u8>,
+    },
     // Arbitrary-precision integer (JS BigInt <-> Ruby Integer). Carried as V8's
     // word representation: sign + little-endian u64 limbs. Both ends speak this
     // natively (V8 BigInt words; Ruby Integer via a hex string), so no value is
     // truncated — unlike routing a big int through f64.
-    BigInt { negative: bool, words: Vec<u64> },
+    BigInt {
+        negative: bool,
+        words: Vec<u64>,
+    },
     // JS Date <-> Ruby Time, carried as milliseconds since the Unix epoch
     // (v8::Date::value_of's unit). mini_racer marshals Date to Time.
     Date(f64),
@@ -45,17 +51,29 @@ pub(crate) enum JsVal {
     // round-trip: the first time an object is seen it is emitted with its id,
     // and any later occurrence (a sibling sharing it, or a cycle back to an
     // ancestor) is emitted as Ref(id) instead of being re-expanded.
-    Array { id: u32, items: Vec<JsVal> },
+    Array {
+        id: u32,
+        items: Vec<JsVal>,
+    },
     // JS object / Ruby Hash with string keys. Insertion order preserved.
-    Obj { id: u32, entries: Vec<(String, JsVal)> },
+    Obj {
+        id: u32,
+        entries: Vec<(String, JsVal)>,
+    },
     // JS Map <-> Ruby RustyRacer::JSMap (a Hash subclass). Keys are arbitrary
     // values (not just strings), so this is distinct from Obj. Insertion order
     // preserved. The JSMap subclass is what lets a Map round-trip: a plain Ruby
     // Hash marshals to Obj (a JS Object), a JSMap to Map — the return leg tells
     // them apart by class (Ruby has no native Map type).
-    Map { id: u32, pairs: Vec<(JsVal, JsVal)> },
+    Map {
+        id: u32,
+        pairs: Vec<(JsVal, JsVal)>,
+    },
     // JS Set <-> Ruby Set (stdlib).
-    Set { id: u32, items: Vec<JsVal> },
+    Set {
+        id: u32,
+        items: Vec<JsVal>,
+    },
     // Back-reference to an already-emitted container (preserves identity; makes
     // cycles representable instead of truncating at a depth cap).
     Ref(u32),
@@ -180,74 +198,77 @@ fn js_to_jsval_d(
     if value.is_number() {
         return JsVal::Num(value.number_value(scope).unwrap_or(f64::NAN));
     }
-    if value.is_big_int() {
-        if let Ok(bi) = v8::Local::<v8::BigInt>::try_from(value) {
-            let mut words = vec![0u64; bi.word_count()];
-            let (negative, _) = bi.to_words_array(&mut words);
-            return JsVal::BigInt { negative, words };
-        }
+    if value.is_big_int()
+        && let Ok(bi) = v8::Local::<v8::BigInt>::try_from(value)
+    {
+        let mut words = vec![0u64; bi.word_count()];
+        let (negative, _) = bi.to_words_array(&mut words);
+        return JsVal::BigInt { negative, words };
     }
     // Date before the generic object branch (a Date *is* an object).
-    if value.is_date() {
-        if let Ok(date) = v8::Local::<v8::Date>::try_from(value) {
-            return JsVal::Date(date.value_of());
-        }
+    if value.is_date()
+        && let Ok(date) = v8::Local::<v8::Date>::try_from(value)
+    {
+        return JsVal::Date(date.value_of());
     }
     // Binary buffers before the generic object branch (they are objects too).
     // A TypedArray/DataView copies its VIEWED window; a bare ArrayBuffer or
     // SharedArrayBuffer copies the whole buffer. All become a Ruby binary
     // String. (Without the SharedArrayBuffer arm a bare SAB would fall through
     // to the plain-object branch and marshal as an empty Hash — silent loss.)
-    if value.is_array_buffer_view() {
-        if let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(value) {
-            let obj = v8::Local::<v8::Object>::try_from(value).unwrap();
-            // depth 0: a buffer is a leaf (no recursion into children), so it
-            // never risks native-stack overflow and must stay faithful bytes
-            // even when deeply nested — only the identity (Ref) check applies,
-            // never the depth-truncation-to-lossy-string the generic path uses.
-            let id = match js_container_id(scope, seen, value, obj, 0) {
-                Ok(id) => id,
-                Err(jsval) => return jsval, // a Ref to the same buffer
-            };
-            let len = view.byte_length();
-            let mut buf: Vec<u8> = Vec::with_capacity(len);
-            // copy_contents_uninit writes into the UNINITIALIZED spare capacity
-            // (a &mut [MaybeUninit<u8>]) — never forming a &mut [u8] over uninit
-            // memory the way copy_contents would (that's UB). set_len to exactly
-            // what it wrote so a detached/short view never exposes uninit bytes.
-            let n = view.copy_contents_uninit(&mut buf.spare_capacity_mut()[..len]);
-            unsafe { buf.set_len(n) };
-            return JsVal::Bytes { id: Some(id), bytes: buf };
-        }
+    if value.is_array_buffer_view()
+        && let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(value)
+    {
+        let obj = v8::Local::<v8::Object>::try_from(value).unwrap();
+        // depth 0: a buffer is a leaf (no recursion into children), so it
+        // never risks native-stack overflow and must stay faithful bytes
+        // even when deeply nested — only the identity (Ref) check applies,
+        // never the depth-truncation-to-lossy-string the generic path uses.
+        let id = match js_container_id(scope, seen, value, obj, 0) {
+            Ok(id) => id,
+            Err(jsval) => return jsval, // a Ref to the same buffer
+        };
+        let len = view.byte_length();
+        let mut buf: Vec<u8> = Vec::with_capacity(len);
+        // copy_contents_uninit writes into the UNINITIALIZED spare capacity
+        // (a &mut [MaybeUninit<u8>]) — never forming a &mut [u8] over uninit
+        // memory the way copy_contents would (that's UB). set_len to exactly
+        // what it wrote so a detached/short view never exposes uninit bytes.
+        let n = view.copy_contents_uninit(&mut buf.spare_capacity_mut()[..len]);
+        unsafe { buf.set_len(n) };
+        return JsVal::Bytes {
+            id: Some(id),
+            bytes: buf,
+        };
     }
-    if value.is_array_buffer() {
-        if let Ok(ab) = v8::Local::<v8::ArrayBuffer>::try_from(value) {
-            let obj = v8::Local::<v8::Object>::try_from(value).unwrap();
-            // depth 0 — a buffer is a leaf; see the view arm above.
-            let id = match js_container_id(scope, seen, value, obj, 0) {
-                Ok(id) => id,
-                Err(jsval) => return jsval,
-            };
-            return JsVal::Bytes {
-                id: Some(id),
-                bytes: copy_buffer_bytes(ab.data(), ab.byte_length()),
-            };
-        }
+    if value.is_array_buffer()
+        && let Ok(ab) = v8::Local::<v8::ArrayBuffer>::try_from(value)
+    {
+        let obj = v8::Local::<v8::Object>::try_from(value).unwrap();
+        // depth 0 — a buffer is a leaf; see the view arm above.
+        let id = match js_container_id(scope, seen, value, obj, 0) {
+            Ok(id) => id,
+            Err(jsval) => return jsval,
+        };
+        return JsVal::Bytes {
+            id: Some(id),
+            bytes: copy_buffer_bytes(ab.data(), ab.byte_length()),
+        };
     }
-    if value.is_shared_array_buffer() {
-        if let Ok(sab) = v8::Local::<v8::SharedArrayBuffer>::try_from(value) {
-            let obj = v8::Local::<v8::Object>::try_from(value).unwrap();
-            // depth 0 — a buffer is a leaf; see the view arm above.
-            let id = match js_container_id(scope, seen, value, obj, 0) {
-                Ok(id) => id,
-                Err(jsval) => return jsval,
-            };
-            let store = sab.get_backing_store();
-            return JsVal::Bytes {
-                id: Some(id),
-                bytes: copy_buffer_bytes(store.data(), sab.byte_length()),
-            };
-        }
+    if value.is_shared_array_buffer()
+        && let Ok(sab) = v8::Local::<v8::SharedArrayBuffer>::try_from(value)
+    {
+        let obj = v8::Local::<v8::Object>::try_from(value).unwrap();
+        // depth 0 — a buffer is a leaf; see the view arm above.
+        let id = match js_container_id(scope, seen, value, obj, 0) {
+            Ok(id) => id,
+            Err(jsval) => return jsval,
+        };
+        let store = sab.get_backing_store();
+        return JsVal::Bytes {
+            id: Some(id),
+            bytes: copy_buffer_bytes(store.data(), sab.byte_length()),
+        };
     }
     // Map/Set before the generic object branch (both are objects).
     if value.is_map() {
@@ -261,8 +282,12 @@ fn js_to_jsval_d(
         let mut pairs = Vec::with_capacity((arr.length() / 2) as usize);
         let mut i = 0;
         while i + 1 < arr.length() {
-            let k = arr.get_index(scope, i).unwrap_or_else(|| v8::undefined(scope).into());
-            let v = arr.get_index(scope, i + 1).unwrap_or_else(|| v8::undefined(scope).into());
+            let k = arr
+                .get_index(scope, i)
+                .unwrap_or_else(|| v8::undefined(scope).into());
+            let v = arr
+                .get_index(scope, i + 1)
+                .unwrap_or_else(|| v8::undefined(scope).into());
             let kj = js_to_jsval_d(scope, k, seen, depth + 1);
             let vj = js_to_jsval_d(scope, v, seen, depth + 1);
             pairs.push((kj, vj));
@@ -280,7 +305,9 @@ fn js_to_jsval_d(
         let arr = set.as_array(scope);
         let mut items = Vec::with_capacity(arr.length() as usize);
         for i in 0..arr.length() {
-            let el = arr.get_index(scope, i).unwrap_or_else(|| v8::undefined(scope).into());
+            let el = arr
+                .get_index(scope, i)
+                .unwrap_or_else(|| v8::undefined(scope).into());
             items.push(js_to_jsval_d(scope, el, seen, depth + 1));
         }
         return JsVal::Set { id, items };
@@ -330,7 +357,10 @@ fn js_to_jsval_d(
 // Owned-by-value (not &JsVal): a JsVal::Bytes hands its Vec straight to V8's
 // backing store with no copy of the payload, so a large binary blob crosses
 // Ruby->JS with zero extra allocation.
-pub(crate) fn jsval_to_js<'s>(scope: &mut v8::PinScope<'s, '_>, val: JsVal) -> v8::Local<'s, v8::Value> {
+pub(crate) fn jsval_to_js<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    val: JsVal,
+) -> v8::Local<'s, v8::Value> {
     let mut built: HashMap<u32, v8::Local<'s, v8::Value>> = HashMap::new();
     jsval_to_js_d(scope, val, &mut built)
 }
@@ -580,8 +610,7 @@ fn string_to_jsval(ruby: &Ruby, s: RString) -> Result<JsVal, Error> {
     match String::from_utf8(unsafe { utf8.as_slice() }.to_vec()) {
         Ok(s) => Ok(JsVal::Str(s)),
         Err(_) => Err(Error::new(
-            ruby
-                .class_object()
+            ruby.class_object()
                 .const_get::<_, ExceptionClass>("EncodingError")
                 .unwrap_or_else(|_| ruby.exception_runtime_error()),
             "text-tagged String contains invalid UTF-8 bytes",
@@ -646,11 +675,11 @@ fn ruby_to_jsval_d(val: Value, seen: &mut RbSeen, depth: u32) -> Result<JsVal, E
     // Ruby Time -> JS Date. Must precede the numeric checks: magnus's
     // i64/f64 TryConvert coerces a Time via to_i/to_f, so it would otherwise
     // marshal as a bare epoch number. Time#to_f is epoch seconds; Date wants ms.
-    if let Ok(time_class) = ruby.class_object().const_get::<_, magnus::RClass>("Time") {
-        if val.is_kind_of(time_class) {
-            let sec = val.funcall::<_, _, f64>("to_f", ())?;
-            return Ok(JsVal::Date(sec * 1000.0));
-        }
+    if let Ok(time_class) = ruby.class_object().const_get::<_, magnus::RClass>("Time")
+        && val.is_kind_of(time_class)
+    {
+        let sec = val.funcall::<_, _, f64>("to_f", ())?;
+        return Ok(JsVal::Date(sec * 1000.0));
     }
     // Integer. A JS Number is an f64, so only integers exactly representable
     // there (|n| <= 2^53) become Int/Number; anything larger (the rest of the
@@ -658,21 +687,23 @@ fn ruby_to_jsval_d(val: Value, seen: &mut RbSeen, depth: u32) -> Result<JsVal, E
     // Use a strict Integer type check, NOT magnus::Integer::try_convert, which
     // coerces a Float / to_int object — that would turn e.g. 1e300 into a BigInt
     // instead of a Number.
-    if let Ok(int_class) = ruby.class_object().const_get::<_, magnus::RClass>("Integer") {
-        if val.is_kind_of(int_class) {
-            if let Ok(i) = i64::try_convert(val) {
-                if i.unsigned_abs() <= (1u64 << 53) {
-                    return Ok(JsVal::Int(i));
-                }
-            }
-            let abs: Value = val.funcall("abs", ())?;
-            let hex: String = abs.funcall("to_s", (16i64,))?;
-            let negative = val.funcall::<_, _, bool>("negative?", ())?;
-            return Ok(JsVal::BigInt {
-                negative,
-                words: hex_to_words(&hex),
-            });
+    if let Ok(int_class) = ruby
+        .class_object()
+        .const_get::<_, magnus::RClass>("Integer")
+        && val.is_kind_of(int_class)
+    {
+        if let Ok(i) = i64::try_convert(val)
+            && i.unsigned_abs() <= (1u64 << 53)
+        {
+            return Ok(JsVal::Int(i));
         }
+        let abs: Value = val.funcall("abs", ())?;
+        let hex: String = abs.funcall("to_s", (16i64,))?;
+        let negative = val.funcall::<_, _, bool>("negative?", ())?;
+        return Ok(JsVal::BigInt {
+            negative,
+            words: hex_to_words(&hex),
+        });
     }
     if let Ok(n) = f64::try_convert(val) {
         return Ok(JsVal::Num(n));
@@ -722,20 +753,20 @@ fn ruby_to_jsval_d(val: Value, seen: &mut RbSeen, depth: u32) -> Result<JsVal, E
         }
     }
     // Ruby Set -> JS Set. Before the Array/Hash checks (a Set is neither).
-    if let Ok(set_class) = ruby.class_object().const_get::<_, magnus::RClass>("Set") {
-        if val.is_kind_of(set_class) {
-            let id = match rb_container_id(seen, val, depth)? {
-                RbId::New(id) => id,
-                RbId::Reuse(jv) => return Ok(jv),
-            };
-            let arr: RArray = val.funcall("to_a", ())?;
-            let mut items = Vec::with_capacity(arr.len());
-            for i in 0..arr.len() {
-                let el: Value = arr.entry::<Value>(i as isize)?;
-                items.push(ruby_to_jsval_d(el, seen, depth + 1)?);
-            }
-            return Ok(JsVal::Set { id, items });
+    if let Ok(set_class) = ruby.class_object().const_get::<_, magnus::RClass>("Set")
+        && val.is_kind_of(set_class)
+    {
+        let id = match rb_container_id(seen, val, depth)? {
+            RbId::New(id) => id,
+            RbId::Reuse(jv) => return Ok(jv),
+        };
+        let arr: RArray = val.funcall("to_a", ())?;
+        let mut items = Vec::with_capacity(arr.len());
+        for i in 0..arr.len() {
+            let el: Value = arr.entry::<Value>(i as isize)?;
+            items.push(ruby_to_jsval_d(el, seen, depth + 1)?);
         }
+        return Ok(JsVal::Set { id, items });
     }
     if let Ok(arr) = RArray::try_convert(val) {
         let id = match rb_container_id(seen, val, depth)? {
@@ -753,26 +784,26 @@ fn ruby_to_jsval_d(val: Value, seen: &mut RbSeen, depth: u32) -> Result<JsVal, E
     // real JS values (NOT string-coerced like a plain Hash -> JS Object). Must come
     // BEFORE the Hash branch, since a JSMap IS-A Hash. This is what makes a JS Map
     // round-trip (JS Map -> JSMap -> JS Map) instead of degrading to an object.
-    if let Ok(js_map) = js_map_class(&ruby) {
-        if val.is_kind_of(js_map) {
-            let id = match rb_container_id(seen, val, depth)? {
-                RbId::New(id) => id,
-                RbId::Reuse(jv) => return Ok(jv),
-            };
-            let hash = RHash::from_value(val).expect("JSMap is a Hash");
-            let pairs = RefCell::new(Vec::new());
-            hash.foreach(|k: Value, v: Value| {
-                pairs.borrow_mut().push((
-                    ruby_to_jsval_d(k, seen, depth + 1)?,
-                    ruby_to_jsval_d(v, seen, depth + 1)?,
-                ));
-                Ok(magnus::r_hash::ForEach::Continue)
-            })?;
-            return Ok(JsVal::Map {
-                id,
-                pairs: pairs.into_inner(),
-            });
-        }
+    if let Ok(js_map) = js_map_class(&ruby)
+        && val.is_kind_of(js_map)
+    {
+        let id = match rb_container_id(seen, val, depth)? {
+            RbId::New(id) => id,
+            RbId::Reuse(jv) => return Ok(jv),
+        };
+        let hash = RHash::from_value(val).expect("JSMap is a Hash");
+        let pairs = RefCell::new(Vec::new());
+        hash.foreach(|k: Value, v: Value| {
+            pairs.borrow_mut().push((
+                ruby_to_jsval_d(k, seen, depth + 1)?,
+                ruby_to_jsval_d(v, seen, depth + 1)?,
+            ));
+            Ok(magnus::r_hash::ForEach::Continue)
+        })?;
+        return Ok(JsVal::Map {
+            id,
+            pairs: pairs.into_inner(),
+        });
     }
     if let Ok(hash) = RHash::try_convert(val) {
         let id = match rb_container_id(seen, val, depth)? {
@@ -797,7 +828,7 @@ fn ruby_to_jsval_d(val: Value, seen: &mut RbSeen, depth: u32) -> Result<JsVal, E
                             return Err(Error::new(
                                 ruby.exception_type_error(),
                                 "hash key's to_s did not return a String",
-                            ))
+                            ));
                         }
                     }
                 }
