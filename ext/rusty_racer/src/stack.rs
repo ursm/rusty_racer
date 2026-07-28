@@ -203,13 +203,14 @@ fn query_region_bounds(addr: usize) -> (usize, usize) {
         let Some((lo, hi)) = range.split_once('-') else {
             continue;
         };
-        if let (Ok(lo), Ok(hi)) = (
+        let (Ok(lo), Ok(hi)) = (
             usize::from_str_radix(lo, 16),
             usize::from_str_radix(hi, 16),
-        ) {
-            if addr >= lo && addr < hi {
-                return (lo, hi);
-            }
+        ) else {
+            continue;
+        };
+        if addr >= lo && addr < hi {
+            return (lo, hi);
         }
     }
     (0, 0)

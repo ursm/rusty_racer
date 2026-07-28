@@ -1,0 +1,38 @@
+# Static checks on the Rust extension, on the same triggers as test.yml but as
+# its own workflow: one linux job instead of a 12-entry matrix, so a lint
+# regression is obvious without reading through the test results.
+#
+# clippy only. The crate is deliberately NOT rustfmt-formatted — running it
+# rewrites ~100 hunks of hand-laid-out code (import order, struct literals,
+# signature wrapping) for no readability gain — so `cargo fmt --check` is not
+# part of the gate.
+name: "lint"
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+# A new push to a branch/PR cancels its still-running lint run.
+concurrency:
+  group: "lint-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  clippy:
+    runs-on: "ubuntu-22.04"
+    steps:
+      - uses: "actions/checkout@v7"
+      - uses: "dtolnay/rust-toolchain@stable"
+        with:
+          components: "clippy"
+      # rb-sys's build script introspects the running Ruby for the headers and
+      # link flags, so even `cargo clippy` needs one on PATH. No bundler-cache:
+      # nothing here goes through Bundler.
+      - uses: "ruby/setup-ruby@v1"
+        with:
+          ruby-version: "3.4"
+      # -D warnings makes this a gate rather than advice. clippy comes from the
+      # stable toolchain, so a new release can introduce a lint that fails an
+      # otherwise-unchanged PR; fix it or #[allow] it with a reason.
+      - name: "cargo clippy"
+        run: "cargo clippy --manifest-path ext/rusty_racer/Cargo.toml --all-targets -- -D warnings"

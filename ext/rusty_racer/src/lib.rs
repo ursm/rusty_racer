@@ -433,12 +433,10 @@ fn parse_js_stack(stack: &str) -> Vec<String> {
             }
             // "NAME (LOC)" -> "LOC:in 'NAME'". Split on the FIRST " (" so a LOC
             // path that itself contains parentheses stays intact.
-            if frame.ends_with(')') {
-                if let Some(open) = frame.find(" (") {
-                    let name = &frame[..open];
-                    let loc = &frame[open + 2..frame.len() - 1];
-                    return Some(format!("{loc}:in '{name}'"));
-                }
+            if frame.ends_with(')') && let Some(open) = frame.find(" (") {
+                let name = &frame[..open];
+                let loc = &frame[open + 2..frame.len() - 1];
+                return Some(format!("{loc}:in '{name}'"));
             }
             Some(frame.to_string())
         })
@@ -458,21 +456,16 @@ fn capture_js_error(
         .map(|e| e.to_rust_string_lossy(scope))
         .unwrap_or_else(|| "unexpected failure".to_string());
     let mut stack_str = None;
-    if let Some(e) = exception {
-        if let Some(obj) = e.to_object(scope) {
-            if let Some(key) = v8::String::new(scope, "stack") {
-                if let Some(s) = obj.get(scope, key.into()) {
-                    if s.is_string() {
-                        stack_str = Some(s.to_rust_string_lossy(scope));
-                    }
-                }
-            }
-        }
+    if let Some(e) = exception
+        && let Some(obj) = e.to_object(scope)
+        && let Some(key) = v8::String::new(scope, "stack")
+        && let Some(s) = obj.get(scope, key.into())
+        && s.is_string()
+    {
+        stack_str = Some(s.to_rust_string_lossy(scope));
     }
-    if stack_str.is_none() {
-        if let Some(s) = fallback_stack {
-            stack_str = Some(s.to_rust_string_lossy(scope));
-        }
+    if stack_str.is_none() && let Some(s) = fallback_stack {
+        stack_str = Some(s.to_rust_string_lossy(scope));
     }
     let backtrace = stack_str
         .map(|s| parse_js_stack(s.as_str()))
@@ -773,7 +766,7 @@ fn drain_all_realms(scope: &mut v8::PinScope<'_, '_>) {
             .collect()
     };
     for q in queues {
-        unsafe { (*q).perform_checkpoint(&mut ***scope) };
+        unsafe { (*q).perform_checkpoint(scope) };
     }
 }
 
@@ -1671,7 +1664,7 @@ fn new_realm(
 ) -> (v8::Global<v8::Context>, v8::UniqueRef<v8::MicrotaskQueue>) {
     // Explicit policy like the isolate's: rusty drives every drain by hand
     // (auto_drain / NS.drainMicrotasks), so V8 must never auto-run this queue.
-    let mut queue = v8::MicrotaskQueue::new(&mut **scope, v8::MicrotasksPolicy::Explicit);
+    let mut queue = v8::MicrotaskQueue::new(scope, v8::MicrotasksPolicy::Explicit);
     let fresh = {
         let context = v8::Context::new(scope, v8::ContextOptions {
             microtask_queue: Some(&mut *queue as *mut _),
@@ -1874,17 +1867,17 @@ fn build_snapshot(code: &str, base: Option<Vec<u8>>, warmup: bool) -> Result<Vec
         let context = v8::Context::new(scope, Default::default());
         {
             let cscope = &mut v8::ContextScope::new(scope, context);
-            if !code.is_empty() {
-                if let Err(e) = run_source(cscope, code, if warmup { "<warmup>" } else { "<snapshot>" }) {
-                    err = Some(match e {
-                        VmError::Parse(m) | VmError::Runtime(m) => m,
-                        VmError::JsError { message, .. } => message,
-                        VmError::Terminated => "snapshot code was terminated".to_string(),
-                        // Unreachable: the snapshot-creator is a separate isolate
-                        // that never registers near_heap_limit_cb.
-                        VmError::OutOfMemory => "snapshot code ran out of memory".to_string(),
-                    });
-                }
+            if !code.is_empty()
+                && let Err(e) = run_source(cscope, code, if warmup { "<warmup>" } else { "<snapshot>" })
+            {
+                err = Some(match e {
+                    VmError::Parse(m) | VmError::Runtime(m) => m,
+                    VmError::JsError { message, .. } => message,
+                    VmError::Terminated => "snapshot code was terminated".to_string(),
+                    // Unreachable: the snapshot-creator is a separate isolate
+                    // that never registers near_heap_limit_cb.
+                    VmError::OutOfMemory => "snapshot code ran out of memory".to_string(),
+                });
             }
         }
         // Mark the context to deserialize on boot (after the ContextScope is
@@ -1970,7 +1963,7 @@ impl Isolate {
             istate!(scope).realms.main_context = Some(main_context);
             istate!(scope).realms.main_queue = Some(main_queue);
             // The shared graveyard for retired realms' contexts (see V8State).
-            let graveyard = v8::MicrotaskQueue::new(&mut **scope, v8::MicrotasksPolicy::Explicit);
+            let graveyard = v8::MicrotaskQueue::new(scope, v8::MicrotasksPolicy::Explicit);
             istate!(scope).realms.graveyard_queue = Some(graveyard);
         }
         // Box the OwnedIsolate so it has a STABLE address, then capture a raw ptr
