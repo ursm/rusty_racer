@@ -2113,16 +2113,18 @@ impl Core {
             // against Isolate::GetCurrent()). Detect that case and properly enter
             // A on top of B, restoring B on exit.
             let entered = depth == 0 || real_isolate != current_real_isolate();
-            // Snapshot the enclosing op's conservative-GC-scan start BEFORE
+            // Snapshot the ENCLOSING op's conservative-GC-scan start BEFORE
             // entering: Isolate::Enter re-points it at the native top, so reading
-            // it afterwards would hand StackScope the clobbered value to "restore"
-            // — stranding an enclosing FIBER op with a start on the native stack,
-            // whose next GC walks off the fiber's mapped top and SEGVs.
+            // it afterwards would hand StackScope the clobbered value to
+            // "restore" — stranding an enclosing FIBER op with a start on the
+            // native stack, whose next GC walks off the fiber's mapped top and
+            // SEGVs. None at depth 0, where the value in the field belongs to the
+            // previous, already-finished op and so is nothing to preserve.
             let scan_start_field = self.scan_start_field.load(Ordering::Relaxed);
-            let prev_scan_start = if scan_start_field != 0 {
-                unsafe { *(scan_start_field as *const usize) }
+            let enclosing_scan_start = if depth > 0 && scan_start_field != 0 {
+                Some(unsafe { *(scan_start_field as *const usize) })
             } else {
-                0
+                None
             };
             if entered {
                 unsafe { (*iso).enter() };
@@ -2147,7 +2149,7 @@ impl Core {
             let stack = StackScope::enter(
                 real_isolate,
                 scan_start_field,
-                prev_scan_start,
+                enclosing_scan_start,
                 &self.installed_stack_limit,
                 stack_top,
             );
@@ -2190,12 +2192,9 @@ impl Core {
                     istate!(iso_ref).oom_fired = false;
                     reply = reply.map(relabel_oom);
                 }
-                // Drop the stack description BEFORE popping the isolate —
-                // exit() can leave a different one current. At depth 0 there is
-                // no enclosing op, so this just puts the previous op's values
-                // back; harmless (the next op installs its own before any JS
-                // runs) and it leaves the isolate describing a real stack for
-                // teardown.
+                // Drop the stack description BEFORE popping the isolate — exit()
+                // can leave a different one current. At depth 0 the drop restores
+                // nothing (no enclosing op), so this just releases the scope.
                 drop(stack);
                 unsafe { (*iso).exit() };
                 reply

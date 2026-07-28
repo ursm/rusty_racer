@@ -178,6 +178,13 @@ fn current_region_bounds_cached(addr: usize) -> (usize, usize) {
 // The [start, end) of the /proc/self/maps mapping containing `addr`. Linux only;
 // (0, 0) elsewhere (and the caller falls back). Reads the file fresh — slow, so
 // only called on a cache miss (a new fiber).
+//
+// Everything that needs a FIBER's real bounds degrades on the (0, 0) platforms,
+// macOS being the shipped one: the stack limit drops to a fixed budget below the
+// SP (see StackScope::enter), and a nested op can no longer widen its GC-scan
+// start to the enclosing op's, so it narrows to its own frame. Both are the
+// pre-fiber-support behaviour rather than a crash, but a darwin implementation
+// (mach_vm_region on the current task) would close the gap.
 #[cfg(target_os = "linux")]
 fn query_region_bounds(addr: usize) -> (usize, usize) {
     use std::io::Read;
@@ -290,18 +297,27 @@ impl<'a> StackScope<'a> {
     // Describe the stack THIS call runs on to the isolate, until the drop. Must
     // be called with the isolate ENTERED: Isolate::Enter sets the scan start to
     // the native top, so entering afterwards would clobber a fiber override.
-    // Because Enter does that, `prev_scan_start` must be read BEFORE it — it is
-    // the enclosing op's scan start, both the value the drop puts back and the
-    // one a nested op on the same fiber keeps (see below). `real_isolate` is the
-    // raw v8::Isolate* read out of iso_ptr; `stack_top` is a live address the
-    // caller captured ABOVE every V8 frame of this op (used only on a fiber).
+    //
+    // `enclosing_scan_start` is the scan start of the op this one is nested in,
+    // or None at the outermost op, where no enclosing op exists — then the drop
+    // restores nothing (the values left behind belong to no live frame, and the
+    // next op installs its own before any JS runs). Because Enter re-points the
+    // field, it must be read BEFORE entering. It doubles as the value the drop
+    // puts back and, when a nested op didn't switch stacks, as this op's own
+    // start (see below). `real_isolate` is the raw v8::Isolate* read out of
+    // iso_ptr; `stack_top` is a live address the caller captured ABOVE every V8
+    // frame of this op (used only on a fiber).
     pub(crate) fn enter(
         real_isolate: *mut c_void,
         scan_start_field: usize,
-        prev_scan_start: usize,
+        enclosing_scan_start: Option<usize>,
         installed_limit: &'a AtomicUsize,
         stack_top: usize,
     ) -> Self {
+        // Only a nested op has an enclosing description to preserve and restore.
+        let nested = enclosing_scan_start.is_some();
+        // 0 doubles as "no enclosing value" throughout: it is never a real start.
+        let prev_scan_start = enclosing_scan_start.unwrap_or(0);
         let sp_marker = 0u8;
         let sp = &sp_marker as *const u8 as usize;
         let (nbottom, ntop) = native_stack_bounds_cached();
@@ -329,7 +345,16 @@ impl<'a> StackScope<'a> {
             if region.0 != 0 {
                 (region.0 + FIBER_RESERVE).min(sp.saturating_sub(8 * 1024))
             } else {
-                sp.saturating_sub(64 * 1024) // region unknown (non-linux) — best effort
+                // Region unknown — only Linux can look a fiber's bounds up (see
+                // query_region_bounds), so this is the macOS path. Best effort:
+                // hand JS a fixed budget below the SP and hope the fiber is that
+                // deep. It usually is for an OUTERMOST fiber op, whose SP sits
+                // near the fiber's top, and much less reliably for a NESTED one,
+                // whose SP is already far down the fiber — there this can land
+                // below the fiber's mapped bottom, and V8 then grows through the
+                // guard page (SEGV) instead of throwing. Fixing that properly
+                // means a mach_vm_region lookup for darwin.
+                sp.saturating_sub(64 * 1024)
             }
         };
         // Opt-in diagnostics (RUSTY_RACER_STACK_DEBUG): the SP vs the native
@@ -367,13 +392,14 @@ impl<'a> StackScope<'a> {
         // Locker, and an isolate here is thread-confined) or wasm stack
         // switching (no wasm stacks exist in this embedding).
         let prev_limit = installed_limit.load(Ordering::Relaxed);
-        let restore_limit = if limit == prev_limit {
-            0
-        } else {
+        let changed_limit = limit != prev_limit;
+        if changed_limit {
             unsafe { v8__Isolate__SetStackLimit(real_isolate, limit) };
             installed_limit.store(limit, Ordering::Relaxed);
-            prev_limit // 0 before the first op — then there's nothing to put back
-        };
+        }
+        // Only a nested op owes anything back: at the outermost op prev_limit is
+        // the previous, already-finished op's, which describes no live frame.
+        let restore_limit = if nested && changed_limit { prev_limit } else { 0 };
         // Point V8's conservative-GC-scan start at the stack we're on. The
         // scanner walks [marker, start), so on a fiber a native start runs it off
         // the fiber's mapped top into unmapped memory and SEGVs (Avo's Capybara
@@ -391,7 +417,7 @@ impl<'a> StackScope<'a> {
         //     ours and in the same mapping, so it covers both ops' frames.
         let new_scan_start = if on_native {
             unsafe { v8__base__Stack__GetStackStart() }
-        } else if prev_scan_start > sp && prev_scan_start < region.1 && region.0 != 0 {
+        } else if nested && region.0 != 0 && prev_scan_start > sp && prev_scan_start < region.1 {
             prev_scan_start
         } else {
             stack_top
@@ -407,10 +433,10 @@ impl<'a> StackScope<'a> {
             if unsafe { field.read() } != new_scan_start {
                 unsafe { field.write(new_scan_start) };
             }
-            if prev_scan_start != 0 && prev_scan_start != new_scan_start {
+            if nested && prev_scan_start != 0 && prev_scan_start != new_scan_start {
                 prev_scan_start
             } else {
-                0 // nothing earlier to put back, or the drop would be a no-op
+                0 // nothing enclosing to put back, or the drop would be a no-op
             }
         } else {
             0 // nothing installed -> nothing to undo
