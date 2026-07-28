@@ -203,10 +203,8 @@ fn query_region_bounds(addr: usize) -> (usize, usize) {
         let Some((lo, hi)) = range.split_once('-') else {
             continue;
         };
-        let (Ok(lo), Ok(hi)) = (
-            usize::from_str_radix(lo, 16),
-            usize::from_str_radix(hi, 16),
-        ) else {
+        let (Ok(lo), Ok(hi)) = (usize::from_str_radix(lo, 16), usize::from_str_radix(hi, 16))
+        else {
             continue;
         };
         if addr >= lo && addr < hi {
@@ -400,7 +398,11 @@ impl<'a> StackScope<'a> {
         }
         // Only a nested op owes anything back: at the outermost op prev_limit is
         // the previous, already-finished op's, which describes no live frame.
-        let restore_limit = if nested && changed_limit { prev_limit } else { 0 };
+        let restore_limit = if nested && changed_limit {
+            prev_limit
+        } else {
+            0
+        };
         // Point V8's conservative-GC-scan start at the stack we're on. The
         // scanner walks [marker, start), so on a fiber a native start runs it off
         // the fiber's mapped top into unmapped memory and SEGVs (Avo's Capybara
@@ -464,7 +466,8 @@ impl Drop for StackScope<'_> {
         }
         if self.restore_limit != 0 {
             unsafe { v8__Isolate__SetStackLimit(self.real_isolate, self.restore_limit) };
-            self.installed_limit.store(self.restore_limit, Ordering::Relaxed);
+            self.installed_limit
+                .store(self.restore_limit, Ordering::Relaxed);
         }
     }
 }

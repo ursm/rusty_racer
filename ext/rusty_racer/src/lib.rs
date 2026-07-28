@@ -46,18 +46,18 @@ use std::sync::{Arc, Mutex, Once, Weak};
 use magnus::block::Proc;
 use magnus::value::{BoxValue, ReprValue};
 use magnus::{
-    function, method, prelude::*, Error, Exception, ExceptionClass, RHash, Ruby, TryConvert, Value,
+    Error, Exception, ExceptionClass, RHash, Ruby, TryConvert, Value, function, method, prelude::*,
 };
 
 mod marshal;
-use marshal::{js_to_jsval, jsval_to_js, jsval_to_ruby, ruby_to_jsval, JsVal};
+use marshal::{JsVal, js_to_jsval, jsval_to_js, jsval_to_ruby, ruby_to_jsval};
 mod ops;
-use ops::{run_source, service_request, Compiled, Request, VmReply};
+use ops::{Compiled, Request, VmReply, run_source, service_request};
 mod stack;
-use stack::{current_real_isolate, discover_scan_start_field, StackScope, STACK_DEBUG};
+use stack::{STACK_DEBUG, StackScope, current_real_isolate, discover_scan_start_field};
 mod watchdog;
 use watchdog::{
-    arm_watchdog, disarm_watchdog, run_js_bracketed, watchdog_loop, WatchdogShared, WATCHDOG_DEBUG,
+    WATCHDOG_DEBUG, WatchdogShared, arm_watchdog, disarm_watchdog, run_js_bracketed, watchdog_loop,
 };
 
 // A Ruby Proc rooted for as long as the Core holds it. BoxValue registers a
@@ -203,7 +203,11 @@ enum VmError {
 // Core::run, once the op has unwound, forces a GC to reclaim and resets the
 // ceiling — see the OOM recovery there. The bump is a no-op-after-the-fact:
 // doubling here, GC + reset after, so the limit keeps protecting later ops.
-unsafe extern "C" fn near_heap_limit_cb(data: *mut c_void, current_heap_limit: usize, initial: usize) -> usize {
+unsafe extern "C" fn near_heap_limit_cb(
+    data: *mut c_void,
+    current_heap_limit: usize,
+    initial: usize,
+) -> usize {
     let isolate = unsafe { &mut *(data as *mut v8::Isolate) };
     // get_slot_mut (not istate!): this runs as an extern "C" callback from V8's
     // C++ allocator, where a panic would unwind across the FFI boundary. The slot
@@ -263,7 +267,10 @@ where
         job.r = Some((job.f.take().unwrap())());
         null_mut()
     }
-    let mut job = Job::<F, R> { f: Some(f), r: None };
+    let mut job = Job::<F, R> {
+        f: Some(f),
+        r: None,
+    };
     unsafe {
         rb_sys::rb_thread_call_without_gvl(
             Some(run::<F, R>),
@@ -295,7 +302,10 @@ where
         job.r = Some((job.f.take().unwrap())());
         null_mut()
     }
-    let mut job = Job::<F, R> { f: Some(f), r: None };
+    let mut job = Job::<F, R> {
+        f: Some(f),
+        r: None,
+    };
     unsafe {
         rb_sys::rb_thread_call_with_gvl(Some(run::<F, R>), &mut job as *mut _ as *mut c_void);
     }
@@ -433,7 +443,9 @@ fn parse_js_stack(stack: &str) -> Vec<String> {
             }
             // "NAME (LOC)" -> "LOC:in 'NAME'". Split on the FIRST " (" so a LOC
             // path that itself contains parentheses stays intact.
-            if frame.ends_with(')') && let Some(open) = frame.find(" (") {
+            if frame.ends_with(')')
+                && let Some(open) = frame.find(" (")
+            {
                 let name = &frame[..open];
                 let loc = &frame[open + 2..frame.len() - 1];
                 return Some(format!("{loc}:in '{name}'"));
@@ -464,7 +476,9 @@ fn capture_js_error(
     {
         stack_str = Some(s.to_rust_string_lossy(scope));
     }
-    if stack_str.is_none() && let Some(s) = fallback_stack {
+    if stack_str.is_none()
+        && let Some(s) = fallback_stack
+    {
         stack_str = Some(s.to_rust_string_lossy(scope));
     }
     let backtrace = stack_str
@@ -480,7 +494,17 @@ fn capture_js_error(
 fn module_origin<'s>(scope: &v8::PinScope<'s, '_>, url: &str) -> v8::ScriptOrigin<'s> {
     let name = v8::String::new(scope, url).unwrap();
     v8::ScriptOrigin::new(
-        scope, name.into(), 0, 0, false, -1, None, false, false, /*is_module*/ true, None,
+        scope,
+        name.into(),
+        0,
+        0,
+        false,
+        -1,
+        None,
+        false,
+        false,
+        /*is_module*/ true,
+        None,
     )
 }
 
@@ -826,7 +850,10 @@ fn drop_context_artifacts(state: &mut IsolateState, context_id: i32) {
 }
 
 // A script's (unbound handle, owning context id), for running it in that context.
-fn script_handle(state: &IsolateState, script_id: i32) -> Option<(v8::Global<v8::UnboundScript>, i32)> {
+fn script_handle(
+    state: &IsolateState,
+    script_id: i32,
+) -> Option<(v8::Global<v8::UnboundScript>, i32)> {
     state
         .scripts
         .by_id
@@ -1074,7 +1101,9 @@ fn finish_dynamic_import(
                 Some(exc) => {
                     resolver.reject(tc, exc);
                 }
-                None => reject_with_error(tc, resolver, "failed to link dynamically imported module"),
+                None => {
+                    reject_with_error(tc, resolver, "failed to link dynamically imported module")
+                }
             }
             return;
         }
@@ -1090,7 +1119,11 @@ fn finish_dynamic_import(
             match module.evaluate(tc) {
                 Some(value) => {
                     let Ok(eval_promise) = v8::Local::<v8::Promise>::try_from(value) else {
-                        reject_with_error(tc, resolver, "module evaluation did not yield a promise");
+                        reject_with_error(
+                            tc,
+                            resolver,
+                            "module evaluation did not yield a promise",
+                        );
                         return;
                     };
                     // Settle the import() promise from the evaluation promise
@@ -1494,10 +1527,13 @@ fn transfer_out(
         return;
     }
     let token = NEXT_TRANSFER_TOKEN.fetch_add(1, Ordering::Relaxed);
-    transfer_registry()
-        .lock()
-        .unwrap()
-        .insert(token, SendBackingStore { store, shared: false });
+    transfer_registry().lock().unwrap().insert(
+        token,
+        SendBackingStore {
+            store,
+            shared: false,
+        },
+    );
     rv.set(v8::Number::new(scope, token as f64).into());
 }
 
@@ -1518,10 +1554,13 @@ fn share_out(
     };
     let store = sab.get_backing_store();
     let token = NEXT_TRANSFER_TOKEN.fetch_add(1, Ordering::Relaxed);
-    transfer_registry()
-        .lock()
-        .unwrap()
-        .insert(token, SendBackingStore { store, shared: true });
+    transfer_registry().lock().unwrap().insert(
+        token,
+        SendBackingStore {
+            store,
+            shared: true,
+        },
+    );
     rv.set(v8::Number::new(scope, token as f64).into());
 }
 
@@ -1666,10 +1705,13 @@ fn new_realm(
     // (auto_drain / NS.drainMicrotasks), so V8 must never auto-run this queue.
     let mut queue = v8::MicrotaskQueue::new(scope, v8::MicrotasksPolicy::Explicit);
     let fresh = {
-        let context = v8::Context::new(scope, v8::ContextOptions {
-            microtask_queue: Some(&mut *queue as *mut _),
-            ..Default::default()
-        });
+        let context = v8::Context::new(
+            scope,
+            v8::ContextOptions {
+                microtask_queue: Some(&mut *queue as *mut _),
+                ..Default::default()
+            },
+        );
         v8::Global::new(scope, context)
     };
     // DESIGN DECISION: every realm of an isolate shares ONE security token, so
@@ -1722,7 +1764,8 @@ fn flush_retiring(scope: &mut v8::PinScope<'_, '_, ()>) {
     if istate!(scope).realms.retiring.is_empty() {
         return;
     }
-    let graveyard: *const v8::MicrotaskQueue = match istate!(scope).realms.graveyard_queue.as_ref() {
+    let graveyard: *const v8::MicrotaskQueue = match istate!(scope).realms.graveyard_queue.as_ref()
+    {
         Some(q) => &**q as *const _,
         // The graveyard is created at boot and never cleared, so with entries
         // waiting this is unreachable; assert so a future refactor that defers its
@@ -1762,7 +1805,10 @@ fn install_host_namespace(
     let scope = &mut v8::ContextScope::new(scope, context);
     let ns = v8::Object::new(scope);
     let members: [(&str, Option<v8::Local<v8::Function>>); 9] = [
-        ("drainMicrotasks", v8::Function::new(scope, drain_microtasks)),
+        (
+            "drainMicrotasks",
+            v8::Function::new(scope, drain_microtasks),
+        ),
         ("contextGlobal", v8::Function::new(scope, context_global)),
         ("contextOf", v8::Function::new(scope, context_of)),
         (
@@ -1806,8 +1852,8 @@ fn attach_at_path(
         if part.is_empty() {
             return Err(VmError::Runtime(format!("invalid attach name `{name}`")));
         }
-        let key =
-            v8::String::new(scope, part).ok_or_else(|| VmError::Runtime("name too large".into()))?;
+        let key = v8::String::new(scope, part)
+            .ok_or_else(|| VmError::Runtime("name too large".into()))?;
         holder = match holder.get(scope, key.into()) {
             Some(v) if v.is_object() => v8::Local::<v8::Object>::try_from(v).unwrap(),
             // Don't clobber an existing non-object (e.g. a primitive global that
@@ -1820,7 +1866,9 @@ fn attach_at_path(
             _ => {
                 let obj = v8::Object::new(scope);
                 if holder.set(scope, key.into(), obj.into()) != Some(true) {
-                    return Err(VmError::Runtime(format!("`{name}`: cannot create `{part}`")));
+                    return Err(VmError::Runtime(format!(
+                        "`{name}`: cannot create `{part}`"
+                    )));
                 }
                 obj
             }
@@ -1868,7 +1916,8 @@ fn build_snapshot(code: &str, base: Option<Vec<u8>>, warmup: bool) -> Result<Vec
         {
             let cscope = &mut v8::ContextScope::new(scope, context);
             if !code.is_empty()
-                && let Err(e) = run_source(cscope, code, if warmup { "<warmup>" } else { "<snapshot>" })
+                && let Err(e) =
+                    run_source(cscope, code, if warmup { "<warmup>" } else { "<snapshot>" })
             {
                 err = Some(match e {
                     VmError::Parse(m) | VmError::Runtime(m) => m,
@@ -1991,7 +2040,10 @@ impl Isolate {
         let owner_thread = unsafe { Value::from_raw(rb_sys::rb_thread_current()) };
         let core = Arc::new_cyclic(|me| Core {
             me: me.clone(),
-            shared: Mutex::new(Shared { handle, disposed: false }),
+            shared: Mutex::new(Shared {
+                handle,
+                disposed: false,
+            }),
             iso_id,
             owner: owner_thread.as_raw() as usize,
             _owner_root: RootedThread(BoxValue::new(owner_thread)),
@@ -2051,7 +2103,10 @@ impl Core {
             ));
         }
         if self.shared.lock().unwrap().disposed {
-            return Err(Error::new(ruby.exception_runtime_error(), "disposed context"));
+            return Err(Error::new(
+                ruby.exception_runtime_error(),
+                "disposed context",
+            ));
         }
         Ok(())
     }
@@ -2258,15 +2313,12 @@ impl Core {
     // access pattern as swap_instantiate. Does NOT clear it (run() clears at the
     // next outermost op) so a nested timeout's outer frame can read it too.
     fn peek_timeout_backtrace(&self) -> Option<Vec<String>> {
-        istate!(unsafe { &mut *self.iso_ptr.0 }).timeout_backtrace.clone()
+        istate!(unsafe { &mut *self.iso_ptr.0 })
+            .timeout_backtrace
+            .clone()
     }
 
-    fn call_proc(
-        &self,
-        ruby: &Ruby,
-        host_fn_id: usize,
-        args: &[JsVal],
-    ) -> Result<JsVal, String> {
+    fn call_proc(&self, ruby: &Ruby, host_fn_id: usize, args: &[JsVal]) -> Result<JsVal, String> {
         let proc = {
             let procs = self.procs.lock().unwrap();
             procs
@@ -2302,7 +2354,13 @@ impl Core {
     // Context#call (and call_void). Resolves a dotted function path
     // on globalThis and invokes it via v8::Function::call. |void| skips
     // marshalling the return for fire-and-forget calls.
-    fn call(&self, ruby: &Ruby, context_id: i32, args: &[Value], void: bool) -> Result<Value, Error> {
+    fn call(
+        &self,
+        ruby: &Ruby,
+        context_id: i32,
+        args: &[Value],
+        void: bool,
+    ) -> Result<Value, Error> {
         let Some((name, call_args)) = args.split_first() else {
             return Err(Error::new(
                 ruby.exception_arg_error(),
@@ -2315,20 +2373,26 @@ impl Core {
             .map(|v| ruby_to_jsval(*v))
             .collect::<Result<_, _>>()?;
 
-        let reply = self.run(ruby, Request::Call {
-            context_id,
-            name,
-            args: jsargs,
-            void,
-            timeout_ms: self.default_timeout_ms,
-        })?;
+        let reply = self.run(
+            ruby,
+            Request::Call {
+                context_id,
+                name,
+                args: jsargs,
+                void,
+                timeout_ms: self.default_timeout_ms,
+            },
+        )?;
         self.reply_value(ruby, reply)
     }
 
     fn drain_microtasks(&self, ruby: &Ruby) -> Result<Value, Error> {
-        let reply = self.run(ruby, Request::DrainMicrotasks {
-            timeout_ms: self.default_timeout_ms,
-        })?;
+        let reply = self.run(
+            ruby,
+            Request::DrainMicrotasks {
+                timeout_ms: self.default_timeout_ms,
+            },
+        )?;
         self.reply_value(ruby, reply)
     }
 
@@ -2347,10 +2411,19 @@ impl Core {
         h.aset(ruby.to_symbol("total_heap_size"), s.total_heap_size)?;
         h.aset(ruby.to_symbol("heap_size_limit"), s.heap_size_limit)?;
         h.aset(ruby.to_symbol("malloced_memory"), s.malloced_memory)?;
-        h.aset(ruby.to_symbol("peak_malloced_memory"), s.peak_malloced_memory)?;
+        h.aset(
+            ruby.to_symbol("peak_malloced_memory"),
+            s.peak_malloced_memory,
+        )?;
         h.aset(ruby.to_symbol("external_memory"), s.external_memory)?;
-        h.aset(ruby.to_symbol("number_of_native_contexts"), s.number_of_native_contexts)?;
-        h.aset(ruby.to_symbol("number_of_detached_contexts"), s.number_of_detached_contexts)?;
+        h.aset(
+            ruby.to_symbol("number_of_native_contexts"),
+            s.number_of_native_contexts,
+        )?;
+        h.aset(
+            ruby.to_symbol("number_of_detached_contexts"),
+            s.number_of_detached_contexts,
+        )?;
         Ok(h.as_value())
     }
 
@@ -2369,26 +2442,38 @@ impl Core {
         filename: String,
         timeout_ms: u64,
     ) -> Result<Value, Error> {
-        let reply = self.run(ruby, Request::Eval {
-            context_id,
-            source,
-            filename,
-            timeout_ms,
-        })?;
+        let reply = self.run(
+            ruby,
+            Request::Eval {
+                context_id,
+                source,
+                filename,
+                timeout_ms,
+            },
+        )?;
         self.reply_value(ruby, reply)
     }
 
-    fn attach(&self, ruby: &Ruby, context_id: i32, name: String, proc: Proc) -> Result<Value, Error> {
+    fn attach(
+        &self,
+        ruby: &Ruby,
+        context_id: i32,
+        name: String,
+        proc: Proc,
+    ) -> Result<Value, Error> {
         let host_fn_id = self.procs.lock().unwrap().alloc(ProcSlot {
             context_id,
             proc: Some(RootedProc(BoxValue::new(proc))),
         });
-        let reply = self.run(ruby, Request::Attach {
-            context_id,
-            name,
-            host_fn_id,
-            timeout_ms: self.default_timeout_ms,
-        })?;
+        let reply = self.run(
+            ruby,
+            Request::Attach {
+                context_id,
+                name,
+                host_fn_id,
+                timeout_ms: self.default_timeout_ms,
+            },
+        )?;
         self.reply_value(ruby, reply)
     }
 
@@ -2399,7 +2484,12 @@ impl Core {
     // (name-tagged) error WITHOUT rolling back earlier entries (see the
     // AttachMany arm). On that error path the unused slots are reclaimed at the
     // next reset/dispose of the realm, like single attach.
-    fn attach_many(&self, ruby: &Ruby, context_id: i32, entries: Vec<(String, Proc)>) -> Result<Value, Error> {
+    fn attach_many(
+        &self,
+        ruby: &Ruby,
+        context_id: i32,
+        entries: Vec<(String, Proc)>,
+    ) -> Result<Value, Error> {
         if entries.is_empty() {
             return Ok(ruby.qnil().as_value()); // nothing to install, skip the round-trip
         }
@@ -2416,11 +2506,14 @@ impl Core {
                 })
                 .collect()
         };
-        let reply = self.run(ruby, Request::AttachMany {
-            context_id,
-            entries: named_ids,
-            timeout_ms: self.default_timeout_ms,
-        })?;
+        let reply = self.run(
+            ruby,
+            Request::AttachMany {
+                context_id,
+                entries: named_ids,
+                timeout_ms: self.default_timeout_ms,
+            },
+        )?;
         self.reply_value(ruby, reply)
     }
 
@@ -2468,14 +2561,17 @@ impl Core {
         produce_cache: bool,
         eager: bool,
     ) -> Result<Compiled, Error> {
-        let reply = self.run(ruby, Request::CompileModule {
-            context_id,
-            source,
-            filename,
-            cached_data,
-            produce_cache,
-            eager,
-        })?;
+        let reply = self.run(
+            ruby,
+            Request::CompileModule {
+                context_id,
+                source,
+                filename,
+                cached_data,
+                produce_cache,
+                eager,
+            },
+        )?;
         match reply {
             VmReply::ModuleCompiled(Ok(cm)) => Ok(cm),
             VmReply::ModuleCompiled(Err(e)) => Err(vm_err(ruby, e)),
@@ -2510,7 +2606,12 @@ impl Core {
     // it per import edge (it may compile a dependency lazily — a re-entrant op
     // that just recurses into run). A resolver that RAISED is re-raised here with
     // its original class.
-    fn instantiate_module(&self, ruby: &Ruby, module_id: i32, resolve: Proc) -> Result<Value, Error> {
+    fn instantiate_module(
+        &self,
+        ruby: &Ruby,
+        module_id: i32,
+        resolve: Proc,
+    ) -> Result<Value, Error> {
         // Guard BEFORE touching the slot via iso_ptr: a foreign-thread or
         // post-dispose call must be refused, not deref a freed/foreign isolate.
         self.ensure_owner_and_live(ruby)?;
@@ -2528,10 +2629,13 @@ impl Core {
     }
 
     fn evaluate_module(&self, ruby: &Ruby, module_id: i32) -> Result<Value, Error> {
-        let reply = self.run(ruby, Request::EvaluateModule {
-            module_id,
-            timeout_ms: self.default_timeout_ms,
-        })?;
+        let reply = self.run(
+            ruby,
+            Request::EvaluateModule {
+                module_id,
+                timeout_ms: self.default_timeout_ms,
+            },
+        )?;
         self.reply_value(ruby, reply)
     }
 
@@ -2562,14 +2666,17 @@ impl Core {
         produce_cache: bool,
         eager: bool,
     ) -> Result<Compiled, Error> {
-        let reply = self.run(ruby, Request::CompileScript {
-            context_id,
-            source,
-            filename,
-            cached_data,
-            produce_cache,
-            eager,
-        })?;
+        let reply = self.run(
+            ruby,
+            Request::CompileScript {
+                context_id,
+                source,
+                filename,
+                cached_data,
+                produce_cache,
+                eager,
+            },
+        )?;
         match reply {
             VmReply::ScriptCompiled(Ok(cs)) => Ok(cs),
             VmReply::ScriptCompiled(Err(e)) => Err(vm_err(ruby, e)),
@@ -2581,10 +2688,13 @@ impl Core {
     }
 
     fn run_script(&self, ruby: &Ruby, script_id: i32) -> Result<Value, Error> {
-        let reply = self.run(ruby, Request::RunScript {
-            script_id,
-            timeout_ms: self.default_timeout_ms,
-        })?;
+        let reply = self.run(
+            ruby,
+            Request::RunScript {
+                script_id,
+                timeout_ms: self.default_timeout_ms,
+            },
+        )?;
         self.reply_value(ruby, reply)
     }
 
@@ -2804,7 +2914,10 @@ impl Context {
     fn check_live(&self, ruby: &Ruby) -> Result<(), Error> {
         // id 0's lifetime is the isolate's; extras also track their own dispose.
         if self.disposed.load(Ordering::SeqCst) || self.core.is_disposed() {
-            return Err(Error::new(ruby.exception_runtime_error(), "disposed context"));
+            return Err(Error::new(
+                ruby.exception_runtime_error(),
+                "disposed context",
+            ));
         }
         Ok(())
     }
@@ -2822,7 +2935,9 @@ impl Context {
         } else {
             timeout_ms
         };
-        rb_self.core.eval_t(ruby, rb_self.id, source, filename, timeout)
+        rb_self
+            .core
+            .eval_t(ruby, rb_self.id, source, filename, timeout)
     }
     fn call(ruby: &Ruby, rb_self: &Self, args: &[Value]) -> Result<Value, Error> {
         rb_self.check_live(ruby)?;
@@ -2865,9 +2980,15 @@ impl Context {
     ) -> Result<JsModule, Error> {
         rb_self.check_live(ruby)?;
         let cache_in = binary_bytes(ruby, cached_data)?;
-        let cm = rb_self
-            .core
-            .compile_module(ruby, rb_self.id, source, filename, cache_in, produce_cache, eager)?;
+        let cm = rb_self.core.compile_module(
+            ruby,
+            rb_self.id,
+            source,
+            filename,
+            cache_in,
+            produce_cache,
+            eager,
+        )?;
         Ok(JsModule {
             core: rb_self.core.clone(),
             module_id: cm.id,
@@ -2889,9 +3010,15 @@ impl Context {
     ) -> Result<Script, Error> {
         rb_self.check_live(ruby)?;
         let cache_in = binary_bytes(ruby, cached_data)?;
-        let cs = rb_self
-            .core
-            .compile_script(ruby, rb_self.id, source, filename, cache_in, produce_cache, eager)?;
+        let cs = rb_self.core.compile_script(
+            ruby,
+            rb_self.id,
+            source,
+            filename,
+            cache_in,
+            produce_cache,
+            eager,
+        )?;
         Ok(Script {
             core: rb_self.core.clone(),
             script_id: cs.id,
@@ -2984,7 +3111,10 @@ impl JsModule {
         // before run's guard) is gone — without this, instantiate after
         // iso.dispose is a use-after-free.
         if self.disposed.load(Ordering::SeqCst) || self.core.is_disposed() {
-            return Err(Error::new(ruby.exception_runtime_error(), "disposed module"));
+            return Err(Error::new(
+                ruby.exception_runtime_error(),
+                "disposed module",
+            ));
         }
         Ok(())
     }
@@ -2992,7 +3122,9 @@ impl JsModule {
     // the lib wrapper). resolver.(specifier, referrer_url) must return a Module.
     fn instantiate(ruby: &Ruby, rb_self: &Self, resolver: Proc) -> Result<Value, Error> {
         rb_self.check_live(ruby)?;
-        rb_self.core.instantiate_module(ruby, rb_self.module_id, resolver)
+        rb_self
+            .core
+            .instantiate_module(ruby, rb_self.module_id, resolver)
     }
     fn evaluate(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
         rb_self.check_live(ruby)?;
@@ -3043,7 +3175,10 @@ impl Script {
     fn check_live(&self, ruby: &Ruby) -> Result<(), Error> {
         // Also refuse once the isolate is disposed (see JsModule::check_live).
         if self.disposed.load(Ordering::SeqCst) || self.core.is_disposed() {
-            return Err(Error::new(ruby.exception_runtime_error(), "disposed script"));
+            return Err(Error::new(
+                ruby.exception_runtime_error(),
+                "disposed script",
+            ));
         }
         Ok(())
     }
@@ -3105,7 +3240,10 @@ fn code_cache_from_reply(ruby: &Ruby, reply: VmReply) -> Result<Option<Vec<u8>>,
 // Read a Ruby cached_data arg as raw bytes, refusing a non-binary string so a
 // cache file read without 'rb' (silently transcoded) fails loudly rather than
 // being consumed as garbage and rejected with no signal.
-fn binary_bytes(ruby: &Ruby, cached_data: Option<magnus::RString>) -> Result<Option<Vec<u8>>, Error> {
+fn binary_bytes(
+    ruby: &Ruby,
+    cached_data: Option<magnus::RString>,
+) -> Result<Option<Vec<u8>>, Error> {
     match cached_data {
         None => Ok(None),
         Some(s) => {
@@ -3317,7 +3455,10 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     // JS Map instead of a plain object. It behaves exactly like a Hash (so
     // `assert_kind_of Hash` / `h[k]` still work); users may also construct one to
     // hand a JS Map to JS. See marshal.rs.
-    module.define_class("JSMap", ruby.class_object().const_get::<_, magnus::RClass>("Hash")?)?;
+    module.define_class(
+        "JSMap",
+        ruby.class_object().const_get::<_, magnus::RClass>("Hash")?,
+    )?;
 
     let platform = module.define_module("Platform")?;
     platform.define_singleton_method("set_flags!", function!(platform_set_flags, -1))?;
@@ -3331,6 +3472,9 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     // Observability for the thread-confined lifecycle (see Drop for Core).
     module.define_singleton_method("live_isolate_count", function!(live_isolate_count, 0))?;
     module.define_singleton_method("leaked_isolate_count", function!(leaked_isolate_count, 0))?;
-    module.define_singleton_method("pending_transfer_count", function!(pending_transfer_count, 0))?;
+    module.define_singleton_method(
+        "pending_transfer_count",
+        function!(pending_transfer_count, 0),
+    )?;
     Ok(())
 }

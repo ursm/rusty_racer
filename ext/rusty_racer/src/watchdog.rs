@@ -224,7 +224,10 @@ fn capture_js_backtrace(scope: &mut v8::PinScope<'_, '_>, max_frames: usize) -> 
 // bloat the error.
 fn clamp_name(mut s: String) -> String {
     if s.len() > MAX_FRAME_NAME {
-        let end = (0..=MAX_FRAME_NAME).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0);
+        let end = (0..=MAX_FRAME_NAME)
+            .rev()
+            .find(|&i| s.is_char_boundary(i))
+            .unwrap_or(0);
         s.truncate(end);
         s.push('…');
     }
@@ -255,7 +258,10 @@ pub(crate) fn arm_watchdog(scope: &mut v8::PinScope<'_, '_, ()>, timeout_ms: u64
 // Terminated and the outermost frame sweeps the leftover terminate via
 // WATCHDOG_FIRED; removing only this frame keeps a late terminate from
 // poisoning the next request without clobbering a still-running outer op.
-pub(crate) fn disarm_watchdog(scope: &mut v8::PinScope<'_, '_, ()>, generation: Option<u64>) -> bool {
+pub(crate) fn disarm_watchdog(
+    scope: &mut v8::PinScope<'_, '_, ()>,
+    generation: Option<u64>,
+) -> bool {
     let Some(generation) = generation else {
         return false;
     };
