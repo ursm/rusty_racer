@@ -2061,6 +2061,44 @@ class RustyRacerTest < Minitest::Test
     assert_equal 2, @ctx.eval('1 + 1')
   end
 
+  def test_alternating_fibers_each_get_their_own_stack_bounds
+    # Only Linux looks a fiber's stack bounds up (/proc/self/maps has no darwin
+    # equivalent here), so elsewhere every fiber runs on a fixed fallback budget:
+    # there are no cached bounds to get wrong, and none of the headroom the
+    # depths below assume.
+    skip 'fiber stack bounds are only looked up on Linux' unless RUBY_PLATFORM.include?('linux')
+
+    # Those bounds are cached per thread, a few regions at a time so that ops
+    # alternating between fibers don't re-parse the file every time. Each fiber
+    # must still come back with ITS OWN bottom: handing one fiber another's
+    # (lower) bottom would tell V8 it has far more headroom than the fiber really
+    # has, and the recursion below would run through the guard page instead of
+    # throwing. Run more fibers than FIBER_REGION_SLOTS (16, in stack.rs) so
+    # entries are evicted and re-queried rather than all sitting resident — raise
+    # that constant past this count and the test quietly stops covering eviction.
+    # probe() reports how deep it got before overflowing, which catches BOTH ways
+    # the bounds can be wrong. Too low a bottom (another fiber's) hands V8 megabytes
+    # of headroom on a 644KB stack and the recursion leaves the mapping — a SEGV,
+    # so the process dies rather than the assertion failing. Too high a bottom
+    # clamps the limit to SP - 8KB and starves the fiber instead, which is silent
+    # unless the depth is checked: a healthy fiber reaches ~5700-8200 here (the
+    # main stack reaches ~147000), a starved one a few hundred.
+    @ctx.eval('globalThis.probe = function () { let d = 0; function r() { d++; r() } try { r() } catch (e) { return d } }')
+    fibers = Array.new(20) {
+      Fiber.new {
+        loop do
+          Fiber.yield(@ctx.eval('probe()'))
+        end
+      }
+    }
+    2.times do
+      fibers.each do |f|
+        assert_operator f.resume, :>, 2_000
+      end
+    end
+    assert_equal 2, @ctx.eval('1 + 1')
+  end
+
   def test_host_callback_that_evals_inside_a_fiber
     # The stack description V8 holds lives in the ISOLATE, not in the op, so a
     # nested op that switches stacks needs its own. Here a host fn resumes a

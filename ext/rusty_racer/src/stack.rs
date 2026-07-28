@@ -151,27 +151,127 @@ fn native_stack_bounds() -> (usize, usize) {
     (0, 0)
 }
 
-// Lower bound (and upper, for caching) of the memory region containing `addr`
-// — i.e. the BOTTOM of the stack `addr` is on. Used for a Ruby Fiber, whose
-// mmap'd stack pthread can't see: V8's limit must sit ABOVE this bottom or a
-// deep fiber recursion overflows the real stack and SEGVs the unmapped guard.
-// Cached per native thread keyed by the region (parsing /proc/self/maps is
-// slow): reused while successive ops stay on the same fiber. (0, 0) if unknown.
-thread_local! {
-    static FIBER_REGION: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+// Lower bound (and upper, for the cache test) of the memory region containing
+// `addr` — i.e. the BOTTOM of the stack `addr` is on. Used for a Ruby Fiber,
+// whose mmap'd stack pthread can't see: V8's limit must sit ABOVE this bottom or
+// a deep fiber recursion overflows the real stack and SEGVs the unmapped guard.
+// (0, 0) if unknown.
+//
+// Cached per native thread, several regions at a time, because a miss re-parses
+// all of /proc/self/maps and costs far more than the op it serves: with ONE slot
+// a workload that alternates between fibers missed on every single op, and an
+// eval went from 1.2us to 31us as soon as two fibers took turns (measured on a
+// 212-line maps; a Rails process has many times that). Ruby pools fiber stacks,
+// so the live set is small and stable — one Enumerator per Capybara result, say
+// — and a handful of slots turns that back into hits.
+//
+// Eviction is RANDOM, not round-robin (or LRU, which behaves the same here):
+// ops cycling through more fibers than there are slots are exactly the pattern
+// those policies handle worst, since each eviction takes the entry needed next
+// and the hit rate collapses to zero — one fiber over the size measured as slow
+// as having no cache at all. Evicting at random keeps roughly
+// slots/live-fibers of the accesses, so going over the size degrades gradually
+// instead of falling off a cliff. Empty slots are filled before anything is
+// evicted. Entries are never invalidated: a dead fiber's keeps its slot until
+// some miss draws it, and with a live set that fits there are no misses at all
+// — which is why a hit has to be self-justifying rather than merely plausible.
+//
+// So the mapping's top is never used, or even kept, as an upper bound. A fiber
+// stack's mapping can extend far above the stack itself, where the kernel merged
+// it with an adjacent anonymous mapping of the same protection that has nothing
+// to do with the fiber pool (measured: a 644KB stack inside an 8840KB mapping,
+// with an unrelated 400MB mapping directly above). An entry that answered on the
+// strength of that top would let a later allocation in the neighbour's range
+// inherit a bottom megabytes below its own, and V8 would be told it has that
+// much headroom on a 644KB stack.
+//
+// Each entry instead carries `seen`: the highest address a V8 op has ACTUALLY
+// run at on that stack. It is both the top of the matching window and the bound
+// returned to callers, so the scan-start test in StackScope::enter — "is this
+// enclosing op's marker on the stack I am on?" — rests on an address we watched
+// an op occupy rather than on the kernel's idea of where the mapping ends. A
+// frame higher than anything seen so far misses once and widens the window in
+// place, and a miss always re-queries, so it is only HITS that this has to keep
+// honest.
+//
+// What it does not do is tell two stacks apart that genuinely share one mapping,
+// since entries are keyed by the mapping's bottom: an op running higher up such
+// a mapping re-queries, gets the same bottom back, and widens that one entry.
+// Both then get the lower bottom and a window that spans both. That stays
+// SAFE — one mapping means no guard page in between, so neither the limit nor a
+// scan can walk into an unmapped page — but the upper stack is handed more
+// headroom than it owns. It needs a stack with no guard page below it, which
+// Ruby's fiber pool and pthread both rule out for the stacks we run on.
+//
+// Within that window a cached bottom is the fiber's real bottom: Ruby brackets
+// every fiber stack with PROT_NONE guard pages, so the mapping cannot start
+// below the stack, and a pooled slot is handed to the next fiber with identical
+// bounds.
+const FIBER_REGION_SLOTS: usize = 16;
+
+#[derive(Clone, Copy)]
+struct FiberRegion {
+    // The mapping's bottom, and the key: 0 marks the slot unused.
+    lo: usize,
+    // Highest address a V8 op has run at on this stack.
+    seen: usize,
 }
 
+#[derive(Clone, Copy)]
+struct FiberRegions {
+    slots: [FiberRegion; FIBER_REGION_SLOTS],
+    // xorshift64 state for picking a victim. Seeded to a fixed nonzero constant
+    // (the golden-ratio one): nothing here needs unpredictability, only that the
+    // eviction order doesn't line up with the caller's rotation through fibers.
+    rng: u64,
+}
+
+thread_local! {
+    static FIBER_REGIONS: std::cell::RefCell<FiberRegions> = const {
+        std::cell::RefCell::new(FiberRegions {
+            slots: [FiberRegion { lo: 0, seen: 0 }; FIBER_REGION_SLOTS],
+            rng: 0x9E37_79B9_7F4A_7C15,
+        })
+    };
+}
+
+// (bottom, highest-address-seen) of the stack `addr` is on. `addr` must be an
+// address the CALLER knows is on that stack and as high up it as it can offer —
+// it both answers the lookup and becomes the entry's `seen` on a miss, so a
+// caller that passes its topmost frame gets the widest sound window. A RefCell
+// rather than a Cell so a hit reads the slots in place instead of copying the
+// whole table out on every fiber op.
 fn current_region_bounds_cached(addr: usize) -> (usize, usize) {
-    FIBER_REGION.with(|c| {
-        let (lo, hi) = c.get();
-        if lo != 0 && addr >= lo && addr < hi {
-            return (lo, hi);
+    FIBER_REGIONS.with(|c| {
+        if let Some(r) = c
+            .borrow()
+            .slots
+            .iter()
+            .find(|r| r.lo != 0 && addr >= r.lo && addr <= r.seen)
+        {
+            return (r.lo, r.seen);
         }
-        let bounds = query_region_bounds(addr);
-        if bounds.0 != 0 {
-            c.set(bounds);
+        let (lo, _) = query_region_bounds(addr);
+        if lo == 0 {
+            return (0, 0);
         }
-        bounds
+        let mut cache = c.borrow_mut();
+        // Prefer the entry for a stack we already know (a frame above anything
+        // seen on it so far, which just widens the window), then an empty slot,
+        // and only then evict.
+        let slot = cache
+            .slots
+            .iter()
+            .position(|r| r.lo == lo)
+            .or_else(|| cache.slots.iter().position(|r| r.lo == 0))
+            .unwrap_or_else(|| {
+                cache.rng ^= cache.rng << 13;
+                cache.rng ^= cache.rng >> 7;
+                cache.rng ^= cache.rng << 17;
+                (cache.rng % FIBER_REGION_SLOTS as u64) as usize
+            });
+        cache.slots[slot] = FiberRegion { lo, seen: addr };
+        (lo, addr)
     })
 }
 
@@ -340,7 +440,11 @@ impl<'a> StackScope<'a> {
             // throw, but keep the limit below the SP so we don't false-overflow;
             // on a nearly-full fiber that clamps the headroom down (an early but
             // CLEAN RangeError).
-            region = current_region_bounds_cached(sp);
+            // Look it up by `stack_top`, not the SP: it is this op's highest
+            // frame, so it widens the cache's window as far as this op honestly
+            // can, and the scan-start test below then has a bound it can trust.
+            // Falls back to the SP if the caller had no marker to offer.
+            region = current_region_bounds_cached(if stack_top != 0 { stack_top } else { sp });
             if region.0 != 0 {
                 (region.0 + FIBER_RESERVE).min(sp.saturating_sub(8 * 1024))
             } else {
@@ -357,13 +461,15 @@ impl<'a> StackScope<'a> {
             }
         };
         // Opt-in diagnostics (RUSTY_RACER_STACK_DEBUG): the SP vs the native
-        // stack [nbottom, ntop], the fiber region (if any), the per-op limit, and
+        // stack [nbottom, ntop], the fiber window (if any), the per-op limit, and
         // whether the SP is above the limit. A crash with sp_above_limit=false
-        // means the limit is wrong for the current stack.
+        // means the limit is wrong for the current stack. The window is printed
+        // CLOSED because its top is the highest address an op was seen at on that
+        // stack, not the mapping's end — see current_region_bounds_cached.
         if STACK_DEBUG.load(Ordering::Relaxed) {
             eprintln!(
                 "[rusty stack] sp={sp:#x} nbottom={nbottom:#x} ntop={ntop:#x} \
-                 region=[{:#x},{:#x}) limit={limit:#x} fiber={} sp_above_limit={} \
+                 window=[{:#x},{:#x}] limit={limit:#x} fiber={} sp_above_limit={} \
                  fiber_above_native={}",
                 region.0,
                 region.1,
@@ -417,10 +523,20 @@ impl<'a> StackScope<'a> {
         //     the scan could still hit a hole below it.
         //   * a fiber we were ALREADY on (a nested op under a host callback that
         //     didn't switch stacks) — the enclosing op's start, which is above
-        //     ours and in the same mapping, so it covers both ops' frames.
+        //     ours and covers both ops' frames. Accepted only when it is at or
+        //     below the highest address an op has been seen running at on this
+        //     stack (the cache's `seen`, NOT the mapping top, which can reach far
+        //     into an unrelated neighbour — see current_region_bounds_cached);
+        //     otherwise we cannot tell it is on our stack at all, and adopting it
+        //     would send the scan up through our guard page. Since that window
+        //     lives in a cache with random eviction, the test can also fail
+        //     because the entry was evicted between the two ops — the scan then
+        //     narrows to this op's own frame, i.e. the same residual documented
+        //     there for a real stack switch, now reachable at random once more
+        //     fiber stacks are live than the cache holds.
         let new_scan_start = if on_native {
             unsafe { v8__base__Stack__GetStackStart() }
-        } else if nested && region.0 != 0 && prev_scan_start > sp && prev_scan_start < region.1 {
+        } else if nested && region.0 != 0 && prev_scan_start > sp && prev_scan_start <= region.1 {
             prev_scan_start
         } else {
             stack_top
