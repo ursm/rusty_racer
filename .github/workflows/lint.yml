@@ -26,6 +26,11 @@ jobs:
       # second member added later must land inside the gate, not beside it.
       - name: "cargo fmt"
         run: "cargo fmt --all --check"
+      # Only clippy needs this, so it sits AFTER the fmt gate: a formatting slip
+      # still fails without waiting on a cache restore. Worth having, because
+      # clippy builds the v8 crate's build script, which downloads Deno's
+      # prebuilt rusty_v8 archive into target/ — minutes per run otherwise.
+      - uses: "Swatinem/rust-cache@v2"
       # rb-sys's build script introspects the running Ruby for the headers and
       # link flags, so even `cargo clippy` needs one on PATH. No bundler-cache:
       # nothing here goes through Bundler.
