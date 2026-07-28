@@ -22,8 +22,10 @@ jobs:
           components: "clippy, rustfmt"
       # Default config (style edition comes from the crate's edition = 2024).
       # Needs no Ruby and no V8 download, so it runs first and fails fast.
+      # Workspace-wide, not --manifest-path: the root is a workspace, and a
+      # second member added later must land inside the gate, not beside it.
       - name: "cargo fmt"
-        run: "cargo fmt --manifest-path ext/rusty_racer/Cargo.toml --check"
+        run: "cargo fmt --all --check"
       # rb-sys's build script introspects the running Ruby for the headers and
       # link flags, so even `cargo clippy` needs one on PATH. No bundler-cache:
       # nothing here goes through Bundler.
@@ -34,4 +36,4 @@ jobs:
       # stable toolchain, so a new release can introduce a lint that fails an
       # otherwise-unchanged PR; fix it or #[allow] it with a reason.
       - name: "cargo clippy"
-        run: "cargo clippy --manifest-path ext/rusty_racer/Cargo.toml --all-targets -- -D warnings"
+        run: "cargo clippy --workspace --all-targets -- -D warnings"
