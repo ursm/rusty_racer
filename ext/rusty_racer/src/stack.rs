@@ -157,8 +157,9 @@ fn native_stack_bounds() -> (usize, usize) {
 // a deep fiber recursion overflows the real stack and SEGVs the unmapped guard.
 // (0, 0) if unknown.
 //
-// Cached per native thread, several regions at a time, because a miss re-parses
-// all of /proc/self/maps and costs far more than the op it serves: with ONE slot
+// Cached per native thread, several regions at a time, because a miss asks the
+// OS for the whole memory map and costs far more than the op it serves: with ONE
+// slot
 // a workload that alternates between fibers missed on every single op, and an
 // eval went from 1.2us to 31us as soon as two fibers took turns (measured on a
 // 212-line maps; a Rails process has many times that). Ruby pools fiber stacks,
@@ -403,8 +404,8 @@ pub(crate) static STACK_DEBUG: AtomicBool = AtomicBool::new(false);
 //   * Too low (below the real bottom) and a deep recursion grows past the
 //     mapped stack and SEGVs the unmapped guard page below it.
 // So detect the stack by comparing the SP to the cached native bounds: on the
-// native stack, anchor to its pthread bottom; on a fiber, find the bottom of the
-// /proc/self/maps region holding the SP (the fiber's real bottom — anchoring to
+// native stack, anchor to its pthread bottom; on a fiber, look up the bottom of
+// the mapping holding the SP (the fiber's real bottom — anchoring to
 // SP minus a fixed guard punched through the bottom of Avo's small/deep Capybara
 // fibers and SEGV'd).
 //
@@ -499,8 +500,8 @@ impl<'a> StackScope<'a> {
         let limit = if on_native {
             nbottom + NATIVE_GUARD
         } else {
-            // Anchor to the FIBER's real bottom (the /proc/self/maps region
-            // holding the SP), not the SP: SP - fixed_guard can punch through the
+            // Anchor to the FIBER's real bottom (the mapping holding the SP),
+            // not the SP: SP - fixed_guard can punch through the
             // bottom of a small/deep fiber stack and SEGV (Avo's deep Capybara
             // filter chain). Reserve FIBER_RESERVE above the bottom for the
             // throw, but keep the limit below the SP so we don't false-overflow;
@@ -514,15 +515,16 @@ impl<'a> StackScope<'a> {
             if region.0 != 0 {
                 (region.0 + FIBER_RESERVE).min(sp.saturating_sub(8 * 1024))
             } else {
-                // Region unknown — only Linux can look a fiber's bounds up (see
-                // query_region_bounds), so this is the macOS path. Best effort:
-                // hand JS a fixed budget below the SP and hope the fiber is that
+                // Region unknown. Both shipped platforms implement the lookup,
+                // so reaching this on one of them means the lookup FAILED (see
+                // query_region_bounds for what it refuses to vouch for) — worth
+                // chasing rather than assuming, since the budget here is only a
+                // guess: a fixed reserve below the SP, hoping the fiber is that
                 // deep. It usually is for an OUTERMOST fiber op, whose SP sits
                 // near the fiber's top, and much less reliably for a NESTED one,
                 // whose SP is already far down the fiber — there this can land
                 // below the fiber's mapped bottom, and V8 then grows through the
-                // guard page (SEGV) instead of throwing. Fixing that properly
-                // means a mach_vm_region lookup for darwin.
+                // guard page (SEGV) instead of throwing.
                 sp.saturating_sub(64 * 1024)
             }
         };
@@ -585,7 +587,7 @@ impl<'a> StackScope<'a> {
         //   * a fiber we ENTERED (the enclosing op is elsewhere) — this op's
         //     `stack_top`, which keeps the range between two real stack pointers
         //     (marker..stack_top) and so guaranteed mapped. We can't use the
-        //     /proc/maps region top: that mapping isn't reliably contiguous, so
+        //     looked-up region's top: that mapping isn't reliably contiguous, so
         //     the scan could still hit a hole below it.
         //   * a fiber we were ALREADY on (a nested op under a host callback that
         //     didn't switch stacks) — the enclosing op's start, which is above

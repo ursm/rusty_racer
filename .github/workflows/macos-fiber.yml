@@ -34,15 +34,18 @@ jobs:
           ruby-version: "3.4"
           bundler-cache: true
       - name: "Compile"
+        id: "compile"
         run: "bundle exec rake compile"
       - name: "Fiber tests"
         run: "bundle exec ruby -Ilib -Itest test/rusty_racer_test.rb -n '/fiber|stack_bounds|headroom/i'"
-      # Always, because this is exactly what a failure above needs explaining.
-      # The depths must GROW with the fiber stack size; if they don't, the region
-      # lookup isn't in effect and every fiber is on the fixed fallback budget.
-      # The debug line then shows what bounds the lookup actually came back with.
+      # Runs even when the tests fail, because this is exactly what such a
+      # failure needs explaining — but not when the build did, where it would
+      # only repeat the compiler's own error under a second red X. The depths
+      # must GROW with the fiber stack size; if they don't, the region lookup
+      # isn't in effect and every fiber is on the fixed fallback budget. The
+      # debug line then shows what bounds the lookup actually came back with.
       - name: "Diagnostics"
-        if: "always()"
+        if: "always() && steps.compile.outcome == 'success'"
         run: |
           for size in 524288 1048576 4194304; do
             RUBY_FIBER_MACHINE_STACK_SIZE=$size bundle exec ruby -Ilib -e '

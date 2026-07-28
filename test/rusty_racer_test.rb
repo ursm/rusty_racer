@@ -2068,12 +2068,19 @@ class RustyRacerTest < Minitest::Test
     # the RELATIONSHIP instead: quadruple the fiber stack and the reachable JS
     # depth has to grow with it. A fixed budget would return the same depth for
     # both. Ruby reads the size at boot, hence the subprocesses.
-    small = fiber_js_depth(512 * 1024)
-    large = fiber_js_depth(4 * 1024 * 1024)
+    # Both shipped platforms implement the lookup; the source gem builds on
+    # others, where the stub leaves every fiber on the fallback budget and the
+    # relationship this asserts cannot hold.
+    skip 'fiber stack bounds are only looked up on Linux and macOS' unless RUBY_PLATFORM.match?(/linux|darwin/)
+
+    small_bytes = 512 * 1024
+    large_bytes = 4 * 1024 * 1024
+    small = fiber_js_depth(small_bytes)
+    large = fiber_js_depth(large_bytes)
     assert_operator large, :>, small * 3,
-                    "JS headroom on a fiber is not tracking its stack size " \
-                    "(512KB -> #{small}, 4MB -> #{large}); the region lookup is " \
-                    'not in effect and the fixed fallback budget is being used'
+                    'JS headroom on a fiber is not tracking its stack size ' \
+                    "(#{small_bytes / 1024}KB -> #{small}, #{large_bytes / 1024}KB -> #{large}); " \
+                    'the region lookup is not in effect and the fixed fallback budget is being used'
   end
 
   def test_alternating_fibers_each_get_their_own_stack_bounds
