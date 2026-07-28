@@ -5,7 +5,7 @@
 // — no IsolateState/JsVal/marshalling. It also hosts current_real_isolate() (the
 // entered-isolate query) since that too is just one of the exported V8 symbols
 // below, kept here so the FFI block stays in one place. The crate uses
-// discover_scan_start_field (once per isolate), set_v8_stack_limit (per op),
+// discover_scan_start_field (once per isolate), StackScope (per op),
 // current_real_isolate (per reentrant op), and STACK_DEBUG (set at init);
 // everything else is private to this module.
 
@@ -14,7 +14,7 @@ use std::ffi::c_void;
 // don't warn it unused.
 #[cfg(target_os = "linux")]
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // rusty_v8 doesn't wrap the runtime `v8::Isolate::SetStackLimit(uintptr_t)`, so
 // link the public V8 symbol directly (stable across V8 versions). It sets the
@@ -24,7 +24,7 @@ unsafe extern "C" {
     fn v8__Isolate__SetStackLimit(isolate: *mut c_void, stack_limit: usize);
     // V8's own (exported) accessors down to the conservative-GC-scan Stack
     // object, so we can re-point its stack_start per op when V8 runs on a Ruby
-    // Fiber (see set_fiber_scan_start / discover_scan_start_field). Member fns:
+    // Fiber (see StackScope / discover_scan_start_field). Member fns:
     // the first arg is `this`. The public v8::Isolate* IS i::Isolate*.
     #[link_name = "_ZN2v88internal7Isolate4heapEv"]
     fn v8__internal__Isolate__heap(isolate: *mut c_void) -> *mut c_void;
@@ -52,7 +52,7 @@ pub(crate) fn current_real_isolate() -> *mut c_void {
 }
 
 // Locate V8's conservative-GC-scan stack_start field
-// (heap::base::Stack::current_segment_.start) so set_fiber_scan_start can
+// (heap::base::Stack::current_segment_.start) so StackScope can
 // re-point it per op. The scanner walks [SP, stack_start); on a Ruby Fiber V8's
 // stack_start is still the NATIVE thread top, a different region, so the walk
 // runs off the fiber's mapped top into the guard page and SEGVs (the residual
@@ -178,6 +178,13 @@ fn current_region_bounds_cached(addr: usize) -> (usize, usize) {
 // The [start, end) of the /proc/self/maps mapping containing `addr`. Linux only;
 // (0, 0) elsewhere (and the caller falls back). Reads the file fresh — slow, so
 // only called on a cache miss (a new fiber).
+//
+// Everything that needs a FIBER's real bounds degrades on the (0, 0) platforms,
+// macOS being the shipped one: the stack limit drops to a fixed budget below the
+// SP (see StackScope::enter), and a nested op can no longer widen its GC-scan
+// start to the enclosing op's, so it narrows to its own frame. Both are the
+// pre-fiber-support behaviour rather than a crash, but a darwin implementation
+// (mach_vm_region on the current task) would close the gap.
 #[cfg(target_os = "linux")]
 fn query_region_bounds(addr: usize) -> (usize, usize) {
     use std::io::Read;
@@ -216,11 +223,17 @@ fn query_region_bounds(_addr: usize) -> (usize, usize) {
 // Set from RUSTY_RACER_STACK_DEBUG at init; gates the per-op stack diagnostics.
 pub(crate) static STACK_DEBUG: AtomicBool = AtomicBool::new(false);
 
-// Re-point V8's stack limit at the CURRENT stack each op. In-thread V8 runs
-// wherever the Ruby code is: usually the native thread's pthread stack, but also
-// a Ruby Fiber's separate mmap'd stack (Capybara::Result is an Enumerator) that
-// pthread can't see. The limit MUST sit between the current SP and the real
-// bottom of whatever stack we're on:
+// How V8 describes the stack an op runs on: the stack limit, and — on a Ruby
+// Fiber — the conservative-GC-scan start. Both live in the ISOLATE, not in the
+// op, so an op that runs on a DIFFERENT stack than the one enclosing it (a host
+// callback that resumes a Fiber which evals again) has to install its own and
+// put the enclosing op's back on the way out. Hence a scope: after enter() V8
+// describes the stack we are on now, after the drop the one it described before.
+//
+// In-thread V8 runs wherever the Ruby code is: usually the native thread's
+// pthread stack, but also a Ruby Fiber's separate mmap'd stack (Capybara::Result
+// is an Enumerator) that pthread can't see. The limit MUST sit between the
+// current SP and the real bottom of whatever stack we're on:
 //   * Too high (above SP) and V8 declares a FALSE overflow on entry.
 //   * Too low (below the real bottom) and a deep recursion grows past the
 //     mapped stack and SEGVs the unmapped guard page below it.
@@ -228,85 +241,229 @@ pub(crate) static STACK_DEBUG: AtomicBool = AtomicBool::new(false);
 // native stack, anchor to its pthread bottom; on a fiber, find the bottom of the
 // /proc/self/maps region holding the SP (the fiber's real bottom — anchoring to
 // SP minus a fixed guard punched through the bottom of Avo's small/deep Capybara
-// fibers and SEGV'd). Must be called with the isolate ENTERED. `real_isolate` is
-// the raw v8::Isolate* read out of iso_ptr.
+// fibers and SEGV'd).
 //
-// On a fiber it ALSO re-points V8's conservative-GC-scan stack_start (via
-// scan_start_field, discovered once per isolate) to `stack_top`: Enter just set
-// it to the native top, but the scanner walks [marker, stack_start), so a native
-// start runs the scan off the fiber's mapped stack into unmapped memory and
-// SEGVs (Avo's Capybara filter chain). scan_start_field is 0 when discovery
-// failed (override disabled).
+// The limit does double duty, which is why a STALE one is fatal rather than
+// merely wrong: v8::Isolate::SetStackLimit also sets stack_size_ to
+// (base::Stack::GetStackStart() - limit), and V8's "am I on the central stack?"
+// test is (native_top - stack_size_ - margin) < addr <= native_top — that is,
+// exactly (limit - margin, native_top]. Throwing (and GC) CHECKs that window and
+// V8_Fatals the process on a miss. So an op running on a fiber under the
+// ENCLOSING op's native-stack limit doesn't merely false-overflow: the
+// RangeError it then tries to throw aborts. Installing the limit for the stack
+// we are actually on fixes both at once.
 //
-// LIMITATION (worker-thread fibers): the GC and a thrown exception ALSO
-// `CHECK(IsOnCentralStack(SP))`, which tests the SP against
-// `base::Stack::GetStackStart()` — the pthread top, cached per native thread,
-// with no API to retarget — NOT the scan start we re-point above. A fiber mmap'd
-// ABOVE that top (the common case on a NON-main native thread, whose stack sits
-// below later fiber mmaps) fails the CHECK, so V8 aborts on the next GC or throw.
-// We can fix the scan (the SEGV) but not that CHECK. On the main thread the
-// process stack is the highest address, so every fiber is below it and both the
-// scan and the CHECK are safe — the Capybara/Avo case. See README.
-pub(crate) fn set_v8_stack_limit(real_isolate: *mut c_void, scan_start_field: usize, stack_top: usize) {
-    let sp_marker = 0u8;
-    let sp = &sp_marker as *const u8 as usize;
-    let (nbottom, ntop) = native_stack_bounds_cached();
-    let on_native = nbottom != 0 && sp > nbottom && sp <= ntop;
-    // Reserve below the limit for V8's own RangeError-throw frames.
-    const NATIVE_GUARD: usize = 128 * 1024;
-    // V8 throws when SP descends to the limit, then needs some real stack BELOW
-    // it to build the RangeError (and V8 itself allows growing a little past the
-    // limit — its overflow slack). On a fiber that reserve must NOT cross the
-    // fiber's real bottom (the mapping below it is an unmapped guard -> SEGV), so
-    // keep it comfortably above V8's slack.
-    const FIBER_RESERVE: usize = 64 * 1024;
-    let mut region = (0usize, 0usize);
-    let limit = if on_native {
-        nbottom + NATIVE_GUARD
-    } else {
-        // Anchor to the FIBER's real bottom (the /proc/self/maps region holding
-        // the SP), not the SP: SP - fixed_guard can punch through the bottom of a
-        // small/deep fiber stack and SEGV (Avo's deep Capybara filter chain).
-        // Reserve FIBER_RESERVE above the bottom for the throw, but keep the
-        // limit below the SP so we don't false-overflow; on a nearly-full fiber
-        // that clamps the headroom down (an early but CLEAN RangeError).
-        region = current_region_bounds_cached(sp);
-        if region.0 != 0 {
-            (region.0 + FIBER_RESERVE).min(sp.saturating_sub(8 * 1024))
+// RESIDUAL (GC scan across a stack SWITCH): V8 tracks ONE scan segment per
+// isolate, so while a nested op runs on a fiber its enclosing op's frames on the
+// NATIVE stack aren't conservatively scanned — the two live in different
+// mappings and only one range can be described. (A nested op that did NOT switch
+// stacks is fine: it keeps the enclosing op's start, which covers both.) Handles
+// are unaffected — this
+// build has v8_enable_direct_handle off, so every Local lives in a HandleScope
+// block and is iterated precisely, and JS frames are walked precisely from the
+// frame pointers whichever stack they sit on. Only a raw Tagged<> in V8's own
+// C++ frames would be missed, and V8 keeps those in handles across anything that
+// can allocate. There's no fix available: Stack has no API to register a second
+// segment for the same thread.
+//
+// LIMITATION (worker-thread fibers): only the window's LOWER bound follows the
+// limit. Its upper bound is base::Stack::GetStackStart(), the native pthread
+// top, cached per thread with no way to retarget it (on POSIX
+// base::Stack::SetCurrentThreadStackBounds is UNREACHABLE()). A fiber mmap'd
+// ABOVE that top — the common case on a NON-main native thread, whose stack sits
+// below later fiber mmaps — is outside the window whatever limit we set, so V8
+// aborts on the next throw or GC. On the main thread the process stack is the
+// highest address, so every fiber is below it and the window covers it — the
+// Capybara/Avo case. See README.
+pub(crate) struct StackScope<'a> {
+    real_isolate: *mut c_void,
+    // Address of V8's conservative-GC-scan start field, or 0 when enter()
+    // installed nothing (discovery failed, or no sane limit) — the drop then
+    // restores nothing.
+    scan_start_field: usize,
+    // The limit V8 currently holds for this isolate. Tracked by the caller
+    // because V8 exposes no getter, and a nested op needs the enclosing op's
+    // value to put back. 0 before the isolate's first op.
+    installed_limit: &'a AtomicUsize,
+    // What the drop has to put back, or 0 for "nothing changed, nothing to undo".
+    // Most re-entrant ops run in deeper frames of the SAME stack and so compute
+    // the very values already installed; skipping those writes keeps a nested op
+    // as cheap as it was before it started describing its own stack.
+    restore_limit: usize,
+    restore_scan_start: usize,
+}
+
+impl<'a> StackScope<'a> {
+    // Describe the stack THIS call runs on to the isolate, until the drop. Must
+    // be called with the isolate ENTERED: Isolate::Enter sets the scan start to
+    // the native top, so entering afterwards would clobber a fiber override.
+    //
+    // `enclosing_scan_start` is the scan start of the op this one is nested in,
+    // or None at the outermost op, where no enclosing op exists — then the drop
+    // restores nothing (the values left behind belong to no live frame, and the
+    // next op installs its own before any JS runs). Because Enter re-points the
+    // field, it must be read BEFORE entering. It doubles as the value the drop
+    // puts back and, when a nested op didn't switch stacks, as this op's own
+    // start (see below). `real_isolate` is the raw v8::Isolate* read out of
+    // iso_ptr; `stack_top` is a live address the caller captured ABOVE every V8
+    // frame of this op (used only on a fiber).
+    pub(crate) fn enter(
+        real_isolate: *mut c_void,
+        scan_start_field: usize,
+        enclosing_scan_start: Option<usize>,
+        installed_limit: &'a AtomicUsize,
+        stack_top: usize,
+    ) -> Self {
+        // Only a nested op has an enclosing description to preserve and restore.
+        let nested = enclosing_scan_start.is_some();
+        // 0 doubles as "no enclosing value" throughout: it is never a real start.
+        let prev_scan_start = enclosing_scan_start.unwrap_or(0);
+        let sp_marker = 0u8;
+        let sp = &sp_marker as *const u8 as usize;
+        let (nbottom, ntop) = native_stack_bounds_cached();
+        let on_native = nbottom != 0 && sp > nbottom && sp <= ntop;
+        // Reserve below the limit for V8's own RangeError-throw frames.
+        const NATIVE_GUARD: usize = 128 * 1024;
+        // V8 throws when SP descends to the limit, then needs some real stack
+        // BELOW it to build the RangeError (and V8 itself allows growing a little
+        // past the limit — its overflow slack). On a fiber that reserve must NOT
+        // cross the fiber's real bottom (the mapping below it is an unmapped
+        // guard -> SEGV), so keep it comfortably above V8's slack.
+        const FIBER_RESERVE: usize = 64 * 1024;
+        let mut region = (0usize, 0usize);
+        let limit = if on_native {
+            nbottom + NATIVE_GUARD
         } else {
-            sp.saturating_sub(64 * 1024) // region unknown (non-linux) — best effort
+            // Anchor to the FIBER's real bottom (the /proc/self/maps region
+            // holding the SP), not the SP: SP - fixed_guard can punch through the
+            // bottom of a small/deep fiber stack and SEGV (Avo's deep Capybara
+            // filter chain). Reserve FIBER_RESERVE above the bottom for the
+            // throw, but keep the limit below the SP so we don't false-overflow;
+            // on a nearly-full fiber that clamps the headroom down (an early but
+            // CLEAN RangeError).
+            region = current_region_bounds_cached(sp);
+            if region.0 != 0 {
+                (region.0 + FIBER_RESERVE).min(sp.saturating_sub(8 * 1024))
+            } else {
+                // Region unknown — only Linux can look a fiber's bounds up (see
+                // query_region_bounds), so this is the macOS path. Best effort:
+                // hand JS a fixed budget below the SP and hope the fiber is that
+                // deep. It usually is for an OUTERMOST fiber op, whose SP sits
+                // near the fiber's top, and much less reliably for a NESTED one,
+                // whose SP is already far down the fiber — there this can land
+                // below the fiber's mapped bottom, and V8 then grows through the
+                // guard page (SEGV) instead of throwing. Fixing that properly
+                // means a mach_vm_region lookup for darwin.
+                sp.saturating_sub(64 * 1024)
+            }
+        };
+        // Opt-in diagnostics (RUSTY_RACER_STACK_DEBUG): the SP vs the native
+        // stack [nbottom, ntop], the fiber region (if any), the per-op limit, and
+        // whether the SP is above the limit. A crash with sp_above_limit=false
+        // means the limit is wrong for the current stack.
+        if STACK_DEBUG.load(Ordering::Relaxed) {
+            eprintln!(
+                "[rusty stack] sp={sp:#x} nbottom={nbottom:#x} ntop={ntop:#x} \
+                 region=[{:#x},{:#x}) limit={limit:#x} fiber={} sp_above_limit={} \
+                 fiber_above_native={}",
+                region.0,
+                region.1,
+                !on_native,
+                sp > limit,
+                !on_native && nbottom != 0 && sp > ntop,
+            );
         }
-    };
-    if limit == 0 {
-        return; // couldn't determine a sane limit — leave V8's default
+        if limit == 0 {
+            // Couldn't determine a sane limit — leave V8's default in place, and
+            // with it a scope that restores nothing.
+            return Self {
+                real_isolate,
+                scan_start_field: 0,
+                installed_limit,
+                restore_limit: 0,
+                restore_scan_start: 0,
+            };
+        }
+        // installed_limit is the sole record of what V8 holds (it has no getter),
+        // so an equal value means the isolate is already described correctly and
+        // the call can be skipped. Nothing else moves the limit behind our back:
+        // Isolate::Enter/Exit leave the stack guard alone, and V8 re-points it
+        // itself only under v8::Locker thread archiving (rusty_v8 exposes no
+        // Locker, and an isolate here is thread-confined) or wasm stack
+        // switching (no wasm stacks exist in this embedding).
+        let prev_limit = installed_limit.load(Ordering::Relaxed);
+        let changed_limit = limit != prev_limit;
+        if changed_limit {
+            unsafe { v8__Isolate__SetStackLimit(real_isolate, limit) };
+            installed_limit.store(limit, Ordering::Relaxed);
+        }
+        // Only a nested op owes anything back: at the outermost op prev_limit is
+        // the previous, already-finished op's, which describes no live frame.
+        let restore_limit = if nested && changed_limit { prev_limit } else { 0 };
+        // Point V8's conservative-GC-scan start at the stack we're on. The
+        // scanner walks [marker, start), so on a fiber a native start runs it off
+        // the fiber's mapped top into unmapped memory and SEGVs (Avo's Capybara
+        // filter chain). Always take the WIDEST start that is still on this
+        // stack, because everything between the marker and it gets scanned and an
+        // enclosing op's frames sit above ours:
+        //   * native stack — the native top, i.e. what V8 itself uses.
+        //   * a fiber we ENTERED (the enclosing op is elsewhere) — this op's
+        //     `stack_top`, which keeps the range between two real stack pointers
+        //     (marker..stack_top) and so guaranteed mapped. We can't use the
+        //     /proc/maps region top: that mapping isn't reliably contiguous, so
+        //     the scan could still hit a hole below it.
+        //   * a fiber we were ALREADY on (a nested op under a host callback that
+        //     didn't switch stacks) — the enclosing op's start, which is above
+        //     ours and in the same mapping, so it covers both ops' frames.
+        let new_scan_start = if on_native {
+            unsafe { v8__base__Stack__GetStackStart() }
+        } else if nested && region.0 != 0 && prev_scan_start > sp && prev_scan_start < region.1 {
+            prev_scan_start
+        } else {
+            stack_top
+        };
+        // Install it, and work out what the drop owes the enclosing op. The value
+        // to put back is the caller's PRE-ENTER snapshot, not whatever the field
+        // holds now: Isolate::Enter re-points the start at the native top, so on
+        // the foreign-isolate reentry path the field has already been clobbered
+        // by the time we get here, and restoring that would strand an enclosing
+        // fiber op with a start on the wrong stack.
+        let restore_scan_start = if scan_start_field != 0 && new_scan_start != 0 {
+            let field = scan_start_field as *mut usize;
+            if unsafe { field.read() } != new_scan_start {
+                unsafe { field.write(new_scan_start) };
+            }
+            if nested && prev_scan_start != 0 && prev_scan_start != new_scan_start {
+                prev_scan_start
+            } else {
+                0 // nothing enclosing to put back, or the drop would be a no-op
+            }
+        } else {
+            0 // nothing installed -> nothing to undo
+        };
+        Self {
+            real_isolate,
+            scan_start_field,
+            installed_limit,
+            restore_limit,
+            restore_scan_start,
+        }
     }
-    unsafe { v8__Isolate__SetStackLimit(real_isolate, limit) };
-    // On a fiber, re-point V8's conservative-GC-scan stack_start to `stack_top`
-    // — a live address captured by the caller ABOVE every V8 frame of this op.
-    // Enter() set the start to the NATIVE top (a different region); the scanner
-    // walks [marker, start), so a native start runs it off the fiber's mapped
-    // top into unmapped memory and SEGVs. Anchoring to stack_top keeps the whole
-    // scan range between two real stack pointers (marker..stack_top), so it's
-    // guaranteed mapped, and every V8 root (all below stack_top) is still found.
-    // (We can't use the /proc/maps region top here: that mapping isn't reliably
-    // contiguous, so the scan could still hit a hole below it.)
-    if !on_native && stack_top != 0 && scan_start_field != 0 {
-        unsafe { (scan_start_field as *mut usize).write(stack_top) };
-    }
-    // Opt-in diagnostics (RUSTY_RACER_STACK_DEBUG): the SP vs the native stack
-    // [nbottom, ntop], the fiber region (if any), the per-op limit, and whether
-    // the SP is above the limit. A crash with sp_above_limit=false means the
-    // limit is wrong for the current stack.
-    if STACK_DEBUG.load(Ordering::Relaxed) {
-        eprintln!(
-            "[rusty stack] sp={sp:#x} nbottom={nbottom:#x} ntop={ntop:#x} \
-             region=[{:#x},{:#x}) limit={limit:#x} fiber={} sp_above_limit={} \
-             fiber_above_native={}",
-            region.0,
-            region.1,
-            !on_native,
-            sp > limit,
-            !on_native && nbottom != 0 && sp > ntop,
-        );
+}
+
+impl Drop for StackScope<'_> {
+    // Put the enclosing op's description back, in the reverse order enter()
+    // installed it. A zero means there is nothing to put back: enter() changed
+    // nothing, or this was the isolate's first op and there is no earlier
+    // description. Leaving the last op's settings behind is harmless — every op
+    // installs its own before any JS runs.
+    fn drop(&mut self) {
+        if self.scan_start_field != 0 && self.restore_scan_start != 0 {
+            unsafe { (self.scan_start_field as *mut usize).write(self.restore_scan_start) };
+        }
+        if self.restore_limit != 0 {
+            unsafe { v8__Isolate__SetStackLimit(self.real_isolate, self.restore_limit) };
+            self.installed_limit.store(self.restore_limit, Ordering::Relaxed);
+        }
     }
 }

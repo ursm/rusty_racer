@@ -54,7 +54,7 @@ use marshal::{js_to_jsval, jsval_to_js, jsval_to_ruby, ruby_to_jsval, JsVal};
 mod ops;
 use ops::{run_source, service_request, Compiled, Request, VmReply};
 mod stack;
-use stack::{current_real_isolate, discover_scan_start_field, set_v8_stack_limit, STACK_DEBUG};
+use stack::{current_real_isolate, discover_scan_start_field, StackScope, STACK_DEBUG};
 mod watchdog;
 use watchdog::{
     arm_watchdog, disarm_watchdog, run_js_bracketed, watchdog_loop, WatchdogShared, WATCHDOG_DEBUG,
@@ -1229,10 +1229,16 @@ struct Core {
     // the owner thread.
     iso_ptr: IsoPtr,
     // Address of V8's conservative-GC-scan stack_start field (see
-    // discover_scan_start_field), or 0 if discovery failed. set_v8_stack_limit
-    // writes the fiber region top here per fiber op so a GC scan stays mapped.
-    // Set once at creation, then read-only; AtomicUsize for shared &Core access.
+    // discover_scan_start_field), or 0 if discovery failed. StackScope writes the
+    // fiber region top here per fiber op so a GC scan stays mapped. Set once at
+    // creation, then read-only; AtomicUsize for shared &Core access.
     scan_start_field: std::sync::atomic::AtomicUsize,
+    // The stack limit currently installed in V8 for this isolate. StackScope
+    // keeps it here because V8 exposes no getter and a nested op running on
+    // another stack has to put the enclosing op's limit back. 0 before the first
+    // op. Owner-thread only, like the isolate itself; AtomicUsize for shared
+    // &Core access.
+    installed_stack_limit: std::sync::atomic::AtomicUsize,
     // Re-entry depth for THIS isolate, readable without a scope (the runner needs
     // it to choose the scope kind before any scope exists): 0 = top-level op
     // (open a fresh HandleScope from iso_ptr); >0 = a host callback is on the V8
@@ -1998,6 +2004,7 @@ impl Isolate {
             _owner_root: RootedThread(BoxValue::new(owner_thread)),
             iso_ptr,
             scan_start_field: std::sync::atomic::AtomicUsize::new(0),
+            installed_stack_limit: std::sync::atomic::AtomicUsize::new(0),
             depth: std::sync::atomic::AtomicU32::new(0),
             procs: Mutex::new(ProcTable::default()),
             default_timeout_ms: timeout_ms,
@@ -2084,29 +2091,69 @@ impl Core {
         // poison the isolate and raise instead of crashing the process.
         use std::panic::AssertUnwindSafe;
         let reply: Option<VmReply> = without_gvl(|| {
-            if depth == 0 {
+            // iso_ptr is *mut v8::Isolate = *mut NonNull<RealIsolate>; the raw
+            // v8::Isolate* the C++ entry points want is that NonNull's value.
+            let real_isolate = unsafe { *(iso as *const *mut c_void) };
+            // Whether this op has to ENTER the isolate itself. At depth 0 always:
+            // between ops the isolate is exited, so each op enters around its run.
+            //
+            // A re-entrant op (a host callback or module resolver, having
+            // reacquired the GVL to run a proc that issued this op, is on the V8
+            // stack) USUALLY does not: the JS on the stack belongs to THIS
+            // isolate, which is therefore already entered on THIS native thread,
+            // and we bootstrap onto the ambient HandleScope instead.
+            //
+            // But an embedder driving MANY isolates (e.g. capybara-simulated's
+            // windows) can interleave them: a host callback on isolate A runs
+            // Ruby that evals isolate B, whose own callback re-enters A. Now A is
+            // on the V8 stack (depth > 0) yet B — not A — is the isolate
+            // CURRENTLY entered on this thread, so bootstrapping a scope on A and
+            // opening a ContextScope would trip V8's "scope and Context do not
+            // belong to the same Isolate" panic (it checks the scope's isolate
+            // against Isolate::GetCurrent()). Detect that case and properly enter
+            // A on top of B, restoring B on exit.
+            let entered = depth == 0 || real_isolate != current_real_isolate();
+            // Snapshot the ENCLOSING op's conservative-GC-scan start BEFORE
+            // entering: Isolate::Enter re-points it at the native top, so reading
+            // it afterwards would hand StackScope the clobbered value to
+            // "restore" — stranding an enclosing FIBER op with a start on the
+            // native stack, whose next GC walks off the fiber's mapped top and
+            // SEGVs. None at depth 0, where the value in the field belongs to the
+            // previous, already-finished op and so is nothing to preserve.
+            let scan_start_field = self.scan_start_field.load(Ordering::Relaxed);
+            let enclosing_scan_start = if depth > 0 && scan_start_field != 0 {
+                Some(unsafe { *(scan_start_field as *const usize) })
+            } else {
+                None
+            };
+            if entered {
                 unsafe { (*iso).enter() };
-                // In-thread: V8 runs on THIS native thread's stack. Re-point its
-                // stack limit at this thread's bottom before running JS — the
-                // create-time limit is fixed at a shallow (or other-thread)
-                // frame, so a deeper entry would false-overflow (and the bad
-                // throw trips V8's IsOnCentralStack CHECK -> fatal). iso_ptr is
-                // *mut v8::Isolate = *mut NonNull<RealIsolate>; the raw
-                // v8::Isolate* the C++ method wants is that NonNull's value.
-                let real_isolate = unsafe { *(iso as *const *mut c_void) };
-                // A live address ABOVE every V8 frame of this op (the scope and
-                // service_request below run in deeper frames). On a fiber it
-                // becomes V8's conservative-GC-scan stack_start so the scan stays
-                // within the live, mapped stack — see set_v8_stack_limit.
-                let stack_top_marker = 0u8;
-                // Word-align (down): V8 CHECKs the scan start is pointer-aligned.
-                // Down stays above all V8 frames (they're a full frame below).
-                let stack_top = (&stack_top_marker as *const u8 as usize) & !(size_of::<usize>() - 1);
-                set_v8_stack_limit(
-                    real_isolate,
-                    self.scan_start_field.load(Ordering::Relaxed),
-                    stack_top,
-                );
+            }
+            // In-thread: V8 runs on whatever stack the Ruby caller is on — this
+            // native thread's, or a Ruby Fiber's if a host callback resumed one.
+            // Describe that stack to the isolate for the duration of the op, and
+            // put the enclosing op's description back afterwards. Both the
+            // create-time limit (fixed at a shallow, possibly other-thread frame)
+            // and an enclosing op's are stale here, and a stale limit doesn't
+            // merely false-overflow — it makes the resulting throw FATAL. See
+            // StackScope.
+            //
+            // stack_top_marker is a live address ABOVE every V8 frame of this op
+            // (the scope and service_request below run in deeper frames); on a
+            // fiber it becomes V8's conservative-GC-scan start so the scan stays
+            // within the live, mapped stack.
+            let stack_top_marker = 0u8;
+            // Word-align (down): V8 CHECKs the scan start is pointer-aligned.
+            // Down stays above all V8 frames (they're a full frame below).
+            let stack_top = (&stack_top_marker as *const u8 as usize) & !(size_of::<usize>() - 1);
+            let stack = StackScope::enter(
+                real_isolate,
+                scan_start_field,
+                enclosing_scan_start,
+                &self.installed_stack_limit,
+                stack_top,
+            );
+            if depth == 0 {
                 let mut reply = std::panic::catch_unwind(AssertUnwindSafe(|| {
                     v8::scope!(let scope, unsafe { &mut *iso });
                     service_request(scope, request, true)
@@ -2145,45 +2192,20 @@ impl Core {
                     istate!(iso_ref).oom_fired = false;
                     reply = reply.map(relabel_oom);
                 }
+                // Drop the stack description BEFORE popping the isolate — exit()
+                // can leave a different one current. At depth 0 the drop restores
+                // nothing (no enclosing op), so this just releases the scope.
+                drop(stack);
                 unsafe { (*iso).exit() };
                 reply
             } else {
-                // Re-entrant (a host callback or module resolver, having
-                // reacquired the GVL to run a proc that issued this op, is on the
-                // V8 stack). USUALLY the JS on the stack belongs to THIS isolate
-                // (same-isolate reentry) — which is therefore already entered on
-                // THIS native thread — so we bootstrap onto the ambient
-                // HandleScope without re-entering.
-                //
-                // But an embedder driving MANY isolates (e.g. capybara-simulated's
-                // windows) can interleave them: a host callback on isolate A runs
-                // Ruby that evals isolate B, whose own callback re-enters A. Now A
-                // is on the V8 stack (depth > 0) yet B — not A — is the isolate
-                // CURRENTLY entered on this thread, so bootstrapping a scope on A
-                // and opening a ContextScope would trip V8's "scope and Context do
-                // not belong to the same Isolate" panic (it checks the scope's
-                // isolate against Isolate::GetCurrent()). Detect that case and
-                // properly enter A on top of B, restoring B on exit. Entering an
-                // already-current isolate is also harmless (V8's entered-isolate
-                // stack nests), so this is correct for same-isolate reentry too —
-                // we only pay the enter/exit when a FOREIGN isolate is on top.
-                //
-                // The stack limit + scan-start set at depth 0 are NOT re-pointed
-                // here: reentry runs in DEEPER frames of the SAME stack, so the
-                // depth-0 values still bound it correctly (whichever isolate is
-                // current — each tracks its own limit). The one exception is a
-                // host callback that SWITCHES stacks — e.g. resumes a Ruby Fiber
-                // that itself evals — where the depth-0 (native) settings are
-                // stale for the fiber; that nested-fiber-under-callback case is an
-                // unsupported edge (the realistic fiber path is a depth-0 eval).
-                let foreign = unsafe { *(iso as *const *mut c_void) } != current_real_isolate();
-                if foreign {
-                    unsafe { (*iso).enter() };
-                }
+                // Re-entrant. `entered` is true only when a FOREIGN isolate was
+                // on top (see above): that one had no ambient scope of ours under
+                // its entry, so it opens a fresh HandleScope exactly as the
+                // depth-0 path does. Same-isolate reentry bootstraps onto the
+                // ambient one instead.
                 let reply = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    if foreign {
-                        // A had no ambient scope under B's entry — open a fresh
-                        // HandleScope on A, exactly as the depth-0 path does.
+                    if entered {
                         v8::scope!(let scope, unsafe { &mut *iso });
                         service_request(scope, request, false)
                     } else {
@@ -2195,7 +2217,8 @@ impl Core {
                 // Pop A back off (restoring B as current). Safe even after a
                 // panic unwind: the scope's Drop ran but left A entered, and
                 // exit() asserts A == GetCurrent(), which holds here.
-                if foreign {
+                drop(stack);
+                if entered {
                     unsafe { (*iso).exit() };
                 }
                 reply
