@@ -5,7 +5,7 @@
 # links and loads with no custom archive.
 [package]
 name = "rusty_racer"
-version = "0.1.15"
+version = "0.1.16"
 edition = "2024"
 publish = false
 
