@@ -2061,6 +2061,91 @@ class RustyRacerTest < Minitest::Test
     assert_equal 2, @ctx.eval('1 + 1')
   end
 
+  def test_host_callback_that_evals_inside_a_fiber
+    # The stack description V8 holds lives in the ISOLATE, not in the op, so a
+    # nested op that switches stacks needs its own. Here a host fn resumes a
+    # Fiber and evals again from inside it (Avo reaches this through Rails while
+    # a rack-fetch host call is on the V8 stack). Under the ENCLOSING op's
+    # native-stack limit the nested entry is instantly a false overflow — and
+    # since V8 derives its central-stack window from that same limit, the
+    # RangeError it then tries to throw fails a release CHECK and V8_Fatals the
+    # whole process. With a per-op description the nested throw is an ordinary,
+    # catchable error.
+    @ctx.attach('hop', proc {
+      Fiber.new {
+        begin
+          @ctx.eval('throw new Error("boom")')
+          nil
+        rescue RustyRacer::RuntimeError => e
+          e.message
+        end
+      }.resume
+    })
+    @ctx.eval('globalThis.outer = function () { return globalThis.hop() }')
+    assert_includes @ctx.call('outer'), 'boom'
+    assert_equal 2, @ctx.eval('1 + 1') # isolate still works on the native stack
+  end
+
+  def test_host_callback_fiber_eval_overflows_cleanly
+    # Same path, but the nested op overflows for real. A fiber stack is far
+    # smaller than the native one, so the limit has to come from the FIBER's own
+    # mapping — otherwise V8 either never notices (and grows through the guard
+    # page) or false-overflows. A clean RangeError, not a SEGV or an abort.
+    @ctx.eval('globalThis.rec = function (n) { return n <= 0 ? 0 : 1 + rec(n - 1) }')
+    @ctx.attach('hop', proc {
+      Fiber.new {
+        begin
+          @ctx.eval('rec(10_000_000)')
+          nil
+        rescue RustyRacer::RuntimeError => e
+          e.message
+        end
+      }.resume
+    })
+    @ctx.eval('globalThis.outer = function () { return globalThis.hop() }')
+    assert_includes @ctx.call('outer'), 'call stack'
+    assert_equal 2, @ctx.eval('1 + 1')
+  end
+
+  def test_nested_fiber_eval_restores_the_enclosing_ops_stack_limit
+    # The nested op installs the FIBER's limit, which sits far below the native
+    # stack it was called from. If that stayed installed once the fiber returned,
+    # V8 would never see the native stack's bottom coming and would recurse
+    # straight through the guard page (SEGV) instead of throwing — so the scope
+    # has to put the enclosing op's limit back. The recursion below runs on the
+    # native stack, in the SAME op that hopped through the fiber.
+    @ctx.eval('globalThis.rec = function (n) { return n <= 0 ? 0 : 1 + rec(n - 1) }')
+    @ctx.attach('hop', proc { Fiber.new { @ctx.eval('1 + 1') }.resume })
+    @ctx.eval(<<~JS)
+      globalThis.outer = function () {
+        globalThis.hop();
+        try { rec(10_000_000) } catch (e) { return e.constructor.name }
+        return 'no overflow';
+      }
+    JS
+    assert_equal 'RangeError', @ctx.call('outer')
+    assert_equal 2, @ctx.eval('1 + 1')
+  end
+
+  def test_host_callback_fiber_eval_survives_garbage_collection
+    # A GC during the nested op walks [marker, scan start), so the scan start has
+    # to follow the op onto the fiber or the walk runs off the fiber's mapped top
+    # into unmapped memory. Allocate hard inside the nested eval to force one,
+    # with the enclosing op's frames still live on the native stack.
+    @ctx.attach('hop', proc {
+      Fiber.new {
+        last = nil
+        500.times do
+          last = @ctx.eval('(function () { let a = []; for (let i = 0; i < 1000; i++) a.push({ k: i, v: [i, i + 1] }); return a.length })()')
+        end
+        last
+      }.resume
+    })
+    @ctx.eval('globalThis.outer = function () { return globalThis.hop() }')
+    assert_equal 1000, @ctx.call('outer')
+    assert_equal 2, @ctx.eval('1 + 1')
+  end
+
   def test_isolate_is_thread_confined
     # Every op must run on the isolate's owner thread; a foreign-thread op raises
     # WrongThreadError rather than corrupting V8.

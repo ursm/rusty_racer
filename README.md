@@ -252,14 +252,19 @@ In-thread V8 runs on whatever stack the calling Ruby code is on — including a
 **Fiber**'s separate stack (a plain `Enumerator` is a Fiber, so this is common:
 `Capybara::Result#find`, lazy enumerators, …). This works on the **main thread**,
 where the process stack is the highest address and every Fiber sits below it.
+That includes a Fiber entered *underneath* a running JS call — a host function
+that resumes a Fiber which evals again — since each operation describes its own
+stack to V8 and restores the enclosing one when it returns.
 
-On a **non-main thread** it does not: V8 anchors its "is this the central stack?"
-check to that thread's native stack top (a pthread value it caches, with no API
-to retarget), and a Fiber allocated *above* that top — the usual case off the
-main thread — falls outside the check, so V8 aborts the process on the next GC or
-thrown exception. So **don't call into an isolate from inside a Fiber on a
-worker thread**; drive isolate ops directly on the thread, or keep
-Fiber/Enumerator-mediated JS calls on the main thread.
+On a **non-main thread** it does not. V8 decides "is this the central stack?" by
+testing the stack pointer against a window that ends at the thread's native stack
+top — a pthread value it caches, with no API to retarget on POSIX. Only the
+window's *lower* edge follows the per-operation stack limit, so a Fiber allocated
+*above* that top — the usual case off the main thread, whose own stack sits below
+later Fiber mmaps — is outside the window whatever we do, and V8 aborts the
+process on the next GC or thrown exception. So **don't call into an isolate from
+inside a Fiber on a worker thread**; drive isolate ops directly on the thread, or
+keep Fiber/Enumerator-mediated JS calls on the main thread.
 
 ## Installation
 
