@@ -275,16 +275,16 @@ fn current_region_bounds_cached(addr: usize) -> (usize, usize) {
     })
 }
 
-// The [start, end) of the /proc/self/maps mapping containing `addr`. Linux only;
-// (0, 0) elsewhere (and the caller falls back). Reads the file fresh — slow, so
-// only called on a cache miss (a new fiber).
+// The [start, end) of the mapping containing `addr`, or (0, 0) when it can't be
+// established. Only called on a cache miss (a new fiber), because it is slow.
 //
-// Everything that needs a FIBER's real bounds degrades on the (0, 0) platforms,
-// macOS being the shipped one: the stack limit drops to a fixed budget below the
-// SP (see StackScope::enter), and a nested op can no longer widen its GC-scan
-// start to the enclosing op's, so it narrows to its own frame. Both are the
-// pre-fiber-support behaviour rather than a crash, but a darwin implementation
-// (mach_vm_region on the current task) would close the gap.
+// (0, 0) is the fail-safe answer, not an error: every caller falls back to a
+// fixed budget below the SP, which is what this gem did on every platform before
+// any of these lookups existed. So a platform without an implementation, or a
+// lookup that returns something we can't vouch for, degrades to a smaller JS
+// stack rather than to a wrong one.
+//
+// Linux reads /proc/self/maps fresh each time.
 #[cfg(target_os = "linux")]
 fn query_region_bounds(addr: usize) -> (usize, usize) {
     use std::io::Read;
@@ -314,7 +314,73 @@ fn query_region_bounds(addr: usize) -> (usize, usize) {
     (0, 0)
 }
 
-#[cfg(not(target_os = "linux"))]
+// macOS has no /proc, so ask the Mach VM directly. mach_vm_region reports the
+// region containing `addr` — or, when `addr` sits in a hole, the next one ABOVE
+// it — so the answer is checked for containment rather than trusted. It is also
+// checked for being readable and writable: a stack always is, and a protection
+// that isn't tells us we either walked into something that is not a stack or
+// misread the reply, in which case the fixed-budget fallback is the safer answer.
+#[cfg(target_os = "macos")]
+fn query_region_bounds(addr: usize) -> (usize, usize) {
+    // Not in libc, which points at the `mach2` crate instead; these are the only
+    // entry points we need, so declare them here rather than take the dependency.
+    // (libc does carry mach_task_self_, but deprecated for the same reason.)
+    unsafe extern "C" {
+        static mach_task_self_: libc::mach_port_t;
+        fn mach_vm_region(
+            target_task: libc::vm_map_t,
+            address: *mut libc::mach_vm_address_t,
+            size: *mut libc::mach_vm_size_t,
+            flavor: libc::c_int,
+            info: *mut u32,
+            info_count: *mut libc::mach_msg_type_number_t,
+            object_name: *mut libc::mach_port_t,
+        ) -> libc::kern_return_t;
+        fn mach_port_deallocate(
+            task: libc::mach_port_t,
+            name: libc::mach_port_t,
+        ) -> libc::kern_return_t;
+    }
+    // VM_REGION_BASIC_INFO_64, and the width of vm_region_basic_info_data_64_t
+    // in u32s. Only `protection` (its first field) is read.
+    const VM_REGION_BASIC_INFO_64: libc::c_int = 9;
+    const VM_REGION_BASIC_INFO_COUNT_64: libc::mach_msg_type_number_t = 9;
+    const KERN_SUCCESS: libc::kern_return_t = 0;
+    const VM_PROT_READ_WRITE: u32 = 0x1 | 0x2;
+
+    unsafe {
+        let mut start = addr as libc::mach_vm_address_t;
+        let mut size: libc::mach_vm_size_t = 0;
+        let mut info = [0u32; VM_REGION_BASIC_INFO_COUNT_64 as usize];
+        let mut count = VM_REGION_BASIC_INFO_COUNT_64;
+        let mut object_name: libc::mach_port_t = 0;
+        let kr = mach_vm_region(
+            mach_task_self_,
+            &mut start,
+            &mut size,
+            VM_REGION_BASIC_INFO_64,
+            info.as_mut_ptr(),
+            &mut count,
+            &mut object_name,
+        );
+        // Documented to come back MACH_PORT_NULL for this flavor, but a leaked
+        // port name in a per-fiber path would accumulate, so hand it back.
+        if object_name != 0 {
+            mach_port_deallocate(mach_task_self_, object_name);
+        }
+        if kr != KERN_SUCCESS || size == 0 || info[0] & VM_PROT_READ_WRITE != VM_PROT_READ_WRITE {
+            return (0, 0);
+        }
+        let (lo, hi) = (start as usize, start.saturating_add(size) as usize);
+        if addr >= lo && addr < hi {
+            (lo, hi)
+        } else {
+            (0, 0) // `addr` was in a hole; this is the region after it
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn query_region_bounds(_addr: usize) -> (usize, usize) {
     (0, 0)
 }
