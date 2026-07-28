@@ -246,9 +246,12 @@ pub(crate) static STACK_DEBUG: AtomicBool = AtomicBool::new(false);
 // RangeError it then tries to throw aborts. Installing the limit for the stack
 // we are actually on fixes both at once.
 //
-// RESIDUAL (GC scan under a nested fiber op): V8 tracks ONE scan segment per
-// isolate, so while a nested op runs on a fiber the ENCLOSING op's frames on the
-// native stack aren't conservatively scanned. Handles are unaffected — this
+// RESIDUAL (GC scan across a stack SWITCH): V8 tracks ONE scan segment per
+// isolate, so while a nested op runs on a fiber its enclosing op's frames on the
+// NATIVE stack aren't conservatively scanned — the two live in different
+// mappings and only one range can be described. (A nested op that did NOT switch
+// stacks is fine: it keeps the enclosing op's start, which covers both.) Handles
+// are unaffected — this
 // build has v8_enable_direct_handle off, so every Local lives in a HandleScope
 // block and is iterated precisely, and JS frames are walked precisely from the
 // frame pointers whichever stack they sit on. Only a raw Tagged<> in V8's own
@@ -287,12 +290,15 @@ impl<'a> StackScope<'a> {
     // Describe the stack THIS call runs on to the isolate, until the drop. Must
     // be called with the isolate ENTERED: Isolate::Enter sets the scan start to
     // the native top, so entering afterwards would clobber a fiber override.
-    // `real_isolate` is the raw v8::Isolate* read out of iso_ptr; `stack_top` is
-    // a live address the caller captured ABOVE every V8 frame of this op (used
-    // only on a fiber).
+    // Because Enter does that, `prev_scan_start` must be read BEFORE it — it is
+    // the enclosing op's scan start, both the value the drop puts back and the
+    // one a nested op on the same fiber keeps (see below). `real_isolate` is the
+    // raw v8::Isolate* read out of iso_ptr; `stack_top` is a live address the
+    // caller captured ABOVE every V8 frame of this op (used only on a fiber).
     pub(crate) fn enter(
         real_isolate: *mut c_void,
         scan_start_field: usize,
+        prev_scan_start: usize,
         installed_limit: &'a AtomicUsize,
         stack_top: usize,
     ) -> Self {
@@ -371,26 +377,40 @@ impl<'a> StackScope<'a> {
         // Point V8's conservative-GC-scan start at the stack we're on. The
         // scanner walks [marker, start), so on a fiber a native start runs it off
         // the fiber's mapped top into unmapped memory and SEGVs (Avo's Capybara
-        // filter chain). `stack_top` keeps the whole range between two real stack
-        // pointers (marker..stack_top), so it is guaranteed mapped, and every V8
-        // root of this op (all below stack_top) is still found. (We can't use the
-        // /proc/maps region top: that mapping isn't reliably contiguous, so the
-        // scan could still hit a hole below it.) On the native stack the widest
-        // CORRECT start is the native top — narrowing it to `stack_top` would
-        // drop an enclosing op's frames, which sit above ours.
+        // filter chain). Always take the WIDEST start that is still on this
+        // stack, because everything between the marker and it gets scanned and an
+        // enclosing op's frames sit above ours:
+        //   * native stack — the native top, i.e. what V8 itself uses.
+        //   * a fiber we ENTERED (the enclosing op is elsewhere) — this op's
+        //     `stack_top`, which keeps the range between two real stack pointers
+        //     (marker..stack_top) and so guaranteed mapped. We can't use the
+        //     /proc/maps region top: that mapping isn't reliably contiguous, so
+        //     the scan could still hit a hole below it.
+        //   * a fiber we were ALREADY on (a nested op under a host callback that
+        //     didn't switch stacks) — the enclosing op's start, which is above
+        //     ours and in the same mapping, so it covers both ops' frames.
         let new_scan_start = if on_native {
             unsafe { v8__base__Stack__GetStackStart() }
+        } else if prev_scan_start > sp && prev_scan_start < region.1 && region.0 != 0 {
+            prev_scan_start
         } else {
             stack_top
         };
+        // Install it, and work out what the drop owes the enclosing op. The value
+        // to put back is the caller's PRE-ENTER snapshot, not whatever the field
+        // holds now: Isolate::Enter re-points the start at the native top, so on
+        // the foreign-isolate reentry path the field has already been clobbered
+        // by the time we get here, and restoring that would strand an enclosing
+        // fiber op with a start on the wrong stack.
         let restore_scan_start = if scan_start_field != 0 && new_scan_start != 0 {
             let field = scan_start_field as *mut usize;
-            let prev = unsafe { field.read() };
-            if prev == new_scan_start {
-                0 // already correct for this stack
-            } else {
+            if unsafe { field.read() } != new_scan_start {
                 unsafe { field.write(new_scan_start) };
-                prev
+            }
+            if prev_scan_start != 0 && prev_scan_start != new_scan_start {
+                prev_scan_start
+            } else {
+                0 // nothing earlier to put back, or the drop would be a no-op
             }
         } else {
             0 // nothing installed -> nothing to undo

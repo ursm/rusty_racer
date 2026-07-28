@@ -2113,6 +2113,17 @@ impl Core {
             // against Isolate::GetCurrent()). Detect that case and properly enter
             // A on top of B, restoring B on exit.
             let entered = depth == 0 || real_isolate != current_real_isolate();
+            // Snapshot the enclosing op's conservative-GC-scan start BEFORE
+            // entering: Isolate::Enter re-points it at the native top, so reading
+            // it afterwards would hand StackScope the clobbered value to "restore"
+            // — stranding an enclosing FIBER op with a start on the native stack,
+            // whose next GC walks off the fiber's mapped top and SEGVs.
+            let scan_start_field = self.scan_start_field.load(Ordering::Relaxed);
+            let prev_scan_start = if scan_start_field != 0 {
+                unsafe { *(scan_start_field as *const usize) }
+            } else {
+                0
+            };
             if entered {
                 unsafe { (*iso).enter() };
             }
@@ -2135,7 +2146,8 @@ impl Core {
             let stack_top = (&stack_top_marker as *const u8 as usize) & !(size_of::<usize>() - 1);
             let stack = StackScope::enter(
                 real_isolate,
-                self.scan_start_field.load(Ordering::Relaxed),
+                scan_start_field,
+                prev_scan_start,
                 &self.installed_stack_limit,
                 stack_top,
             );
@@ -2178,8 +2190,12 @@ impl Core {
                     istate!(iso_ref).oom_fired = false;
                     reply = reply.map(relabel_oom);
                 }
-                // Put the enclosing op's stack description back BEFORE popping
-                // the isolate — exit() can leave a different one current.
+                // Drop the stack description BEFORE popping the isolate —
+                // exit() can leave a different one current. At depth 0 there is
+                // no enclosing op, so this just puts the previous op's values
+                // back; harmless (the next op installs its own before any JS
+                // runs) and it leaves the isolate describing a real stack for
+                // teardown.
                 drop(stack);
                 unsafe { (*iso).exit() };
                 reply

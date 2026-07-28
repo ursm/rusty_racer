@@ -2146,6 +2146,52 @@ class RustyRacerTest < Minitest::Test
     assert_equal 2, @ctx.eval('1 + 1')
   end
 
+  def test_cross_isolate_reentry_from_a_fiber_keeps_the_outer_scan_start
+    # A -> B -> A while A's op runs on a Fiber. The hop back into A finds a
+    # FOREIGN isolate current, so it enters A — and Isolate::Enter re-points A's
+    # conservative-GC-scan start at the NATIVE stack top. The nested op has to
+    # remember the start from BEFORE it entered; putting back the one it finds
+    # afterwards leaves the outer fiber op describing the wrong stack, and the
+    # next scanning GC there walks off the fiber's mapped top:
+    #   [BUG] Segmentation fault ... IteratePointersInStack
+    # The GC has to land inside the OUTER op (any later op reinstalls the start
+    # and hides it), hence deep JS frames and sustained allocation after the hop.
+    a = RustyRacer::Isolate.new.context
+    b = RustyRacer::Isolate.new.context
+    b.attach('reenterA', proc { a.eval('1 + 2') })
+    b.eval('function callA() { return reenterA() }')
+    a.attach('intoB', proc { b.eval('callA()') })
+    a.eval(<<~JS)
+      globalThis.deep = function (n) {
+        if (n > 0) return deep(n - 1);
+        let keep = [];
+        for (let i = 0; i < 500; i++) {
+          const x = new Array(2000);
+          for (let j = 0; j < 2000; j++) x[j] = {j, s: 'value' + j, t: [j, j + 1]};
+          keep.push(x);
+          if (keep.length > 3) keep.shift();
+        }
+        return keep.length;
+      }
+    JS
+    12.times { assert_equal 3, Fiber.new { a.eval('intoB(); deep(40)') }.resume }
+    assert_equal 4, a.eval('2 + 2') # A wasn't left describing the wrong stack
+  end
+
+  def test_nested_op_on_the_same_fiber_runs_under_gc_pressure
+    # A host callback that evals again WITHOUT switching stacks stays on the one
+    # fiber, so the nested op keeps the enclosing op's scan start rather than
+    # narrowing it to its own frame (which would leave the enclosing frames,
+    # sitting above it, outside [marker, start) for the duration). Allocate hard
+    # in the nested op so the scan runs with both ops live on the same fiber.
+    @ctx.attach('inner', proc {
+      @ctx.eval('(function () { let s = 0; for (let i = 0; i < 1500; i++) { const x = []; for (let j = 0; j < 500; j++) x.push({j}); s += x.length } return s })()')
+    })
+    @ctx.eval('globalThis.outer = function () { return globalThis.inner() }')
+    assert_equal 750_000, Fiber.new { @ctx.call('outer') }.resume
+    assert_equal 2, @ctx.eval('1 + 1')
+  end
+
   def test_isolate_is_thread_confined
     # Every op must run on the isolate's owner thread; a foreign-thread op raises
     # WrongThreadError rather than corrupting V8.
