@@ -2185,7 +2185,7 @@ impl Core {
         }
         if self.shared.lock().unwrap().disposed {
             return Err(Error::new(
-                ruby.exception_runtime_error(),
+                err_class(ruby, "DisposedError"),
                 "disposed context",
             ));
         }
@@ -2361,7 +2361,7 @@ impl Core {
                 // isolate (every later op refuses) rather than risk using it.
                 self.shared.lock().unwrap().disposed = true;
                 Err(Error::new(
-                    ruby.exception_runtime_error(),
+                    err_class(ruby, "InternalError"),
                     "internal error: operation panicked; the isolate has been disposed",
                 ))
             }
@@ -2383,7 +2383,7 @@ impl Core {
             }
             VmReply::Done(Err(e)) => Err(vm_err(ruby, e)),
             _ => Err(Error::new(
-                ruby.exception_runtime_error(),
+                err_class(ruby, "InternalError"),
                 "internal: unexpected reply kind",
             )),
         }
@@ -2483,7 +2483,7 @@ impl Core {
         let reply = self.run(ruby, Request::HeapStatistics)?;
         let VmReply::Heap(s) = reply else {
             return Err(Error::new(
-                ruby.exception_runtime_error(),
+                err_class(ruby, "InternalError"),
                 "internal: unexpected heap reply",
             ));
         };
@@ -2657,7 +2657,7 @@ impl Core {
             VmReply::ModuleCompiled(Ok(cm)) => Ok(cm),
             VmReply::ModuleCompiled(Err(e)) => Err(vm_err(ruby, e)),
             _ => Err(Error::new(
-                ruby.exception_runtime_error(),
+                err_class(ruby, "InternalError"),
                 "internal: unexpected compile reply",
             )),
         }
@@ -2767,7 +2767,7 @@ impl Core {
             VmReply::ScriptCompiled(Ok(cs)) => Ok(cs),
             VmReply::ScriptCompiled(Err(e)) => Err(vm_err(ruby, e)),
             _ => Err(Error::new(
-                ruby.exception_runtime_error(),
+                err_class(ruby, "InternalError"),
                 "internal: unexpected compile reply",
             )),
         }
@@ -2880,7 +2880,7 @@ impl Core {
             // and SEGV — refuse it, leaving the isolate usable.
             if self.depth.load(Ordering::SeqCst) != 0 {
                 return Err(Error::new(
-                    ruby.exception_runtime_error(),
+                    err_class(ruby, "Error"),
                     "RustyRacer: cannot dispose an isolate from within a running op or host callback",
                 ));
             }
@@ -3001,7 +3001,7 @@ impl Context {
         // id 0's lifetime is the isolate's; extras also track their own dispose.
         if self.disposed.load(Ordering::SeqCst) || self.core.is_disposed() {
             return Err(Error::new(
-                ruby.exception_runtime_error(),
+                err_class(ruby, "DisposedError"),
                 "disposed context",
             ));
         }
@@ -3198,7 +3198,7 @@ impl JsModule {
         // iso.dispose is a use-after-free.
         if self.disposed.load(Ordering::SeqCst) || self.core.is_disposed() {
             return Err(Error::new(
-                ruby.exception_runtime_error(),
+                err_class(ruby, "DisposedError"),
                 "disposed module",
             ));
         }
@@ -3275,7 +3275,7 @@ impl Script {
         // Also refuse once the isolate is disposed (see JsModule::check_live).
         if self.disposed.load(Ordering::SeqCst) || self.core.is_disposed() {
             return Err(Error::new(
-                ruby.exception_runtime_error(),
+                err_class(ruby, "DisposedError"),
                 "disposed script",
             ));
         }
@@ -3330,7 +3330,7 @@ fn code_cache_from_reply(ruby: &Ruby, reply: VmReply) -> Result<Option<Vec<u8>>,
         VmReply::CodeCache(Ok(bytes)) => Ok(bytes),
         VmReply::CodeCache(Err(e)) => Err(vm_err(ruby, e)),
         _ => Err(Error::new(
-            ruby.exception_runtime_error(),
+            err_class(ruby, "InternalError"),
             "internal: unexpected code-cache reply",
         )),
     }
@@ -3466,7 +3466,7 @@ fn resolve_module_via_ruby(
     })?;
     if !std::ptr::eq(Arc::as_ptr(&obj.core), core as *const Core) {
         return Err(Error::new(
-            ruby.exception_runtime_error(),
+            err_class(&ruby, "Error"),
             "module resolver returned a Module from a different Context",
         ));
     }
