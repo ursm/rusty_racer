@@ -79,6 +79,12 @@ rescue RustyRacer::RuntimeError => e
 end
 ```
 
+Everything the binding raises descends from `RustyRacer::Error`, so one rescue
+covers the library. Under it: `ParseError`, `RuntimeError`,
+`ScriptTerminatedError` and `V8OutOfMemoryError` for what the JS did;
+`DisposedError` for using an isolate (or anything it handed out) after
+disposing it; `WrongThreadError` for reaching an isolate from the wrong thread.
+
 ES modules (the embedder owns the URL→module registry):
 
 ```ruby

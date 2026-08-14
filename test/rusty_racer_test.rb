@@ -75,7 +75,7 @@ class RustyRacerTest < Minitest::Test
   def test_script_create_code_cache_raises_after_dispose
     s = @ctx.compile('1')
     s.dispose
-    assert_raises(::RuntimeError) { s.create_code_cache }
+    assert_raises(RustyRacer::DisposedError) { s.create_code_cache }
   end
 
   def test_create_code_cache_is_nil_when_the_realm_is_gone
@@ -180,7 +180,7 @@ class RustyRacerTest < Minitest::Test
     assert_equal false, s.disposed?
     s.dispose
     assert_equal true, s.disposed?
-    assert_raises(::RuntimeError) { s.run }
+    assert_raises(RustyRacer::DisposedError) { s.run }
   end
 
   def test_cached_data_version_tag
@@ -1221,13 +1221,32 @@ class RustyRacerTest < Minitest::Test
     assert_equal 2, ctx.eval('1 + 1') # isolate still usable
   end
 
+  def test_every_error_the_binding_raises_is_a_rusty_racer_error
+    # one rescue has to cover the library. Disposal errors used to be plain
+    # ::RuntimeErrors, so `rescue RustyRacer::Error` missed exactly the mistakes
+    # a caller is most likely to make
+    assert_operator RustyRacer::DisposedError, :<, RustyRacer::Error
+    assert_operator RustyRacer::InternalError, :<, RustyRacer::Error
+
+    iso = RustyRacer::Isolate.new
+    ctx = iso.context
+    m = ctx.compile_module('export const a = 1;')
+    s = ctx.compile('1 + 1')
+    iso.dispose
+
+    [-> { ctx.eval('1') }, -> { m.evaluate }, -> { s.run }].each do |use_it|
+      assert_raises(RustyRacer::DisposedError, &use_it)
+      assert_raises(RustyRacer::Error, &use_it)
+    end
+  end
+
   def test_realm_dispose
     r = @iso.create_context
     assert_equal false, r.disposed?
     assert_equal 5, r.eval("2 + 3")
     r.dispose
     assert_equal true, r.disposed?
-    assert_raises(::RuntimeError) { r.eval("1") }
+    assert_raises(RustyRacer::DisposedError) { r.eval("1") }
     r.dispose # idempotent
     # the parent context still works after a realm is disposed
     assert_equal 2, @ctx.eval("1 + 1")
@@ -1418,7 +1437,7 @@ class RustyRacerTest < Minitest::Test
     iso = RustyRacer::Isolate.new
     m = iso.context.compile_module('export const x = 1;', filename: '/m.js')
     iso.dispose
-    e = assert_raises(::RuntimeError) { m.instantiate { |_s, _r| nil } }
+    e = assert_raises(RustyRacer::DisposedError) { m.instantiate { |_s, _r| nil } }
     assert_includes e.message, 'disposed'
   end
 
@@ -1681,7 +1700,7 @@ class RustyRacerTest < Minitest::Test
   def test_module_create_code_cache_raises_after_dispose
     m = @ctx.compile_module('export const x = 1;')
     m.dispose
-    assert_raises(::RuntimeError) { m.create_code_cache }
+    assert_raises(RustyRacer::DisposedError) { m.create_code_cache }
   end
 
   def test_create_code_cache_on_an_errored_module_is_safe
@@ -1860,7 +1879,7 @@ class RustyRacerTest < Minitest::Test
     m = @ctx.compile_module('export const x = 1;')
     m.instantiate {|_s, _r| nil }
     m.dispose
-    assert_raises(::RuntimeError) { m.graph_async? }
+    assert_raises(RustyRacer::DisposedError) { m.graph_async? }
   end
 
   def test_es_module_dispose
@@ -1868,7 +1887,7 @@ class RustyRacerTest < Minitest::Test
     assert_equal false, m.disposed?
     m.dispose
     assert_equal true, m.disposed?
-    assert_raises(::RuntimeError) { m.evaluate }
+    assert_raises(RustyRacer::DisposedError) { m.evaluate }
   end
 
   def test_call_invokes_global_function
@@ -2824,7 +2843,7 @@ class RustyRacerTest < Minitest::Test
     r = iso.create_context
     r.dispose
     50.times do
-      e = assert_raises(::RuntimeError) { r.eval("1 + 1") }
+      e = assert_raises(RustyRacer::DisposedError) { r.eval("1 + 1") }
       refute_kind_of RustyRacer::ScriptTerminatedError, e
     end
   end
@@ -2844,7 +2863,7 @@ class RustyRacerTest < Minitest::Test
       iso.dispose
       assert worker.join(5), "worker hung"
       # post-dispose use raises the plain disposed-context guard, not a JS error
-      assert_raises(::RuntimeError) { c.eval("1") }
+      assert_raises(RustyRacer::DisposedError) { c.eval("1") }
     end
   end
 
