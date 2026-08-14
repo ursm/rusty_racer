@@ -42,6 +42,19 @@ module RustyRacer
   class SnapshotError < Error; end
   class PlatformAlreadyInitialized < Error; end
 
+  # Raised when a disposed Isolate, Context, Module or Script is used — or one
+  # whose Isolate has been disposed, which takes everything it handed out with
+  # it. Disposal is deliberate, so this says "you used it after you released
+  # it", not "something went wrong".
+  class DisposedError < Error; end
+
+  # A broken invariant inside the binding rather than anything the caller did:
+  # an unexpected reply kind, or an operation that panicked. Reaching one is a
+  # bug in rusty_racer and worth reporting. It exists so that EVERY error the
+  # extension raises is a RustyRacer::Error, and one rescue can cover the
+  # library.
+  class InternalError < Error; end
+
   # Raised when an Isolate (or a Context/Module/Script it handed out) is used
   # from a thread other than the one that created it. An isolate is
   # thread-confined: every operation must run on its owner thread. The lone
