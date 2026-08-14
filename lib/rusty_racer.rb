@@ -112,7 +112,18 @@ module RustyRacer
     # `timeout_ms` (0 = the isolate default) caps this eval; `filename` names the
     # script in stack traces and parse-error locations.
     def eval(source, timeout_ms: 0, filename: '<eval>')
-      _eval(source, timeout_ms, filename)
+      _eval(source, timeout_ms, filename, false)
+    end
+
+    # Run `source` for its EFFECT and return nil, without marshalling its
+    # completion value — the counterpart of #call_void, and what a <script> tag
+    # does. Worth reaching for whenever the value is incidental: a statement
+    # list still has one (its last statement's), and marshalling reads the
+    # value, which runs JS — a getter or a Proxy trap can throw, failing an eval
+    # whose writes all landed. `globalThis.win = someProxy` is the shape that
+    # bites.
+    def eval_void(source, timeout_ms: 0, filename: '<eval>')
+      _eval(source, timeout_ms, filename, true)
     end
 
     # Compile a classic <script>; returns a RustyRacer::Script to #run.

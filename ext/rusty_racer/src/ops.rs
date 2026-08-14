@@ -51,6 +51,11 @@ pub(crate) enum Request {
         source: String,
         filename: String,
         timeout_ms: u64,
+        // void = don't marshal the completion value (see Call's |void|). A
+        // statement-list eval run for its EFFECT still has one — the last
+        // statement's value — and marshalling it can throw (an accessor, a
+        // Proxy trap) or walk a huge graph, for a value the caller discards.
+        void: bool,
     },
     // Resolve a dotted function path on globalThis and invoke it with marshalled
     // args (v8::Function::call), preserving the holder as `this`. Distinct from
@@ -146,10 +151,12 @@ pub(crate) enum Request {
         produce_cache: bool,
         eager: bool,
     },
-    // Bind the script to its context and run it; returns the completion value.
+    // Bind the script to its context and run it; returns the completion value
+    // (unless |void| — see Eval).
     RunScript {
         script_id: i32,
         timeout_ms: u64,
+        void: bool,
     },
     DisposeScript {
         script_id: i32,
@@ -220,6 +227,7 @@ pub(crate) fn run_source(
     scope: &mut v8::PinScope<'_, '_>,
     source: &str,
     filename: &str,
+    void: bool,
 ) -> Result<JsVal, VmError> {
     v8::tc_scope!(let tc, scope);
     // Compile and run as distinct phases so a compile failure maps to
@@ -252,6 +260,7 @@ pub(crate) fn run_source(
         }
     };
     match script.run(tc) {
+        Some(_) if void => Ok(JsVal::Undefined),
         Some(value) => marshalled!(tc, value),
         None if tc.has_terminated() => Err(VmError::Terminated),
         None => {
@@ -448,7 +457,10 @@ fn dispatch_one(
             source,
             filename,
             timeout_ms,
-        } => op_eval(scope, context_id, source, filename, timeout_ms, outermost),
+            void,
+        } => op_eval(
+            scope, context_id, source, filename, timeout_ms, void, outermost,
+        ),
         Request::Call {
             context_id,
             name,
@@ -515,7 +527,8 @@ fn dispatch_one(
         Request::RunScript {
             script_id,
             timeout_ms,
-        } => op_run_script(scope, script_id, timeout_ms, outermost),
+            void,
+        } => op_run_script(scope, script_id, timeout_ms, void, outermost),
         Request::DisposeScript { script_id } => op_dispose_script(scope, script_id),
         // Serialize the script's CURRENT compile state. The stored handle is
         // the UnboundScript, which V8 fills in with inner-function bytecode as
@@ -558,12 +571,14 @@ fn op_low_memory_notification(scope: &mut v8::PinScope<'_, '_, ()>) -> VmReply {
     VmReply::Done(Ok(JsVal::Undefined))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn op_eval(
     scope: &mut v8::PinScope<'_, '_, ()>,
     context_id: i32,
     source: String,
     filename: String,
     timeout_ms: u64,
+    void: bool,
     outermost: bool,
 ) -> VmReply {
     let outcome = run_js_bracketed(scope, outermost, timeout_ms, "eval", |scope, outermost| {
@@ -572,7 +587,7 @@ fn op_eval(
             Some(ctx) => {
                 let context = v8::Local::new(scope, &ctx);
                 let scope = &mut v8::ContextScope::new(scope, context);
-                let out = run_source(scope, &source, &filename);
+                let out = run_source(scope, &source, &filename, void);
                 auto_drain(scope, outermost);
                 (true, out)
             }
@@ -1278,6 +1293,7 @@ fn op_run_script(
     scope: &mut v8::PinScope<'_, '_, ()>,
     script_id: i32,
     timeout_ms: u64,
+    void: bool,
     outermost: bool,
 ) -> VmReply {
     let outcome = run_js_bracketed(
@@ -1302,6 +1318,7 @@ fn op_run_script(
                         let out = {
                             v8::tc_scope!(let tc, scope);
                             match script.run(tc) {
+                                Some(_) if void => Ok(JsVal::Undefined),
                                 Some(value) => marshalled!(tc, value),
                                 None if tc.has_terminated() => Err(VmError::Terminated),
                                 None => {

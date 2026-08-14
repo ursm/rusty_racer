@@ -1069,6 +1069,18 @@ class RustyRacerTest < Minitest::Test
     end
   end
 
+  def test_snapshot_ignores_its_own_completion_value
+    # snapshot code runs for the heap it leaves behind; nothing reads what it
+    # evaluated LAST, so a bundle ending in a value that throws on marshal must
+    # still snapshot (a real failure — see the test above — still raises)
+    snap = RustyRacer::Snapshot.new(<<~JS)
+      globalThis.A = 1;
+      new Proxy({}, {ownKeys() { throw new Error("snapshot boom") }});
+    JS
+    snap.warmup!('new Proxy({}, {ownKeys() { throw new Error("warmup boom") }});')
+    assert_equal 1, RustyRacer::Isolate.new(snapshot: snap).context.eval('A')
+  end
+
   def test_create_realm_is_isolated_from_main_and_siblings
     a = @iso.create_context
     b = @iso.create_context
@@ -1400,6 +1412,37 @@ class RustyRacerTest < Minitest::Test
     assert_includes e.message, 'call boom'
     # call_void never marshals the return, so the hostile getter is never read
     assert_nil @ctx.call_void('hostile')
+  end
+
+  def test_eval_void_runs_for_effect_without_marshalling_the_completion_value
+    # a statement list run for its EFFECT still has a completion value — its
+    # last statement's — so an eval whose writes ALL landed could still fail on
+    # the way out, over a value the caller never asked for
+    src = <<~JS
+      var hostile = new Proxy({}, {ownKeys() { throw new Error("boot boom") }});
+      if (true) { globalThis.win = hostile; }
+    JS
+    e = assert_raises(RustyRacer::RuntimeError) { @ctx.eval(src) }
+    assert_includes e.message, 'boot boom'
+    # ...and the write had landed even then: only the marshal failed
+    assert_equal 'object', @ctx.eval('typeof globalThis.win')
+
+    @ctx.eval('globalThis.win = undefined')
+    assert_nil @ctx.eval_void(src)
+    assert_equal 'object', @ctx.eval('typeof globalThis.win')
+
+    # Script#run_void is the same opt-out for a compiled script
+    s = @ctx.compile(src)
+    assert_raises(RustyRacer::RuntimeError) { s.run }
+    assert_nil s.run_void
+  end
+
+  def test_eval_void_still_reports_a_real_failure
+    # discarding the RESULT must not discard the ERROR
+    assert_raises(RustyRacer::ParseError) { @ctx.eval_void('function (') }
+    e = assert_raises(RustyRacer::RuntimeError) { @ctx.eval_void('throw new Error("thrown")') }
+    assert_includes e.message, 'thrown'
+    assert_raises(RustyRacer::ScriptTerminatedError) { @ctx.eval_void('while (true) {}', timeout_ms: 50) }
   end
 
   def test_a_throw_while_marshalling_a_host_fn_argument_surfaces

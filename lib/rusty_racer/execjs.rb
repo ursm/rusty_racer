@@ -35,9 +35,15 @@ module RustyRacer
         # ExecJS guarantees a bare global (no browser/Node ambient): V8 installs a
         # default `console`, so drop it to match the contract (consumers attach
         # their own if needed), exactly as the mini_racer runtime does.
-        @context.eval('delete globalThis.console')
+        @context.eval_void('delete globalThis.console')
         source = encode(source)
-        translate { @context.eval(source, filename: LOCATION) } if /\S/.match?(source)
+        # eval_void: a bundle is run to POPULATE the context, and its completion
+        # value — the last thing a UMD wrapper happened to evaluate — is nobody's
+        # answer. Marshalling it would walk the whole exports graph on every
+        # context creation, and a lazy/hostile property there would fail the
+        # constructor over a value ExecJS discards. #exec/#eval below must NOT
+        # use it: they read the JSON their wrapper returns.
+        translate { @context.eval_void(source, filename: LOCATION) } if /\S/.match?(source)
       end
 
       # Run statements in a function body and return what they `return` (nil when

@@ -1997,8 +1997,16 @@ fn build_snapshot(code: &str, base: Option<Vec<u8>>, warmup: bool) -> Result<Vec
         {
             let cscope = &mut v8::ContextScope::new(scope, context);
             if !code.is_empty()
-                && let Err(e) =
-                    run_source(cscope, code, if warmup { "<warmup>" } else { "<snapshot>" })
+                && let Err(e) = run_source(
+                    cscope,
+                    code,
+                    if warmup { "<warmup>" } else { "<snapshot>" },
+                    // Snapshot/warmup code runs for its EFFECT (the heap it
+                    // leaves behind); nothing reads its completion value, so
+                    // don't marshal it — a bundle ending in an expression must
+                    // not fail the snapshot over a value no one wants.
+                    true,
+                )
             {
                 err = Some(match e {
                     VmError::Parse(m) | VmError::Runtime(m) => m,
@@ -2522,6 +2530,7 @@ impl Core {
         source: String,
         filename: String,
         timeout_ms: u64,
+        void: bool,
     ) -> Result<Value, Error> {
         let reply = self.run(
             ruby,
@@ -2530,6 +2539,7 @@ impl Core {
                 source,
                 filename,
                 timeout_ms,
+                void,
             },
         )?;
         self.reply_value(ruby, reply)
@@ -2773,12 +2783,13 @@ impl Core {
         }
     }
 
-    fn run_script(&self, ruby: &Ruby, script_id: i32) -> Result<Value, Error> {
+    fn run_script(&self, ruby: &Ruby, script_id: i32, void: bool) -> Result<Value, Error> {
         let reply = self.run(
             ruby,
             Request::RunScript {
                 script_id,
                 timeout_ms: self.default_timeout_ms,
+                void,
             },
         )?;
         self.reply_value(ruby, reply)
@@ -3008,12 +3019,14 @@ impl Context {
         Ok(())
     }
     // timeout_ms 0 = use the isolate's default; an explicit value overrides it.
+    // |void| discards the completion value instead of marshalling it.
     fn eval(
         ruby: &Ruby,
         rb_self: &Self,
         source: String,
         timeout_ms: u64,
         filename: String,
+        void: bool,
     ) -> Result<Value, Error> {
         rb_self.check_live(ruby)?;
         let timeout = if timeout_ms == 0 {
@@ -3023,7 +3036,7 @@ impl Context {
         };
         rb_self
             .core
-            .eval_t(ruby, rb_self.id, source, filename, timeout)
+            .eval_t(ruby, rb_self.id, source, filename, timeout, void)
     }
     fn call(ruby: &Ruby, rb_self: &Self, args: &[Value]) -> Result<Value, Error> {
         rb_self.check_live(ruby)?;
@@ -3285,7 +3298,13 @@ impl Script {
     // thrown exception is a RuntimeError; a timeout/stop a ScriptTerminatedError.
     fn run(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
         rb_self.check_live(ruby)?;
-        rb_self.core.run_script(ruby, rb_self.script_id)
+        rb_self.core.run_script(ruby, rb_self.script_id, false)
+    }
+    // Run it for its effect only, discarding the completion value (see
+    // Context#eval_void) — what a <script> tag does.
+    fn run_void(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
+        rb_self.check_live(ruby)?;
+        rb_self.core.run_script(ruby, rb_self.script_id, true)
     }
     fn cached_data(ruby: &Ruby, rb_self: &Self) -> Value {
         code_cache_value(ruby, rb_self.cached_data.as_ref())
@@ -3506,8 +3525,9 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
 
     // A v8::Context (realm): eval/call/attach/compile_module.
     let context = module.define_class("Context", ruby.class_object())?;
-    // keyword-arg wrapper Context#eval(source, timeout_ms:, filename:) in lib.
-    context.define_method("_eval", method!(Context::eval, 3))?;
+    // Backs both keyword-arg wrappers in lib: Context#eval(source, timeout_ms:,
+    // filename:) and #eval_void, which differ only in the 4th arg (the void flag).
+    context.define_method("_eval", method!(Context::eval, 4))?;
     context.define_method("call", method!(Context::call, -1))?;
     context.define_method("call_void", method!(Context::call_void, -1))?;
     context.define_method("attach", method!(Context::attach, 2))?;
@@ -3523,6 +3543,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     // Classic compiled script: Context#compile -> #run / #cached_data.
     let script = module.define_class("Script", ruby.class_object())?;
     script.define_method("run", method!(Script::run, 0))?;
+    script.define_method("run_void", method!(Script::run_void, 0))?;
     script.define_method("cached_data", method!(Script::cached_data, 0))?;
     script.define_method("cache_rejected?", method!(Script::cache_rejected, 0))?;
     script.define_method("create_code_cache", method!(Script::create_code_cache, 0))?;
