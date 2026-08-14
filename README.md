@@ -65,6 +65,7 @@ ctx.eval("({a: 1, b: [true, 'x']})")     # => {"a"=>1, "b"=>[true, "x"]}
 ctx.eval("function add(a, b) { return a + b }")
 ctx.call("add", 20, 22)                  # => 42
 ctx.call_void("doSideEffect")            # runs it; never marshals the return
+ctx.eval_void("globalThis.wired = wire()")  # ditto for the completion value
 
 # Ruby callbacks into JS; a raised Ruby exception becomes a JS exception.
 ctx.attach("rubyUpcase", ->(s) { s.upcase })
@@ -84,6 +85,14 @@ covers the library. Under it: `ParseError`, `RuntimeError`,
 `ScriptTerminatedError` and `V8OutOfMemoryError` for what the JS did;
 `DisposedError` for using an isolate (or anything it handed out) after
 disposing it; `WrongThreadError` for reaching an isolate from the wrong thread.
+
+Reading a result is not passive — marshalling runs JS (getters, `Proxy` traps,
+`toString`), and a throw there fails the operation even though the code itself
+ran to completion. When the value is incidental, say so: `#eval_void`,
+`Script#run_void` and `#call_void` run for the effect and never touch the
+result. A statement list has a completion value whether you want one or not, so
+plumbing an object into a global (`globalThis.win = someProxy`) is enough to
+make a plain `#eval` fail after every one of its writes has landed.
 
 ES modules (the embedder owns the URL→module registry):
 
