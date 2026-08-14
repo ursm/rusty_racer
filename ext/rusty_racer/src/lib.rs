@@ -326,13 +326,21 @@ fn current_ruby_thread() -> usize {
 // that class carrying the message. Must be called with the GVL held.
 fn error_to_exception(e: &Error) -> Option<Exception> {
     let v = e.value()?;
-    if let Ok(exc) = Exception::try_convert(v) {
-        return Some(exc);
-    }
+    // ExceptionClass FIRST. Error::new(class, msg) stores the CLASS, and
+    // Exception::try_convert would happily accept it — it falls back to calling
+    // #exception on the value, which hands back a fresh instance carrying only
+    // the class name, silently dropping our message.
     if let Ok(class) = ExceptionClass::try_convert(v) {
-        return class.new_instance((e.to_string(),)).ok();
+        // magnus renders such an Error as "Class: message"; the instance carries
+        // the class already, so strip it rather than say it twice.
+        let text = e.to_string();
+        let message = text
+            .strip_prefix(&format!("{class}: "))
+            .unwrap_or(&text)
+            .to_owned();
+        return class.new_instance((message,)).ok();
     }
-    None
+    Exception::try_convert(v).ok()
 }
 
 // JS called a host function. We are on the owner thread with the GVL RELEASED
@@ -924,19 +932,22 @@ fn resolve_imported<'s>(
     // import's auto-link (None -> dynamic_import_resolver, with the initiating
     // realm so it can resolve per-realm).
     let instantiate = istate!(scope).instantiate_resolve.as_ref().map(|r| r.get());
+    let mut dynamic_err = None;
     let dep_id = match instantiate {
         Some(resolve) => {
+            // The error conversion happens INSIDE with_gvl: error_to_exception
+            // calls into Ruby (so it can allocate, so it can GC) and BoxValue::new
+            // registers a GC root — neither is safe with the GVL released.
             match with_gvl(|| {
                 resolve_module_via_ruby(unsafe { &*core_ptr }, resolve, &spec, &ref_url, None)
+                    .map_err(|e| error_to_exception(&e).map(BoxValue::new))
             }) {
                 Ok(id) => id,
                 // Stash the resolver's own raised exception (GC-rooted) so the
                 // InstantiateModule op can re-raise it with its original class
                 // instead of a generic "failed to link".
-                Err(e) => {
-                    if let Some(exc) = error_to_exception(&e) {
-                        istate!(scope).instantiate_resolve_err = Some(BoxValue::new(exc));
-                    }
+                Err(exc) => {
+                    istate!(scope).instantiate_resolve_err = exc;
                     None
                 }
             }
@@ -949,7 +960,7 @@ fn resolve_imported<'s>(
                 .as_ref()
                 .map(|r| r.get());
             match resolver {
-                Some(p) => with_gvl(|| {
+                Some(p) => match with_gvl(|| {
                     resolve_module_via_ruby(
                         unsafe { &*core_ptr },
                         p,
@@ -957,23 +968,81 @@ fn resolve_imported<'s>(
                         &ref_url,
                         Some(here.unwrap_or(0)),
                     )
-                })
-                .unwrap_or(None),
+                    // Rendering the message reads the Ruby exception, so it too
+                    // stays inside with_gvl.
+                    .map_err(|e| e.to_string())
+                }) {
+                    Ok(id) => id,
+                    // Unlike the static branch there is no Ruby frame waiting to
+                    // re-raise into — this failure becomes the import()'s promise
+                    // rejection — so the resolver's own message has to travel out
+                    // as the JS error or it is lost.
+                    Err(why) => {
+                        dynamic_err = Some(why);
+                        None
+                    }
+                },
                 None => None,
             }
         }
     };
-    let dep_id = dep_id?;
+    // From here on, every exit that isn't a module throws first. V8 has no
+    // channel for "why" — it just sees an empty return, installs no error of its
+    // own and resets the graph — so without a thrown exception the failure
+    // reaches Ruby as a bare "unexpected failure" naming neither the import nor
+    // where it came from, which is the single most common module wiring mistake.
+    // (The two bails above stay silent: both are broken internal state, not
+    // anything the caller did.) The one path that must also stay silent is a
+    // STATIC resolver that raised — its own Ruby exception is already stashed
+    // for instantiate_module to re-raise, and ours would mask it. The dynamic
+    // branch has no such frame, so it carries its message in dynamic_err.
+    let raised = istate!(scope).instantiate_resolve_err.is_some();
+    let fail = |scope: &mut v8::PinScope<'_, '_>, message: String| {
+        if !raised {
+            throw_js_error(scope, &message);
+        }
+        None
+    };
+    let import = format!("{spec:?} imported from {ref_url}");
+    let Some(dep_id) = dep_id else {
+        return match dynamic_err {
+            Some(why) => fail(scope, format!("{why} (resolving {import})")),
+            None => fail(
+                scope,
+                format!("failed to resolve module specifier {import}"),
+            ),
+        };
+    };
     // The dep must live in the context actually being linked — the auto-link of
     // a dynamic import runs in whatever realm import() fired in, which kAuto can
     // detach from the request that started it. A foreign-context module would
     // V8-CHECK-abort.
-    let g = {
-        let (g, _, cid) = istate!(scope).modules.by_id.get(&dep_id)?;
-        if Some(*cid) != here {
-            return None;
+    let found = istate!(scope)
+        .modules
+        .by_id
+        .get(&dep_id)
+        .map(|(g, _, cid)| (g.clone(), *cid));
+    let g = match (here, found) {
+        (Some(here), Some((g, cid))) if cid == here => g,
+        (Some(_), Some(_)) => {
+            return fail(
+                scope,
+                format!("resolver returned a module from another realm for {import}"),
+            );
         }
-        g.clone()
+        // The realm being linked is gone. Not reachable while a module is
+        // linking (see |here| above), but reporting it as a realm mismatch
+        // would name the wrong cause.
+        (None, _) => return fail(scope, format!("the realm being linked is gone ({import})")),
+        // Only reachable if the module went away between the resolver handing it
+        // over and this lookup; to the caller that reads the same as never
+        // having resolved it.
+        (_, None) => {
+            return fail(
+                scope,
+                format!("failed to resolve module specifier {import}"),
+            );
+        }
     };
     Some(v8::Local::new(scope, &g))
 }

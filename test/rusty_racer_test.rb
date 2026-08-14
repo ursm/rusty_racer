@@ -1099,9 +1099,11 @@ class RustyRacerTest < Minitest::Test
     other = @iso.create_context
     dep_elsewhere = other.compile_module("export const x = 1;", filename: "/dep.js")
     app = @ctx.compile_module('import {x} from "./dep.js";', filename: "/app.js")
-    assert_raises(RustyRacer::RuntimeError) do
+    e = assert_raises(RustyRacer::RuntimeError) do
       app.instantiate { |_s, _r| dep_elsewhere } # foreign-context dep
     end
+    assert_includes e.message, "another realm"
+    assert_includes e.message, "./dep.js"
     # the isolate is still usable (no crash)
     assert_equal 2, @ctx.eval("1 + 1")
   end
@@ -1281,7 +1283,20 @@ class RustyRacerTest < Minitest::Test
 
   def test_es_module_unresolved_import_raises
     app = @ctx.compile_module('import {x} from "./missing.js";', filename: "/app.js")
-    assert_raises(RustyRacer::RuntimeError) { app.instantiate { |_spec, _ref| nil } }
+    e = assert_raises(RustyRacer::RuntimeError) { app.instantiate { |_spec, _ref| nil } }
+    # V8 has no channel for WHY a resolve came back empty, so the message has to
+    # name the import and its referrer itself or the most common wiring mistake
+    # arrives with nothing to go on
+    assert_includes e.message, './missing.js'
+    assert_includes e.message, '/app.js'
+  end
+
+  def test_es_module_resolver_wrong_type_message_survives
+    # the resolver's TypeError is built by us, not raised by Ruby, so it travels
+    # as an exception CLASS — the message has to be preserved across that
+    app = @ctx.compile_module('import {x} from "./dep.js";', filename: "/app.js")
+    e = assert_raises(TypeError) { app.instantiate { |_s, _r| 42 } }
+    assert_includes e.message, "must return a RustyRacer::Module"
   end
 
   def test_es_module_syntax_error_is_parse_error
@@ -1306,6 +1321,20 @@ class RustyRacerTest < Minitest::Test
     app = @ctx.compile_module('import {x} from "./dep.js";', filename: "/app.js")
     e = assert_raises(ArgumentError) { app.instantiate { |_s, _r| raise ArgumentError, "resolver boom" } }
     assert_includes e.message, "resolver boom"
+  end
+
+  def test_es_module_resolver_raise_propagates_under_gc_stress
+    # the raised exception is converted to an instance and GC-rooted so the op can
+    # re-raise it later; that conversion allocates, so it has to happen with the
+    # GVL HELD — under GC.stress a GVL-free conversion corrupts the heap
+    app = @ctx.compile_module('import {x} from "./dep.js";', filename: '/app.js')
+    GC.stress = true
+    begin
+      e = assert_raises(ArgumentError) { app.instantiate {|_s, _r| raise ArgumentError, 'resolver boom' } }
+      assert_includes e.message, 'resolver boom'
+    ensure
+      GC.stress = false
+    end
   end
 
   def test_es_module_resolver_wrong_type_raises
