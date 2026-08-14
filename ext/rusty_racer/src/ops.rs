@@ -104,6 +104,11 @@ pub(crate) enum Request {
     ModuleStatus {
         module_id: i32,
     },
+    // Whether top-level await appears anywhere in the module's linked import
+    // graph (v8::Module::IsGraphAsync), as a bool.
+    ModuleGraphAsync {
+        module_id: i32,
+    },
     DisposeModule {
         module_id: i32,
     },
@@ -396,6 +401,7 @@ fn request_realm(state: &IsolateState, request: &Request) -> Option<i32> {
         | Request::CreateContext
         | Request::DisposeContext { .. }
         | Request::ModuleStatus { .. }
+        | Request::ModuleGraphAsync { .. }
         | Request::DisposeModule { .. }
         | Request::DisposeScript { .. }
         | Request::ScriptCodeCache { .. }
@@ -465,6 +471,7 @@ fn dispatch_one(
         } => op_evaluate_module(scope, module_id, timeout_ms, outermost),
         Request::ModuleNamespace { module_id } => op_module_namespace(scope, module_id),
         Request::ModuleStatus { module_id } => op_module_status(scope, module_id),
+        Request::ModuleGraphAsync { module_id } => op_module_graph_async(scope, module_id),
         Request::DisposeModule { module_id } => op_dispose_module(scope, module_id),
         Request::CompileScript {
             context_id,
@@ -1065,6 +1072,20 @@ fn op_evaluate_module(
     VmReply::Done(outcome)
 }
 
+// get_module_namespace and is_graph_async both CHECK-abort (a release check, so
+// it kills the process) below Instantiated, so both ask this first. Everything
+// from Instantiated up is admissible, Errored included: a module that fails to
+// LINK is reset to Uninstantiated by V8's ResetGraph, so Errored can only mean
+// "linked, then evaluation failed" — the graph is still there to read.
+fn require_instantiated(module: v8::Local<v8::Module>, what: &str) -> Result<(), VmError> {
+    match module.get_status() {
+        v8::ModuleStatus::Uninstantiated | v8::ModuleStatus::Instantiating => Err(
+            VmError::Runtime(format!("module must be instantiated before {what}")),
+        ),
+        _ => Ok(()),
+    }
+}
+
 fn op_module_namespace(scope: &mut v8::PinScope<'_, '_, ()>, module_id: i32) -> VmReply {
     let handle = module_handle(istate!(scope), module_id);
     let outcome = match handle {
@@ -1075,13 +1096,9 @@ fn op_module_namespace(scope: &mut v8::PinScope<'_, '_, ()>, module_id: i32) -> 
                 let context = v8::Local::new(scope, &cx);
                 let scope = &mut v8::ContextScope::new(scope, context);
                 let module = v8::Local::new(scope, &g);
-                // get_module_namespace CHECK-aborts unless the module
-                // is at least Instantiated.
-                match module.get_status() {
-                    v8::ModuleStatus::Uninstantiated | v8::ModuleStatus::Instantiating => Err(
-                        VmError::Runtime("module must be instantiated before namespace".into()),
-                    ),
-                    _ => {
+                match require_instantiated(module, "namespace") {
+                    Err(e) => Err(e),
+                    Ok(()) => {
                         let ns = module.get_module_namespace();
                         Ok(js_to_jsval(scope, ns))
                     }
@@ -1107,6 +1124,26 @@ fn op_module_status(scope: &mut v8::PinScope<'_, '_, ()>, module_id: i32) -> VmR
                 v8::ModuleStatus::Errored => "errored",
             };
             Ok(JsVal::Str(name.into()))
+        }
+    };
+    VmReply::Done(outcome)
+}
+
+// Does top-level await appear anywhere in this module's import graph? V8 walks
+// the linked graph from here, so an `await` in a dependency counts too — which
+// is why no amount of looking at one source text can answer it, and why it needs
+// an instantiated module: before linking there is no graph to walk. What V8
+// guarantees is the false case — "if IsGraphAsync() is false, the returned
+// Promise is settled" — i.e. false means #evaluate ran the whole graph to
+// completion. No context is entered: the walk reads module slots, runs no JS.
+fn op_module_graph_async(scope: &mut v8::PinScope<'_, '_, ()>, module_id: i32) -> VmReply {
+    let handle = module_handle(istate!(scope), module_id);
+    let outcome = match handle {
+        None => Err(VmError::Runtime("unknown module".into())),
+        Some((g, _cid)) => {
+            let module = v8::Local::new(scope, &g);
+            require_instantiated(module, "graph_async?")
+                .map(|()| JsVal::Bool(module.is_graph_async()))
         }
     };
     VmReply::Done(outcome)

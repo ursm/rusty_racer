@@ -2649,6 +2649,11 @@ impl Core {
         self.reply_value(ruby, reply)
     }
 
+    fn module_graph_async(&self, ruby: &Ruby, module_id: i32) -> Result<Value, Error> {
+        let reply = self.run(ruby, Request::ModuleGraphAsync { module_id })?;
+        self.reply_value(ruby, reply)
+    }
+
     fn dispose_module(&self, ruby: &Ruby, module_id: i32) -> Result<(), Error> {
         let reply = self.run(ruby, Request::DisposeModule { module_id })?;
         self.reply_value(ruby, reply).map(|_| ())
@@ -3140,6 +3145,19 @@ impl JsModule {
         rb_self.check_live(ruby)?;
         rb_self.core.module_status(ruby, rb_self.module_id)
     }
+    // True when top-level await appears anywhere in the module's LINKED import
+    // graph (v8::Module::IsGraphAsync) — a dependency's await counts, which is
+    // why no check on the source text alone can stand in for this. FALSE is the
+    // load-bearing answer: V8 guarantees the evaluation promise is settled, so
+    // #evaluate returning means the whole graph ran. True and it may have
+    // returned with the body still suspended, while #status reads :evaluated
+    // regardless (V8 folds its internal kEvaluatingAsync into kEvaluated).
+    // Raises RustyRacer::RuntimeError unless the module is instantiated: before
+    // linking there is no graph to walk.
+    fn graph_async(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
+        rb_self.check_live(ruby)?;
+        rb_self.core.module_graph_async(ruby, rb_self.module_id)
+    }
     // The bytecode cache produced at compile (produce_cache: true), as a binary
     // String, or nil. Persist it cross-process and pass back via cached_data:.
     fn cached_data(ruby: &Ruby, rb_self: &Self) -> Value {
@@ -3444,6 +3462,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     jsmodule.define_method("evaluate", method!(JsModule::evaluate, 0))?;
     jsmodule.define_method("namespace", method!(JsModule::namespace, 0))?;
     jsmodule.define_method("_status", method!(JsModule::status, 0))?;
+    jsmodule.define_method("graph_async?", method!(JsModule::graph_async, 0))?;
     jsmodule.define_method("cached_data", method!(JsModule::cached_data, 0))?;
     jsmodule.define_method("cache_rejected?", method!(JsModule::cache_rejected, 0))?;
     jsmodule.define_method("create_code_cache", method!(JsModule::create_code_cache, 0))?;
