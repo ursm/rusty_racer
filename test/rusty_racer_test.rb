@@ -1310,6 +1310,104 @@ class RustyRacerTest < Minitest::Test
     assert_raises(RustyRacer::RuntimeError) { m.evaluate }
   end
 
+  def test_es_module_namespace_before_evaluate_names_the_binding
+    # a `const` export has no value until the body runs, so reading it throws.
+    # That throw used to make enumeration fail and marshal to "" — a
+    # plausible-looking empty answer in place of the exports
+    m = @ctx.compile_module('export const a = 1;')
+    m.instantiate {|_s, _r| nil }
+    e = assert_raises(RustyRacer::RuntimeError) { m.namespace }
+    assert_includes e.message, 'before initialization'
+    m.evaluate
+    assert_equal({'a' => 1}, m.namespace)
+  end
+
+  def test_es_module_namespace_before_evaluate_works_for_hoisted_exports
+    # function and var bindings ARE initialized at instantiation, so this is a
+    # legitimate read — a blanket "must be evaluated" guard would refuse it
+    m = @ctx.compile_module('export function f() { return 1 }')
+    m.instantiate {|_s, _r| nil }
+    assert_equal 'function f() { return 1 }', m.namespace['f']
+
+    empty = @ctx.compile_module('export {};')
+    empty.instantiate {|_s, _r| nil }
+    assert_equal({}, empty.namespace)
+  end
+
+  def test_es_module_namespace_of_an_errored_module_reports_why_it_errored
+    # the namespace is unreadable, and the useful answer is the module's own
+    # failure — the same one instantiate and evaluate give — not the secondary
+    # "cannot access before initialization" from the binding it never reached
+    m = @ctx.compile_module('export const a = 1; throw new Error("boom"); export const b = 2;')
+    m.instantiate {|_s, _r| nil }
+    assert_raises(RustyRacer::RuntimeError) { m.evaluate }
+    e = assert_raises(RustyRacer::RuntimeError) { m.namespace }
+    assert_includes e.message, 'boom'
+  end
+
+  def test_es_module_namespace_of_a_suspended_module_reports_the_real_error
+    # a module still parked on an unsettled top-level await reports :evaluated,
+    # so no status check can catch this one — the throw from reading an
+    # uninitialized binding has to survive marshalling and name itself
+    m = @ctx.compile_module('await new Promise(() => {}); export const a = 1;')
+    m.instantiate {|_s, _r| nil }
+    m.evaluate
+    assert_equal :evaluated, m.status
+    assert_equal true, m.graph_async?
+    e = assert_raises(RustyRacer::RuntimeError) { m.namespace }
+    assert_includes e.message, 'before initialization'
+  end
+
+  def test_a_throw_while_marshalling_the_result_surfaces
+    # marshalling runs JS, and a throw there lands after the script already
+    # succeeded — nothing else is looking, so it has to be checked for
+    e = assert_raises(RustyRacer::RuntimeError) do
+      @ctx.eval('({get boom() { throw new Error("getter boom") }})')
+    end
+    assert_includes e.message, 'getter boom'
+
+    e = assert_raises(RustyRacer::RuntimeError) do
+      @ctx.eval('new Proxy({}, {ownKeys() { throw new Error("trap boom") }})')
+    end
+    assert_includes e.message, 'trap boom'
+
+    # Script#run marshals its result the same way eval does
+    s = @ctx.compile('new Proxy({}, {ownKeys() { throw new Error("script boom") }})')
+    e = assert_raises(RustyRacer::RuntimeError) { s.run }
+    assert_includes e.message, 'script boom'
+
+    @ctx.eval('function hostile() { return {get boom() { throw new Error("call boom") }} }')
+    e = assert_raises(RustyRacer::RuntimeError) { @ctx.call('hostile') }
+    assert_includes e.message, 'call boom'
+    # call_void never marshals the return, so the hostile getter is never read
+    assert_nil @ctx.call_void('hostile')
+  end
+
+  def test_a_throw_while_marshalling_a_host_fn_argument_surfaces
+    # the arg marshal runs before the Ruby proc is even called; unwatched, the
+    # exception lingered and whether anyone saw it depended on whether the proc
+    # happened to re-enter V8
+    seen = :never_called
+    @ctx.attach('sink', ->(v) { seen = v })
+    e = assert_raises(RustyRacer::RuntimeError) do
+      @ctx.eval('sink(new Proxy({}, {ownKeys() { throw new Error("arg boom") }}))')
+    end
+    assert_includes e.message, 'arg boom'
+    assert_equal :never_called, seen
+  end
+
+  def test_a_symbol_marshals_instead_of_failing_the_whole_result
+    # Value::ToString THROWS on a Symbol, so the marshaller's escape hatch has to
+    # use the no-side-effects renderer — otherwise one Symbol anywhere in a graph
+    # (every React element carries one) fails the entire op
+    assert_equal 'Symbol(x)', @ctx.eval('Symbol("x")')
+    assert_equal(
+      {'$$typeof' => 'Symbol(react.element)', 'type' => 'div'},
+      @ctx.eval('({$$typeof: Symbol.for("react.element"), type: "div"})')
+    )
+    assert_equal ['Symbol(a)'], @ctx.eval('[Symbol("a")]')
+  end
+
   def test_es_module_top_level_throw_surfaces
     m = @ctx.compile_module('throw new Error("boom in module");', filename: "/t.js")
     m.instantiate { |_s, _r| nil }

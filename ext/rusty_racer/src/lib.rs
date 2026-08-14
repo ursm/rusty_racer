@@ -359,8 +359,20 @@ fn host_fn_callback(
         Err(_) => return,
     };
     let mut js_args = Vec::with_capacity(args.length() as usize);
-    for i in 0..args.length() {
-        js_args.push(js_to_jsval(scope, args.get(i)));
+    {
+        // Marshalling an argument RUNS JS — accessors, Proxy traps — and a throw
+        // there has to fail the host call, not hand the Ruby proc a value that
+        // was never read. Without a TryCatch of our own the exception simply
+        // rides along until something happens to clear it, so whether the caller
+        // ever saw it came down to whether the proc re-entered V8.
+        v8::tc_scope!(let tc, scope);
+        for i in 0..args.length() {
+            js_args.push(js_to_jsval(tc, args.get(i)));
+        }
+        if tc.has_caught() {
+            tc.rethrow();
+            return;
+        }
     }
     // Reach the owning Core through the slot back-pointer (the callback holds
     // only a scope). Null only before wiring, which is before any JS can run.
