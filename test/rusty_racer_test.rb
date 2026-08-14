@@ -1069,6 +1069,18 @@ class RustyRacerTest < Minitest::Test
     end
   end
 
+  def test_snapshot_ignores_its_own_completion_value
+    # snapshot code runs for the heap it leaves behind; nothing reads what it
+    # evaluated LAST, so a bundle ending in a value that throws on marshal must
+    # still snapshot (a real failure — see the test above — still raises)
+    snap = RustyRacer::Snapshot.new(<<~JS)
+      globalThis.A = 1;
+      new Proxy({}, {ownKeys() { throw new Error("snapshot boom") }});
+    JS
+    snap.warmup!('new Proxy({}, {ownKeys() { throw new Error("warmup boom") }});')
+    assert_equal 1, RustyRacer::Isolate.new(snapshot: snap).context.eval('A')
+  end
+
   def test_create_realm_is_isolated_from_main_and_siblings
     a = @iso.create_context
     b = @iso.create_context

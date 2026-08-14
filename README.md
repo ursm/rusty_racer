@@ -65,7 +65,7 @@ ctx.eval("({a: 1, b: [true, 'x']})")     # => {"a"=>1, "b"=>[true, "x"]}
 ctx.eval("function add(a, b) { return a + b }")
 ctx.call("add", 20, 22)                  # => 42
 ctx.call_void("doSideEffect")            # runs it; never marshals the return
-ctx.eval_void("globalThis.wired = wire()")  # ditto for the completion value
+ctx.eval_void("globalThis.app = boot()") # ditto for the completion value
 
 # Ruby callbacks into JS; a raised Ruby exception becomes a JS exception.
 ctx.attach("rubyUpcase", ->(s) { s.upcase })

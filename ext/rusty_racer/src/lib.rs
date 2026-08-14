@@ -3525,7 +3525,8 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
 
     // A v8::Context (realm): eval/call/attach/compile_module.
     let context = module.define_class("Context", ruby.class_object())?;
-    // keyword-arg wrapper Context#eval(source, timeout_ms:, filename:) in lib.
+    // Backs both keyword-arg wrappers in lib: Context#eval(source, timeout_ms:,
+    // filename:) and #eval_void, which differ only in the 4th arg (the void flag).
     context.define_method("_eval", method!(Context::eval, 4))?;
     context.define_method("call", method!(Context::call, -1))?;
     context.define_method("call_void", method!(Context::call_void, -1))?;
