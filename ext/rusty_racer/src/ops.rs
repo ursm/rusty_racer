@@ -18,6 +18,29 @@ use crate::istate;
 use crate::marshal::{JsVal, js_to_jsval, jsval_to_js};
 use crate::*;
 
+// Marshal an op's result, treating a throw on the way out as the op's outcome.
+// Marshalling RUNS JS — accessors, Proxy traps, toString — and an exception
+// raised there is as real as one from the script itself, but it lands after the
+// call has already succeeded, so nothing else looks at it: the TryCatch drops it
+// on unwind and the caller keeps a value that no longer means anything (an
+// object whose enumeration threw marshals to undefined). A macro rather than a
+// fn because the tc_scope! binding has no nameable type here.
+macro_rules! marshalled {
+    ($tc:expr, $value:expr) => {{
+        let tc = $tc;
+        let out = js_to_jsval(tc, $value);
+        let exc = tc.exception();
+        if exc.is_none() {
+            Ok(out)
+        } else if tc.has_terminated() {
+            Err(VmError::Terminated)
+        } else {
+            let stack = tc.stack_trace();
+            Err(capture_js_error(tc, exc, stack))
+        }
+    }};
+}
+
 // One VM operation, built by a magnus method and run inline by Core::run ->
 // service_request -> dispatch_one. |context_id| selects which realm the op runs
 // in: 0 = the main realm (Context's own globalThis, swappable by reset_realm),
@@ -229,7 +252,7 @@ pub(crate) fn run_source(
         }
     };
     match script.run(tc) {
-        Some(value) => Ok(js_to_jsval(tc, value)),
+        Some(value) => marshalled!(tc, value),
         None if tc.has_terminated() => Err(VmError::Terminated),
         None => {
             let exc = tc.exception();
@@ -284,7 +307,7 @@ fn call_function(
     match func.call(tc, recv, &argv) {
         // void: skip marshalling the return so a huge/cyclic result is never walked.
         Some(_) if void => Ok(JsVal::Undefined),
-        Some(value) => Ok(js_to_jsval(tc, value)),
+        Some(value) => marshalled!(tc, value),
         None if tc.has_terminated() => Err(VmError::Terminated),
         None => {
             let exc = tc.exception();
@@ -1096,11 +1119,27 @@ fn op_module_namespace(scope: &mut v8::PinScope<'_, '_, ()>, module_id: i32) -> 
                 let context = v8::Local::new(scope, &cx);
                 let scope = &mut v8::ContextScope::new(scope, context);
                 let module = v8::Local::new(scope, &g);
-                match require_instantiated(module, "namespace") {
-                    Err(e) => Err(e),
-                    Ok(()) => {
-                        let ns = module.get_module_namespace();
-                        Ok(js_to_jsval(scope, ns))
+                // An errored module's namespace is unreadable — its bindings
+                // never initialized — and the useful answer is WHY it errored,
+                // the same one instantiate and evaluate give.
+                if module.get_status() == v8::ModuleStatus::Errored {
+                    Err(VmError::JsError {
+                        message: module.get_exception().to_rust_string_lossy(scope),
+                        backtrace: vec![],
+                    })
+                } else {
+                    match require_instantiated(module, "namespace") {
+                        Err(e) => Err(e),
+                        Ok(()) => {
+                            let ns = module.get_module_namespace();
+                            // Reading the namespace RUNS JS: every export is an
+                            // accessor, and one whose binding is still
+                            // uninitialized throws. Unwatched, that throw made
+                            // enumeration fail and the caller silently got the
+                            // stringified object in place of their exports.
+                            v8::tc_scope!(let tc, scope);
+                            marshalled!(tc, ns)
+                        }
                     }
                 }
             }
@@ -1263,7 +1302,7 @@ fn op_run_script(
                         let out = {
                             v8::tc_scope!(let tc, scope);
                             match script.run(tc) {
-                                Some(value) => Ok(js_to_jsval(tc, value)),
+                                Some(value) => marshalled!(tc, value),
                                 None if tc.has_terminated() => Err(VmError::Terminated),
                                 None => {
                                     let exc = tc.exception();

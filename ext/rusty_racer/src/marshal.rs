@@ -149,7 +149,7 @@ fn js_container_id(
     // First sighting but too deep: truncate WITHOUT registering, so no later
     // Ref can target a container that was never emitted.
     if depth >= MAX_MARSHAL_DEPTH {
-        return Err(JsVal::Str(value.to_rust_string_lossy(scope)));
+        return Err(JsVal::Str(stringify(scope, value)));
     }
     let id = seen.next_id;
     seen.next_id += 1;
@@ -342,7 +342,7 @@ fn js_to_jsval_d(
                 let Some(key) = names.get_index(scope, i) else {
                     continue;
                 };
-                let key_str = key.to_rust_string_lossy(scope);
+                let key_str = stringify(scope, key);
                 let val = obj
                     .get(scope, key)
                     .unwrap_or_else(|| v8::undefined(scope).into());
@@ -350,8 +350,43 @@ fn js_to_jsval_d(
             }
             return JsVal::Obj { id, entries };
         }
+        // Enumeration THREW — a module namespace whose bindings aren't
+        // initialized yet, a Proxy with a hostile ownKeys trap. Falling through
+        // to the stringify below would hand the caller a plausible-looking
+        // "[object Object]" for an object we never actually read. Leave the
+        // pending exception alone instead and let the op's TryCatch report it —
+        // and give back the id, or a sibling Ref to this same object would point
+        // at a container that is never emitted.
+        unregister_container(seen, obj, id);
+        return JsVal::Undefined;
     }
-    JsVal::Str(value.to_rust_string_lossy(scope))
+    JsVal::Str(stringify(scope, value))
+}
+
+// The escape hatch for values with no structural representation — Function,
+// Date, RegExp, Symbol. to_rust_string_lossy is Value::ToString, which THROWS on
+// a Symbol, and a Symbol sitting anywhere in a graph (every React element has
+// one) would then leave a pending exception behind and fail the whole op over a
+// value that marshalled fine. to_detail_string is V8's no-side-effects renderer
+// and cannot throw, so Symbols go through it.
+fn stringify(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) -> String {
+    if value.is_symbol() {
+        return value
+            .to_detail_string(scope)
+            .map(|s| s.to_rust_string_lossy(scope))
+            .unwrap_or_default();
+    }
+    value.to_rust_string_lossy(scope)
+}
+
+// Undo js_container_id's registration for a container we end up NOT emitting.
+// The id is always the last one pushed to its bucket, since nothing else can
+// register while we are inside this object.
+fn unregister_container(seen: &mut JsSeen, obj: v8::Local<v8::Object>, id: u32) {
+    let hash = obj.get_identity_hash().get();
+    if let Some(bucket) = seen.map.get_mut(&hash) {
+        bucket.retain(|(_, existing)| *existing != id);
+    }
 }
 
 // Owned-by-value (not &JsVal): a JsVal::Bytes hands its Vec straight to V8's
