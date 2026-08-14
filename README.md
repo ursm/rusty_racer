@@ -86,9 +86,18 @@ dep = ctx.compile_module("export const x = 21;", filename: "/dep.js")
 app = ctx.compile_module('import {x} from "./dep.js"; export const r = x * 2;',
                          filename: "/app.js")
 app.instantiate { |specifier, referrer| dep if specifier == "./dep.js" }
+app.graph_async?                         # => false
 app.evaluate
 app.namespace["r"]                       # => 42
 ```
+
+`graph_async?` asks whether top-level `await` appears anywhere in the *linked*
+graph, so an `await` in a dependency counts — which is why it needs an
+instantiated module and raises before then. `false` is the answer that carries a
+guarantee: `evaluate` ran the whole graph to completion. Since there is no event
+loop here (see below), a `true` graph whose `await` never settles returns from
+`evaluate` with the module body still suspended, and `status` reports
+`:evaluated` either way — so `graph_async?` is what distinguishes the two.
 
 Classic `<script>`s work the same way: `ctx.compile("1 + 1").run` # => 2.
 

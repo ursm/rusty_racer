@@ -1624,6 +1624,147 @@ class RustyRacerTest < Minitest::Test
     assert_equal :errored, m.status
   end
 
+  def test_module_graph_async_reports_top_level_await
+    plain = @ctx.compile_module('export const x = 1;')
+    plain.instantiate {|_s, _r| nil }
+    assert_equal false, plain.graph_async?
+
+    tla = @ctx.compile_module('await Promise.resolve(); export const x = 1;')
+    tla.instantiate {|_s, _r| nil }
+    assert_equal true, tla.graph_async?
+  end
+
+  def test_module_graph_async_sees_await_in_an_imported_module
+    # the answer is about the whole linked graph, not this module's own source:
+    # an importer with no await of its own is still async if a dependency awaits
+    dep = @ctx.compile_module('await Promise.resolve(); export const x = 1;', filename: '/dep.js')
+    app = @ctx.compile_module('import {x} from "./dep.js"; export const y = x;', filename: '/app.js')
+    app.instantiate {|spec, _ref| dep if spec == './dep.js' }
+    assert_equal true, app.graph_async?
+    assert_equal true, dep.graph_async?
+  end
+
+  def test_module_graph_async_with_imports_alongside_the_await
+    # the case source probing cannot answer: `import` makes the source illegal as
+    # a classic script whether or not it awaits, so only V8 can tell the two apart
+    dep = @ctx.compile_module('export const x = 1;', filename: '/dep.js')
+    resolve = ->(spec, _ref) { dep if spec == './dep.js' }
+
+    sync = @ctx.compile_module('import {x} from "./dep.js"; export const y = x;', filename: '/sync.js')
+    sync.instantiate(&resolve)
+    assert_equal false, sync.graph_async?
+
+    async = @ctx.compile_module('import {x} from "./dep.js"; await Promise.resolve();', filename: '/async.js')
+    async.instantiate(&resolve)
+    assert_equal true, async.graph_async?
+    # and the walk runs DOWN the graph only — importing an awaiting module makes
+    # you async, being imported by one does not
+    assert_equal false, dep.graph_async?
+  end
+
+  def test_module_graph_async_is_about_top_level_await_only
+    # not an `await` token scan: only await in the module BODY counts, and a
+    # dynamic import is not part of the static graph the walk follows
+    nested = @ctx.compile_module('async function f() { await Promise.resolve(); } f();')
+    nested.instantiate {|_s, _r| nil }
+    assert_equal false, nested.graph_async?
+
+    dynamic = @ctx.compile_module("import('/tla.js');", filename: '/dynamic.js')
+    dynamic.instantiate {|_s, _r| nil }
+    assert_equal false, dynamic.graph_async?
+
+    awaited = @ctx.compile_module("await import('/tla.js');", filename: '/awaited.js')
+    awaited.instantiate {|_s, _r| nil }
+    assert_equal true, awaited.graph_async?
+  end
+
+  def test_module_graph_async_walks_a_deep_chain
+    # one edge is not enough: the answer has to survive the whole traversal
+    leaf  = @ctx.compile_module('await Promise.resolve(); export const x = 1;', filename: '/leaf.js')
+    mid   = @ctx.compile_module('export {x} from "/leaf.js";', filename: '/mid.js')
+    inner = @ctx.compile_module('export {x} from "/mid.js";', filename: '/inner.js')
+    root  = @ctx.compile_module('import {x} from "/inner.js"; globalThis.X = x;', filename: '/root.js')
+
+    graph = {'/leaf.js' => leaf, '/mid.js' => mid, '/inner.js' => inner}
+    root.instantiate {|spec, _ref| graph[spec] }
+
+    assert_equal [true, true, true, true], [root, inner, mid, leaf].map(&:graph_async?)
+  end
+
+  def test_module_graph_async_terminates_on_a_cyclic_graph
+    # V8's walk keeps a visited set purely to break cycles; without it this hangs
+    # rather than fails, so it is worth pinning explicitly
+    a = @ctx.compile_module('import {x} from "/b.js"; export const y = 1;', filename: '/a.js')
+    b = @ctx.compile_module('import {y} from "/a.js"; await Promise.resolve(); export const x = 1;', filename: '/b.js')
+
+    graph = {'/a.js' => a, '/b.js' => b}
+    a.instantiate {|spec, _ref| graph[spec] }
+
+    assert_equal true, a.graph_async?
+    assert_equal true, b.graph_async?
+  end
+
+  def test_module_graph_async_before_instantiate_raises_not_aborts
+    # guard against V8 CHECK-aborting the process on an unlinked module
+    m = @ctx.compile_module('await Promise.resolve();')
+    e = assert_raises(RustyRacer::RuntimeError) { m.graph_async? }
+    assert_includes e.message, 'must be instantiated'
+  end
+
+  def test_module_graph_async_during_instantiate_raises_not_aborts
+    # mid-link is the state the V8 CHECK exists for: the resolver runs while the
+    # root is still unlinked, and asking then must raise rather than abort
+    dep = @ctx.compile_module('export const x = 1;', filename: '/dep.js')
+    app = @ctx.compile_module('import {x} from "/dep.js";', filename: '/app.js')
+
+    raised = nil
+    app.instantiate do |_spec, _ref|
+      raised ||= assert_raises(RustyRacer::RuntimeError) { app.graph_async? }
+      dep
+    end
+
+    assert_includes raised.message, 'must be instantiated'
+    assert_equal false, app.graph_async?
+  end
+
+  def test_module_graph_async_after_a_failed_instantiate_raises
+    # a failed link resets the root to :uninstantiated (V8's ResetGraph), which is
+    # what keeps :errored safe to admit — an already-linked dep is left alone
+    dep = @ctx.compile_module('await Promise.resolve(); export const x = 1;', filename: '/dep.js')
+    dep.instantiate {|_s, _r| nil }
+    app = @ctx.compile_module('import {x} from "/dep.js"; import "/missing.js";', filename: '/app.js')
+
+    graph = {'/dep.js' => dep}
+    assert_raises(RustyRacer::RuntimeError) { app.instantiate {|spec, _ref| graph[spec] } }
+
+    assert_equal :uninstantiated, app.status
+    assert_raises(RustyRacer::RuntimeError) { app.graph_async? }
+    assert_equal true, dep.graph_async?
+  end
+
+  def test_module_graph_async_survives_the_rest_of_the_lifecycle
+    # :evaluated and :errored are both past the CHECK's threshold, so the answer
+    # stays available after the module has run — or failed
+    ok = @ctx.compile_module('await Promise.resolve();')
+    ok.instantiate {|_s, _r| nil }
+    ok.evaluate
+    assert_equal :evaluated, ok.status
+    assert_equal true, ok.graph_async?
+
+    bad = @ctx.compile_module('await Promise.resolve(); throw new Error("boom");')
+    bad.instantiate {|_s, _r| nil }
+    assert_raises(RustyRacer::RuntimeError) { bad.evaluate }
+    assert_equal :errored, bad.status
+    assert_equal true, bad.graph_async?
+  end
+
+  def test_module_graph_async_after_dispose_raises
+    m = @ctx.compile_module('export const x = 1;')
+    m.instantiate {|_s, _r| nil }
+    m.dispose
+    assert_raises(::RuntimeError) { m.graph_async? }
+  end
+
   def test_es_module_dispose
     m = @ctx.compile_module("export const a = 1;")
     assert_equal false, m.disposed?
