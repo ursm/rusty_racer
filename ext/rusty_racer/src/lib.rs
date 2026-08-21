@@ -571,8 +571,8 @@ struct V8State {
     // its microtasks. reset/dispose don't drop it directly — they move the old
     // (context, queue) into `retiring` so flush_retiring can repoint then free it
     // safely (see those fields).
-    main_queue: Option<v8::UniqueRef<v8::MicrotaskQueue>>,
-    queues: HashMap<i32, v8::UniqueRef<v8::MicrotaskQueue>>,
+    main_queue: Option<v8::MicrotaskQueueHandle>,
+    queues: HashMap<i32, v8::MicrotaskQueueHandle>,
     // A long-lived, never-drained queue a retired realm's context is repointed to
     // before its own queue is freed. V8 enqueues a promise reaction into the
     // HANDLER's context's queue, and rusty's realms are mutually accessible (one
@@ -589,7 +589,7 @@ struct V8State {
     // the whole-realm-per-reset leak this design fixes, and empty in normal use
     // (you don't resolve a disposed realm's promises), so it is an accepted cost of
     // keeping that late enqueue memory-safe.
-    graveyard_queue: Option<v8::UniqueRef<v8::MicrotaskQueue>>,
+    graveyard_queue: Option<v8::MicrotaskQueueHandle>,
     // Realms retired by reset/dispose, awaiting teardown. We can't free a realm's
     // queue at reset/dispose time: (1) Context::SetMicrotaskQueue (the graveyard
     // repoint) requires NO context entered, which fails for a NESTED reset (an
@@ -599,7 +599,7 @@ struct V8State {
     // flush_retiring drains this list at the end of the outermost request, when
     // no context is entered: it repoints each context to the graveyard, then drops
     // the queues (discarding their pending microtasks — the actual leak fix).
-    retiring: Vec<(v8::Global<v8::Context>, v8::UniqueRef<v8::MicrotaskQueue>)>,
+    retiring: Vec<(v8::Global<v8::Context>, v8::MicrotaskQueueHandle)>,
     next_context_id: i32,
     host_namespace: Option<String>,
     // One security token shared by every realm of this isolate: the
@@ -1781,15 +1781,15 @@ unsafe extern "C" fn promise_reject_cb(message: v8::PromiseRejectMessage) {
 // V8State alongside the context (see V8State::queues for why per-realm).
 fn new_realm(
     scope: &mut v8::PinScope<'_, '_, ()>,
-) -> (v8::Global<v8::Context>, v8::UniqueRef<v8::MicrotaskQueue>) {
+) -> (v8::Global<v8::Context>, v8::MicrotaskQueueHandle) {
     // Explicit policy like the isolate's: rusty drives every drain by hand
     // (auto_drain / NS.drainMicrotasks), so V8 must never auto-run this queue.
-    let mut queue = v8::MicrotaskQueue::new(scope, v8::MicrotasksPolicy::Explicit);
+    let queue = v8::MicrotaskQueue::new(scope, v8::MicrotasksPolicy::Explicit);
     let fresh = {
         let context = v8::Context::new(
             scope,
             v8::ContextOptions {
-                microtask_queue: Some(&mut *queue as *mut _),
+                microtask_queue: Some(std::ptr::from_ref(queue.as_ref()).cast_mut()),
                 ..Default::default()
             },
         );

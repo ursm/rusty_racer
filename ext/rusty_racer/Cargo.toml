@@ -18,12 +18,12 @@ crate-type = ["cdylib"]
 # to root the owner thread).
 magnus = { version = "0.8", features = ["rb-sys"] }
 rb-sys = "0.9"
-# simdutf: SIMD-accelerated UTF-8/UTF-16 transcoding in rusty_v8's String
-# conversion (to_rust_string_lossy etc.), the path every V8->Ruby string crosses.
-# ~6-8x faster marshalling for non-ASCII results (measured); ASCII is unaffected.
-# The feature makes the v8 crate fetch Deno's _simdutf prebuilt archive variant
-# (which is built with rusty_v8_enable_simdutf=true) on every platform.
-v8 = { version = "150.4.0", features = ["simdutf"] }
+# rusty_v8's String conversion (to_rust_string_lossy etc.) — the path every
+# V8->Ruby string crosses — transcodes UTF-16 with simdutf, worth ~6-8x on
+# non-ASCII results (measured; ASCII is unaffected). Since 152.0.0 that is baked
+# into every prebuilt archive, so the `simdutf` feature we used to pass is a
+# deprecated no-op and is gone from here.
+v8 = "152.2.0"
 # pthread stack-bounds query, to set V8's stack limit per op relative to the
 # current native thread (in-thread V8 runs on the Ruby thread's stack).
 libc = "0.2"
