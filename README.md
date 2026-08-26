@@ -258,7 +258,12 @@ to one native thread (rusty_v8 exposes no `v8::Locker`), so using it from anothe
 thread raises `RustyRacer::WrongThreadError` rather than corrupting the VM.
 
 - **`Isolate#terminate` is the one exception** — it is safe to call from any
-  thread (it stops a runaway script on the owner thread).
+  thread (it stops a runaway script on the owner thread). It stops JavaScript at
+  V8's next interrupt check, which a runaway script reaches almost immediately
+  and a *short* one may never reach: terminating from inside a host function that
+  then returns to a script which simply finishes lets that script finish, and the
+  request is dropped rather than carried into the next operation. Use it to stop
+  code that is running away, not as a way to fail the call you are inside.
 - **Dispose on the owner thread.** `Isolate#dispose` must run on the owner
   thread. If the last reference to an isolate is instead garbage-collected on a
   *different* thread (e.g. its owner thread already exited), it cannot be
@@ -289,6 +294,54 @@ later Fiber mmaps — is outside the window whatever we do, and V8 aborts the
 process on the next GC or thrown exception. So **don't call into an isolate from
 inside a Fiber on a worker thread**; drive isolate ops directly on the thread, or
 keep Fiber/Enumerator-mediated JS calls on the main thread.
+
+The other limit is on *where* a Fiber may switch. Operations on one isolate have
+to nest: everything V8 keeps per isolate — the frame chain, the handle scopes,
+the description of the stack — unwinds in the reverse of the order it was
+entered. Resuming a Fiber from inside a host function keeps that (the outer
+operation is simply blocked until the inner one returns, which is why
+`Capybara::Result#find` inside a callback works), but **yielding out of a host
+function** does not: it strands that operation mid-flight. That covers
+`Fiber.yield` and `Fiber#transfer`, an `Enumerator::Yielder#<<` from inside a
+callback, and any blocking call made under a Fiber scheduler (`async`, `falcon`),
+which yields out of the Fiber for you — the last of those without a `Fiber`
+keyword anywhere in your code.
+
+What happens next depends on what the stranded operation's Fiber does:
+
+- **Resumed while another operation is still running** — the two can now only
+  finish in the order they started, which V8 has no room for. There is no
+  exception to raise: raising *is* that unwind. So the binding prints what
+  happened, which host function did it, and where — then stops the process with
+  `SIGABRT` (exit 134). It is not rescuable and there is no opt-out; on a
+  threaded server that takes the whole worker with it.
+
+  ```
+  [rusty_racer] fatal: operations on this isolate stopped nesting.
+
+  The host function `hop` handed control to Ruby.
+  By the time it came back, the operations in flight on this isolate had
+  changed (now 2, was 1) — so they no longer nest. …
+  ```
+
+- **Resumed only after the other operation has finished** — memory-safe, and it
+  keeps working. But note that *while* an operation is stranded, every other
+  operation on that isolate runs as a **nested** one, and only an outermost
+  operation drains microtasks. So a promise queued in the meantime does not
+  settle until the stranded operation finishes. **This is the shape a Fiber
+  scheduler produces**: it resumes the stranded Fiber once the other fiber's
+  operation is done, so `async`/`falcon` get the quiet variant, not the abort.
+
+- **Never resumed** — Ruby frees an unresumed Fiber's stack without unwinding it,
+  so the operation's frames vanish while the isolate is still entered by them.
+  The isolate cannot be disposed after that; it is leaked, with a warning saying
+  why. If you still hold the Fiber, **`Fiber#kill` recovers it**: it resumes the
+  Fiber to unwind it, so the stranded operation finishes in order and the isolate
+  goes back to normal. (The one thing that defeats that is a script which catches
+  the error the killed callback throws and carries on — the kill only lands once
+  that operation ends, just as it would wait out any Ruby call in progress, and
+  until then the script can call further host functions, which run on the
+  already-killed Fiber.)
 
 ## Installation
 
