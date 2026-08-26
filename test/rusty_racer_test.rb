@@ -2534,6 +2534,289 @@ class RustyRacerTest < Minitest::Test
     assert_equal 2, @ctx.eval('1 + 1')
   end
 
+  def test_resuming_a_stranded_host_callback_from_inside_another_op_is_fatal
+    # The one Fiber shape that CANNOT work. A host callback yields out of itself,
+    # stranding its operation mid-flight, and the isolate is then used again —
+    # here from inside the second operation's own callback, so the stranded one
+    # regains control while the second is still running. Everything V8 keeps per
+    # isolate nests strictly, so the two would have to unwind in the order they
+    # STARTED: the stranded one pops its HandleScope out from under the other's
+    # live handles, and exits an isolate the other is still running in. There is
+    # no exception to raise — raising IS that unwind — so the binding stops the
+    # process at the moment control comes back, while the state is still intact,
+    # instead of leaving V8 to abort later on `IsOnCentralStack` (or not at all,
+    # and run on freed handles). A subprocess, since it aborts.
+    out = ruby_subprocess(<<~'RUBY')
+      require 'rusty_racer'
+      ctx = RustyRacer::Isolate.new.context
+      f = nil
+      ctx.attach('hop', proc { Fiber.yield })
+      ctx.attach('go', proc { f.resume })
+      f = Fiber.new { ctx.eval('hop()') }
+      f.resume
+      ctx.eval('go()')
+      $stderr.puts 'still running'
+    RUBY
+
+    assert_predicate $?, :signaled?, "expected SIGABRT, got #{$?.inspect}: #{out}"
+    assert_equal Signal.list['ABRT'], $?.termsig, out
+    refute_includes out, 'still running'
+    assert_includes out, 'operations on this isolate stopped nesting'
+    # It names the callback that did it, and where that operation was — the two
+    # things a reader needs and cannot get from the abort itself.
+    assert_includes out, 'The host function `hop`'
+    assert_includes out, 'That operation is here:'
+    assert_match(/-e:6:in /, out, "the stranded op's own frame is missing:\n#{out}")
+    # Ruby's SIGABRT handler is put back to the default first, so the explanation
+    # isn't buried under a [BUG] report that blames Ruby.
+    refute_includes out, '[BUG]'
+  end
+
+  def test_a_stranded_host_callback_resumed_after_the_other_op_finished_is_not_fatal
+    # The near miss, and the reason the check is a depth COMPARISON rather than
+    # "did a Fiber switch": here the intervening op has already finished when the
+    # stranded one is resumed, so the operations did nest after all — in the
+    # order they unwound, which is all V8 asks. A false positive would kill the
+    # process, so this has to keep working.
+    @ctx.attach('hop', proc { Fiber.yield 42 })
+    f = Fiber.new { @ctx.eval('hop(); 7') }
+
+    assert_equal 42, f.resume         # strands the op inside `hop`
+    assert_equal 2, @ctx.eval('1 + 1') # a whole op, start to finish, meanwhile
+    assert_equal 7, f.resume           # and only then let the stranded one finish
+    assert_equal 3, @ctx.eval('1 + 2')
+  end
+
+  def test_microtasks_do_not_drain_while_an_operation_is_stranded
+    # The documented cost of the shape above, pinned so it stays documented: an
+    # op only drains microtasks when it is the OUTERMOST one, and while an op is
+    # stranded every later op is a nested one. So a promise queued in between
+    # does not settle until the stranded op finishes. Nothing can detect the
+    # strand to do better — a Fiber that yielded out of a callback and one that
+    # was resumed from inside a callback leave Ruby in the same observable state.
+    @ctx.attach('hop', proc { Fiber.yield })
+    f = Fiber.new { @ctx.eval('hop()') }
+
+    @ctx.eval('globalThis.a = 0; Promise.resolve(1).then(() => { globalThis.a = 9 }); 0')
+    assert_equal 9, @ctx.eval('globalThis.a'), 'baseline: microtasks drain'
+
+    f.resume # strand
+    @ctx.eval('globalThis.b = 0; Promise.resolve(1).then(() => { globalThis.b = 9 }); 0')
+    assert_equal 0, @ctx.eval('globalThis.b'), 'stranded: the drain is deferred'
+
+    f.resume # unstrand
+    assert_equal 9, @ctx.eval('globalThis.b'), 'and catches up once it finishes'
+  end
+
+  def test_yielding_out_of_a_module_resolver_is_caught_too
+    # The same guard on the other kind of callback: a module resolver runs Ruby
+    # with V8 frames live exactly as a host function does. It is named by the
+    # specifier it was resolving, which is what a reader has to go on when the
+    # code that yielded is a resolver rather than something they attached.
+    out = ruby_subprocess(<<~'RUBY')
+      require 'rusty_racer'
+      ctx = RustyRacer::Isolate.new.context
+      f = nil
+      ctx.attach('go', proc { f.resume })
+      app = ctx.compile_module('import {x} from "./dep.js";', filename: '/app.js')
+      f = Fiber.new { app.instantiate {|_spec, _ref| Fiber.yield } }
+      f.resume
+      ctx.eval('go()')
+      $stderr.puts 'still running'
+    RUBY
+
+    assert_predicate $?, :signaled?, "expected SIGABRT, got #{$?.inspect}: #{out}"
+    refute_includes out, 'still running'
+    assert_includes out, 'The module resolver, resolving `./dep.js`'
+  end
+
+  def test_a_stranded_host_callback_that_is_never_resumed_leaks_instead_of_aborting
+    # Ruby frees an unresumed Fiber's stack without unwinding it, so a stranded
+    # op's frames simply vanish — taking the isolate's last wrapper with them
+    # while the isolate is still ENTERED by those frames. Disposing an entered
+    # isolate is a V8 fatal ("Disposing the isolate that is entered by a thread"),
+    # the exact unexplained abort this binding exists to avoid, so teardown leaks
+    # the isolate and says why instead. Nothing detects this one while it runs —
+    # no callback ever comes back — which is why it surfaces at teardown.
+    out = ruby_subprocess(<<~'RUBY')
+      require 'rusty_racer'
+      ctx = RustyRacer::Isolate.new.context
+      ctx.attach('hop', proc { Fiber.yield })
+      Fiber.new { ctx.eval('hop()') }.resume
+      $stderr.puts 'exiting with the operation stranded'
+    RUBY
+
+    assert_predicate $?, :success?, "teardown was not survivable: #{out}"
+    assert_includes out, 'exiting with the operation stranded'
+    assert_includes out, 'still in flight'
+    assert_includes out, 'leaked'
+    refute_includes out, 'Fatal error in v8::Isolate::Dispose'
+  end
+
+  def test_an_interrupted_op_still_balances_the_in_flight_count
+    # rb_thread_call_without_gvl checks the thread's pending interrupts as it
+    # re-acquires the GVL, and a Thread#raise / Timeout / Ctrl-C landing there
+    # longjmps past everything written after the call — so the op's in-flight
+    # count has to be balanced INSIDE it. Missing that decrement is permanent and
+    # silent: the isolate then looks like it has an op in flight forever, so no
+    # later op is ever the outermost one (microtasks stop draining) and dispose
+    # refuses for good.
+    iso = RustyRacer::Isolate.new
+    ctx = iso.context
+    main = Thread.current
+    # The raise has to land while the op is INSIDE without_gvl with no callback
+    # running, so that it is delivered as the op re-acquires the GVL — the moment
+    # the decrement used to be skipped. Hence a plain sleep and a JS loop long
+    # enough to cover it: cueing the waker from a host function instead would
+    # deliver the interrupt inside that callback, which is a different path
+    # (rb_protect catches it there) and would not exercise this at all.
+    waker = Thread.new {
+      sleep 0.1
+      main.raise(RuntimeError, 'interrupt')
+    }
+    begin
+      ctx.eval('const t = Date.now(); while (Date.now() - t < 1000) {}')
+      flunk 'the interrupt never arrived'
+    rescue RuntimeError => e
+      assert_equal 'interrupt', e.message
+    end
+    waker.join
+
+    # Both symptoms of an unbalanced count, from the outside.
+    ctx.eval('globalThis.r = null; Promise.resolve(42).then(v => { globalThis.r = v }); 0')
+    assert_equal 42, ctx.eval('globalThis.r'), 'microtasks stopped draining after the interrupt'
+    iso.dispose
+  end
+
+  def test_killing_a_stranded_fiber_recovers_the_isolate
+    # The way out of a strand, and worth pinning because it is the answer a
+    # reader arrives at the Fiber docs looking for. Fiber#kill resumes the fiber
+    # to unwind it, so the stranded op finishes IN ORDER — the in-flight count
+    # balances, ops are outermost again (microtasks drain), and the isolate is
+    # disposable. The unwind reaches Ruby as a kill rather than as a fabricated
+    # error because the callback re-asserts it; see Core::note_fatal.
+    iso = RustyRacer::Isolate.new
+    ctx = iso.context
+    ctx.attach('hop', proc { Fiber.yield })
+    f = Fiber.new { ctx.eval('hop()') }
+    f.resume
+
+    f.kill
+    refute_predicate f, :alive?
+    ctx.eval('globalThis.r = null; Promise.resolve(42).then(v => { globalThis.r = v }); 0')
+    assert_equal 42, ctx.eval('globalThis.r'), 'the isolate did not recover from the strand'
+    iso.dispose
+  end
+
+  def test_a_kill_the_script_swallowed_is_not_delivered_to_another_caller
+    # A swallowed kill is finished at the end of the operation whose callback
+    # swallowed it — but a script can keep that operation from ever ending, by
+    # catching the error the killed callback throws. The kill then has no
+    # operation of its own to end, and must NOT be taken by the next one to
+    # finish: that would kill an unrelated caller (the main thread, mid-eval,
+    # with no exception and no message). Hence the pending kill remembers its
+    # Fiber and is dropped rather than delivered anywhere else.
+    #
+    # A subprocess: if this regresses, the failure is a thread dying silently,
+    # which inside the test process would take the run with it.
+    out = ruby_subprocess(<<~'RUBY')
+      require 'rusty_racer'
+      ctx = RustyRacer::Isolate.new.context
+      ctx.attach('hop', proc { Fiber.yield })
+      f = Fiber.new { ctx.eval('for (;;) { try { hop() } catch (e) {} }') }
+      f.resume
+      f.kill
+      $stderr.puts "eval = #{ctx.eval('1 + 1')}"
+      $stderr.puts 'MAIN SURVIVED'
+    RUBY
+
+    assert_includes out, 'eval = 2'
+    assert_includes out, 'MAIN SURVIVED', "the kill was delivered to the wrong caller:\n#{out}"
+  end
+
+  def test_killing_a_fiber_inside_a_module_resolver_leaves_the_isolate_usable
+    # The resolver is the other callback that runs Ruby with V8 frames live, and
+    # instantiate is the operation with the most to put back afterwards — it
+    # parks the resolver across the call. Killing the Fiber mid-resolve has to
+    # leave an isolate that still evaluates, still links, and still disposes.
+    # (Where the swallowed kill is re-asserted is chosen for this: past every
+    # such restore rather than at the end of the operation — see
+    # Core::resume_pending_fatal.)
+    iso = RustyRacer::Isolate.new
+    ctx = iso.context
+    asked = []
+    app = ctx.compile_module('import {x} from "./dep.js";', filename: '/app.js')
+    f = Fiber.new {
+      app.instantiate do |specifier, _referrer|
+        asked << specifier
+        Fiber.yield
+      end
+    }
+    f.resume
+    f.kill
+
+    assert_equal ['./dep.js'], asked
+    refute_predicate f, :alive?
+    assert_equal 2, ctx.eval('1 + 1')
+    # and a later instantiate still gets ITS resolver, not the dead one's
+    dep = ctx.compile_module('export const x = 21;', filename: '/dep.js')
+    again = ctx.compile_module('import {x} from "./dep.js"; export const y = x;', filename: '/b.js')
+    again.instantiate {|specifier, _referrer| specifier == './dep.js' ? dep : nil }
+    again.evaluate
+    assert_equal 21, again.namespace['y']
+    assert_equal ['./dep.js'], asked, "the dead operation's resolver was consulted"
+    iso.dispose
+  end
+
+  def test_a_host_proc_whose_exception_cannot_be_rendered_still_fails_cleanly
+    # The callback turns a proc's error into a message for the JS side, and that
+    # runs outside any rb_protect with V8 frames live — where a longjmp would not
+    # be survivable. It is safe because magnus renders an exception from its class
+    # and address rather than calling #message or #inspect; this pins that, since
+    # the day it stops being true the failure is a crash, not a test failure.
+    nasty = Class.new(StandardError) do
+      def message = raise('message itself raises')
+      def inspect = raise('inspect itself raises')
+      def to_s    = raise('to_s itself raises')
+    end
+    @ctx.attach('boom', proc { raise nasty })
+
+    caught = @ctx.eval('try { boom(); "no throw" } catch (e) { String(e) }')
+
+    refute_equal 'no throw', caught
+    assert_equal 2, @ctx.eval('1 + 1')
+  end
+
+  def test_thread_kill_inside_a_host_callback_actually_kills_the_thread
+    # A Ruby error raised under a live op must not longjmp — it would cross V8's
+    # C++ frames — so callbacks catch everything and throw it into JS instead.
+    # Thread#kill unwinds with TAG_FATAL, which magnus catches just the same, and
+    # a killed thread merely TOLD about it in JavaScript is not killed: it used
+    # to carry on running Ruby (and JS) while the eval's caller was handed a
+    # fabricated `RustyRacer::RuntimeError: Error: Fatal`. The kill is now
+    # remembered and re-asserted once the op is over.
+    gate = Queue.new
+    after = Queue.new
+    t = Thread.new {
+      ctx = RustyRacer::Isolate.new.context
+      ctx.attach('block', proc { gate << true; sleep 5 })
+      begin
+        ctx.eval('block()')
+        after << 'eval returned'
+      rescue Exception => e # rubocop:disable Lint/RescueException
+        after << "eval raised #{e.class}"
+      end
+      after << "ran on: #{ctx.eval('1 + 1')}"
+    }
+    gate.pop
+    t.kill
+    t.join(5)
+
+    refute_predicate t, :alive?, 'the killed thread outlived its kill'
+    assert_empty after.size.times.map { after.pop },
+                 'the kill was swallowed: the thread went on running after it'
+  end
+
   def test_cross_isolate_reentry_from_a_fiber_keeps_the_outer_scan_start
     # A -> B -> A while A's op runs on a Fiber. The hop back into A finds a
     # FOREIGN isolate current, so it enters A — and Isolate::Enter re-points A's
@@ -2968,11 +3251,27 @@ class RustyRacerTest < Minitest::Test
       ctx.eval('globalThis.probe = function () { let d = 0; function r() { d++; r() } try { r() } catch (e) { return d } }')
       print Fiber.new { ctx.eval('probe()') }.resume
     RUBY
-    env = {'RUBY_FIBER_MACHINE_STACK_SIZE' => stack_bytes.to_s}
-    argv = [RbConfig.ruby, *$LOAD_PATH.flat_map {|d| ['-I', d] }, '-e', script]
-    out = IO.popen(env, argv, &:read)
+    out = ruby_subprocess(
+      script,
+      env:          {'RUBY_FIBER_MACHINE_STACK_SIZE' => stack_bytes.to_s},
+      merge_stderr: false
+    )
     assert_predicate $?, :success?, "probe subprocess failed: #{out}"
     Integer(out)
+  end
+
+  # Run `script` in a fresh Ruby and return its output. The child inherits this
+  # process's $LOAD_PATH so it loads the extension under test rather than an
+  # installed gem. merge_stderr folds the child's stderr into what is returned —
+  # what a diagnostic test wants, and what one parsing stdout does not.
+  # rlimit_core because some of these children are MEANT to die on SIGABRT, and a
+  # V8 process dumps a large core; these say everything a core could. Leaves $?
+  # for the caller to assert on.
+  def ruby_subprocess(script, env: {}, merge_stderr: true)
+    argv = [RbConfig.ruby, *$LOAD_PATH.flat_map {|d| ['-I', d] }, '-e', script]
+    opts       = {rlimit_core: 0}
+    opts[:err] = %i[child out] if merge_stderr
+    IO.popen(env, argv, **opts, &:read)
   end
 
   def deadline_thread(&block)
