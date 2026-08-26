@@ -2688,19 +2688,70 @@ class RustyRacerTest < Minitest::Test
     iso.dispose
   end
 
+  def test_a_kill_swallowed_by_a_callback_does_not_take_the_process_with_it
+    # 0.2.2 tried to put a swallowed Thread#kill back with rb_jump_tag once the
+    # operation was over. A jump does not carry the unwind with it — it re-enters
+    # whatever the VM still holds in `$!` — and rb_protect CLEARS `$!` on the raise
+    # path, so one host callback raising after another was killed empties it.
+    # Jumping into that is not a lost kill, it is `[BUG] Segmentation fault at 0xc`
+    # (0x4 is Qnil, +8 its class slot), and only when there is a frame to rewind:
+    # the `ensure` below is what turns it from harmless into fatal. It took down
+    # capybara-simulated within an hour of release; this is that shape, reduced.
+    out = ruby_subprocess(<<~'RUBY')
+      require 'rusty_racer'
+      gate = Queue.new
+      t = Thread.new do
+        ctx = RustyRacer::Isolate.new.context
+        ctx.attach('parked', proc { gate << true; sleep 5 })
+        ctx.attach('boom', proc { raise 'clears $! on its way out' })
+        begin
+          # The script CATCHES what each callback throws, which is what keeps the
+          # operation running to its end — and reports it, so the test can tell a
+          # swallowed kill from a `t.kill` that arrived too late to be one.
+          $stderr.puts ctx.eval(<<~JS)
+            const caught = [];
+            try { parked() } catch (e) { caught.push(String(e)) }
+            try { boom() } catch (e) { caught.push(String(e)) }
+            caught.join(' | ');
+          JS
+        ensure
+          $stderr.puts 'ensure ran'
+        end
+      end
+      gate.pop
+      t.kill
+      t.join(5)
+      $stderr.puts 'MAIN SURVIVED'
+    RUBY
+
+    assert_predicate $?, :success?, "the killed thread took the process with it:\n#{out}"
+    assert_includes out, 'Fatal', "the kill never reached the callback:\n#{out}"
+    assert_includes out, 'ensure ran'
+    assert_includes out, 'MAIN SURVIVED'
+    refute_includes out, '[BUG]'
+  end
+
   def test_killing_a_stranded_fiber_recovers_the_isolate
     # The way out of a strand, and worth pinning because it is the answer a
     # reader arrives at the Fiber docs looking for. Fiber#kill resumes the fiber
     # to unwind it, so the stranded op finishes IN ORDER — the in-flight count
     # balances, ops are outermost again (microtasks drain), and the isolate is
-    # disposable. The unwind reaches Ruby as a kill rather than as a fabricated
-    # error because the callback re-asserts it; see Core::note_fatal.
+    # disposable.
     iso = RustyRacer::Isolate.new
     ctx = iso.context
     ctx.attach('hop', proc { Fiber.yield })
-    f = Fiber.new { ctx.eval('hop()') }
+    f = Fiber.new do
+      ctx.eval('hop()')
+    rescue RustyRacer::RuntimeError
+      nil
+    end
     f.resume
 
+    # The kill reaches the stranded op as an ordinary JavaScript error (see
+    # test_thread_kill_inside_a_host_callback_does_not_kill_the_thread for why it
+    # cannot be put back as a kill), so the Fiber's eval RAISES rather than
+    # unwinding silently — but it does finish, in order, which is what the isolate
+    # needs.
     f.kill
     refute_predicate f, :alive?
     ctx.eval('globalThis.r = null; Promise.resolve(42).then(v => { globalThis.r = v }); 0')
@@ -2708,50 +2759,26 @@ class RustyRacerTest < Minitest::Test
     iso.dispose
   end
 
-  def test_a_kill_the_script_swallowed_is_not_delivered_to_another_caller
-    # A swallowed kill is finished at the end of the operation whose callback
-    # swallowed it — but a script can keep that operation from ever ending, by
-    # catching the error the killed callback throws. The kill then has no
-    # operation of its own to end, and must NOT be taken by the next one to
-    # finish: that would kill an unrelated caller (the main thread, mid-eval,
-    # with no exception and no message). Hence the pending kill remembers its
-    # Fiber and is dropped rather than delivered anywhere else.
-    #
-    # A subprocess: if this regresses, the failure is a thread dying silently,
-    # which inside the test process would take the run with it.
-    out = ruby_subprocess(<<~'RUBY')
-      require 'rusty_racer'
-      ctx = RustyRacer::Isolate.new.context
-      ctx.attach('hop', proc { Fiber.yield })
-      f = Fiber.new { ctx.eval('for (;;) { try { hop() } catch (e) {} }') }
-      f.resume
-      f.kill
-      $stderr.puts "eval = #{ctx.eval('1 + 1')}"
-      $stderr.puts 'MAIN SURVIVED'
-    RUBY
-
-    assert_includes out, 'eval = 2'
-    assert_includes out, 'MAIN SURVIVED', "the kill was delivered to the wrong caller:\n#{out}"
-  end
-
   def test_killing_a_fiber_inside_a_module_resolver_leaves_the_isolate_usable
     # The resolver is the other callback that runs Ruby with V8 frames live, and
     # instantiate is the operation with the most to put back afterwards — it
     # parks the resolver across the call. Killing the Fiber mid-resolve has to
     # leave an isolate that still evaluates, still links, and still disposes.
-    # (Where the swallowed kill is re-asserted is chosen for this: past every
-    # such restore rather than at the end of the operation — see
-    # Core::resume_pending_fatal.)
     iso = RustyRacer::Isolate.new
     ctx = iso.context
     asked = []
     app = ctx.compile_module('import {x} from "./dep.js";', filename: '/app.js')
-    f = Fiber.new {
+    f = Fiber.new do
       app.instantiate do |specifier, _referrer|
         asked << specifier
         Fiber.yield
       end
-    }
+    rescue RustyRacer::RuntimeError
+      # The kill reaches the stranded op as a JavaScript error — see
+      # test_thread_kill_inside_a_host_callback_does_not_kill_the_thread — so the
+      # instantiate fails on its way out. What matters here is what it leaves.
+      nil
+    end
     f.resume
     f.kill
 
@@ -2787,14 +2814,17 @@ class RustyRacerTest < Minitest::Test
     assert_equal 2, @ctx.eval('1 + 1')
   end
 
-  def test_thread_kill_inside_a_host_callback_actually_kills_the_thread
+  def test_thread_kill_inside_a_host_callback_does_not_kill_the_thread
     # A Ruby error raised under a live op must not longjmp — it would cross V8's
-    # C++ frames — so callbacks catch everything and throw it into JS instead.
-    # Thread#kill unwinds with TAG_FATAL, which magnus catches just the same, and
-    # a killed thread merely TOLD about it in JavaScript is not killed: it used
-    # to carry on running Ruby (and JS) while the eval's caller was handed a
-    # fabricated `RustyRacer::RuntimeError: Error: Fatal`. The kill is now
-    # remembered and re-asserted once the op is over.
+    # C++ frames — so callbacks catch everything and hand it to JavaScript as a
+    # message instead. Thread#kill unwinds with TAG_FATAL, which magnus catches
+    # just the same, and there is no way to put it back: rb_jump_tag resumes into
+    # whatever the VM still holds in `$!`, which anything protected running in
+    # between can have cleared, and jumping into that is a SEGV rather than a lost
+    # kill (0.2.2 shipped exactly that and had to be undone). So the kill is LOST:
+    # the callback's proc stops, its operation fails with the kill rendered as a
+    # JavaScript error, and the thread carries on. Pinned because it is a footgun
+    # worth noticing if it ever changes, and documented in the README.
     gate = Queue.new
     after = Queue.new
     t = Thread.new {
@@ -2806,15 +2836,15 @@ class RustyRacerTest < Minitest::Test
       rescue Exception => e # rubocop:disable Lint/RescueException
         after << "eval raised #{e.class}"
       end
-      after << "ran on: #{ctx.eval('1 + 1')}"
+      after << "still running: #{ctx.eval('1 + 1')}"
     }
     gate.pop
     t.kill
     t.join(5)
 
-    refute_predicate t, :alive?, 'the killed thread outlived its kill'
-    assert_empty after.size.times.map { after.pop },
-                 'the kill was swallowed: the thread went on running after it'
+    refute_predicate t, :alive?, 'the thread outlived its own block'
+    assert_equal ['eval raised RustyRacer::RuntimeError', 'still running: 2'],
+                 after.size.times.map { after.pop }
   end
 
   def test_cross_isolate_reentry_from_a_fiber_keeps_the_outer_scan_start

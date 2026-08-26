@@ -472,19 +472,6 @@ fn current_ruby_thread() -> usize {
     unsafe { rb_sys::rb_thread_current() as usize }
 }
 
-// Identity of the calling FIBER, as its object_id — monotonic and never reused,
-// unlike the VALUE, which is a heap address a collected Fiber hands back (and a
-// Fiber stranded with a pending kill DOES get collected). Ids are a Fixnum on
-// every platform this gem ships for, so the usize compared is an immediate, not
-// a pointer that could alias in its turn. Assigning one can allocate, and this
-// runs with V8 frames live and outside any rb_protect of ours, so it takes its
-// own: 0 on failure, which reads as "no Fiber" at both ends and so drops a kill
-// rather than misdelivers one. MUST be called with the GVL held.
-fn current_fiber_id() -> usize {
-    magnus::rb_sys::protect(|| unsafe { rb_sys::rb_obj_id(rb_sys::rb_fiber_current()) })
-        .map_or(0, |id| id as usize)
-}
-
 // Reduce a magnus Error to a single Exception INSTANCE so it can be GC-rooted and
 // re-raised later WITH ITS ORIGINAL CLASS. A Ruby proc's raise is already an
 // instance; an Error::new(class, msg) from our own code becomes an instance of
@@ -560,7 +547,7 @@ fn host_fn_callback(
             ruby.qnil().as_raw()
         }) {
             Ok(_) => out.unwrap_or_else(|| Err("host function did not complete".into())),
-            Err(e) => Err(core.swallow(e)),
+            Err(e) => Err(format!("{e}")),
         }
     });
     match result {
@@ -1117,10 +1104,8 @@ fn resolve_imported<'s>(
             // calls into Ruby (so it can allocate, so it can GC) and BoxValue::new
             // registers a GC root — neither is safe with the GVL released.
             match with_gvl(core, RubyCall::Resolver(&spec), || {
-                resolve_module_via_ruby(core, resolve, &spec, &ref_url, None).map_err(|e| {
-                    core.note_fatal(&e);
-                    error_to_exception(&e).map(BoxValue::new)
-                })
+                resolve_module_via_ruby(core, resolve, &spec, &ref_url, None)
+                    .map_err(|e| error_to_exception(&e).map(BoxValue::new))
             }) {
                 Ok(id) => id,
                 // Stash the resolver's own raised exception (GC-rooted) so the
@@ -1144,7 +1129,7 @@ fn resolve_imported<'s>(
                     resolve_module_via_ruby(core, p, &spec, &ref_url, Some(here.unwrap_or(0)))
                         // Rendering the message reads the Ruby exception, so it too
                         // stays inside with_gvl.
-                        .map_err(|e| core.swallow(e))
+                        .map_err(|e| e.to_string())
                 }) {
                     Ok(id) => id,
                     // Unlike the static branch there is no Ruby frame waiting to
@@ -1258,17 +1243,11 @@ fn dynamic_import_cb<'s>(
         .map(|r| r.get());
     let id = match resolver_proc {
         // A raising resolver only fails the import() (it rejects generically);
-        // it must NOT abort the surrounding eval, so swallow the Err here — but
-        // note_fatal first, since this is the one with_gvl site that throws its
-        // Err away and a Thread#kill would go with it.
+        // it must NOT abort the surrounding eval, so swallow the Err here.
         Some(p) => with_gvl(core, RubyCall::Resolver(&spec), || {
-            resolve_module_via_ruby(core, p, &spec, &referrer, Some(initiating)).unwrap_or_else(
-                |e| {
-                    core.note_fatal(&e);
-                    None
-                },
-            )
-        }),
+            resolve_module_via_ruby(core, p, &spec, &referrer, Some(initiating))
+        })
+        .unwrap_or(None),
         None => None,
     };
     match id {
@@ -1515,17 +1494,6 @@ struct Core {
     // op. Owner-thread only, like the isolate itself; AtomicUsize for shared
     // &Core access.
     installed_stack_limit: std::sync::atomic::AtomicUsize,
-    // Set when a callback's Ruby code unwound with TAG_FATAL — a Thread#kill —
-    // which magnus catches like any other error because a longjmp through V8's
-    // C++ frames is not survivable. Holds the object_id of the
-    // Fiber that must finish the kill (never a raw VALUE: a stranded Fiber
-    // holding a pending kill does get collected, and its address can then be
-    // handed to a new one, whereas an object_id is monotonic and never reused);
-    // 0 = nothing pending.
-    // See Core::note_fatal / Core::resume_pending_fatal. Atomic for the same
-    // reason as the rest: &Core is shared, though only the owner thread ever
-    // touches this.
-    pending_fatal: std::sync::atomic::AtomicUsize,
     // Re-entry depth for THIS isolate, readable without a scope (the runner needs
     // it to choose the scope kind before any scope exists): 0 = top-level op
     // (open a fresh HandleScope from iso_ptr); >0 = a host callback is on the V8
@@ -2319,7 +2287,6 @@ impl Isolate {
             iso_ptr,
             scan_start_field: std::sync::atomic::AtomicUsize::new(0),
             installed_stack_limit: std::sync::atomic::AtomicUsize::new(0),
-            pending_fatal: std::sync::atomic::AtomicUsize::new(0),
             depth: std::sync::atomic::AtomicU32::new(0),
             procs: Mutex::new(ProcTable::default()),
             default_timeout_ms: timeout_ms,
@@ -2580,58 +2547,10 @@ impl Core {
         }
     }
 
-    // Finish a Thread#kill that a callback had to swallow (see note_fatal). This
-    // is a longjmp — the same rb_jump_tag magnus performs for an Error::Jump
-    // handed back to it — so nothing between here and Ruby runs Drop, and it may
-    // only be called where no frame in between still owns anything that matters.
-    // That rules out the end of `run`: instantiate_module parks the op's resolver
-    // across the call and restores it afterwards, and skipping THAT would leave a
-    // dead op's resolver parked for a later dynamic import to call. The end of
-    // reply_value is past every such restore, and reaching it is what every
-    // operation that can run Ruby at all does.
-    //
-    // An operation that returns Err from `run` — only a panic, which poisons the
-    // isolate — doesn't reach it, and the kill is then dropped by whichever
-    // operation gets here next (see the Fiber check). Frames above still leak
-    // whatever they hold (an argument String, say), which is why every caller with
-    // cleanup of its own runs that cleanup BEFORE calling this.
-    fn resume_pending_fatal<T>(&self, outcome: Result<T, Error>) -> Result<T, Error> {
-        let pending = self.pending_fatal.swap(0, Ordering::SeqCst);
-        // Nothing pending — the case every op takes, and one atomic load.
-        if pending == 0 {
-            return outcome;
-        }
-        // A kill belongs to the Fiber whose callback swallowed it, and finishing
-        // it anywhere else would kill an unrelated caller — the main thread, say,
-        // mid-eval, with no exception and no message. A mismatch is an ordinary
-        // outcome, not a should-not-happen: when the script CATCHES the error the
-        // killed callback threw, that operation may never end, and the next one to
-        // get here is somebody else's. Drop the kill rather than deliver it to the
-        // wrong Fiber. (CRuby's own Fiber#kill bookkeeping still terminates such a
-        // Fiber on its next resume; only its return value is lost.)
-        if pending != current_fiber_id() {
-            return outcome;
-        }
-        drop(outcome);
-        // enum ruby_tag_type's RUBY_TAG_FATAL; not in rb_sys's bindings
-        // (bindgen skips the anonymous enum), and stable since 1.9.
-        const RUBY_TAG_FATAL: std::os::raw::c_int = 8;
-        unsafe { rb_sys::rb_jump_tag(RUBY_TAG_FATAL) };
-    }
-
     // Map a terminal reply to a Ruby value (the common eval/call/run shape).
     // &self so a Terminated outcome can pick up the JS stack the watchdog snapshot
     // captured (see timeout_interrupt / take_timeout_backtrace).
     fn reply_value(&self, ruby: &Ruby, reply: VmReply) -> Result<Value, Error> {
-        let outcome = self.reply_value_deferred(ruby, reply);
-        // Every operation that can run Ruby — and so can have a Thread#kill
-        // swallowed by one of its callbacks — ends here, except the few whose own
-        // cleanup has to run first; those call the two halves in order.
-        self.resume_pending_fatal(outcome)
-    }
-
-    // reply_value without finishing a swallowed kill.
-    fn reply_value_deferred(&self, ruby: &Ruby, reply: VmReply) -> Result<Value, Error> {
         match reply {
             VmReply::Done(Ok(val)) => jsval_to_ruby(ruby, &val),
             // Clone (don't take): a nested timeout's terminate unwinds the whole op
@@ -2659,64 +2578,6 @@ impl Core {
             .clone()
     }
 
-    // A Ruby error raised under a live op cannot be allowed to longjmp — it would
-    // cross V8's C++ frames — so every callback catches it and throws it into JS
-    // as a message instead. That is right for an exception and wrong for exactly
-    // one thing: Thread#kill unwinds with TAG_FATAL, which magnus catches like
-    // anything else, and a killed thread that is merely told about it in
-    // JavaScript is not killed at all — it goes on to run whatever comes next,
-    // while the op's caller is handed a fabricated `RustyRacer::RuntimeError:
-    // Error: Fatal`. Remember it here; Core::run re-asserts it the moment the op
-    // is over and there are no V8 frames left to cross, which is what magnus
-    // would have done with the jump if it could have.
-    //
-    // Only Fatal. The other jumps (a `break` or `next` out of a host proc) have
-    // no live block to return to by the time we could resume them, so they stay
-    // what they are today: an error on the JavaScript side.
-    //
-    // The kill lands at the END of the operation, not at the callback: the
-    // callback still has to return through V8, and what it returns is an ordinary
-    // JavaScript exception, which the script may catch and carry on from — during
-    // which it can call further host functions, running Ruby on the already-killed
-    // thread.
-    //
-    // Terminating the isolate here to make that uncatchable was tried and
-    // REJECTED, for a reason worth writing down because the obvious objection is
-    // the wrong one. V8 does see it: a termination requested from inside a host
-    // callback survives the callback and is observed at the next interrupt check,
-    // which is any JavaScript function entry or a loop long enough to exhaust
-    // Ignition's interrupt budget — only a degenerate tail of host calls and
-    // literals escapes. The problem is what happens when it escapes: the request
-    // stays ARMED, and the sweep that clears a stale one runs only at an outermost
-    // request (see service_request), which is exactly what a stranded operation
-    // leaves the isolate without. It would then terminate an unrelated later
-    // operation, which is a worse failure than the one being fixed — and it does
-    // not even close the window it was for, since a script looping on host calls
-    // alone reaches no interrupt check either.
-    fn note_fatal(&self, e: &Error) {
-        if !matches!(
-            e.error_type(),
-            magnus::error::ErrorType::Jump(magnus::error::Tag::Fatal)
-        ) {
-            return;
-        }
-        // Which Fiber has to finish the kill: this one, the one the killed
-        // callback was running on. Checked again at the other end, so a pending
-        // kill can never land on an unrelated caller.
-        self.pending_fatal
-            .store(current_fiber_id(), Ordering::SeqCst);
-    }
-
-    // note_fatal + the message the callback will throw, for the map_err sites.
-    // Rendering is safe to do here, outside any rb_protect with V8 frames live:
-    // magnus formats an exception from its class name and address rather than
-    // calling #message or #inspect, so a caller whose own class raises from those
-    // (checked) cannot longjmp out of this.
-    fn swallow(&self, e: Error) -> String {
-        self.note_fatal(&e);
-        e.to_string()
-    }
-
     fn call_proc(&self, ruby: &Ruby, host_fn_id: usize, args: &[JsVal]) -> Result<JsVal, String> {
         let proc = {
             let procs = self.procs.lock().unwrap();
@@ -2738,16 +2599,16 @@ impl Core {
         let ruby_args = ruby.ary_new_capa(args.len());
         for v in args {
             ruby_args
-                .push(jsval_to_ruby(ruby, v).map_err(|e| self.swallow(e))?)
-                .map_err(|e| self.swallow(e))?;
+                .push(jsval_to_ruby(ruby, v).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
         }
         // SAFETY: ruby_args is a live local (so GC keeps it and its elements) and
         // is not mutated while the slice is borrowed — as_slice's contract. A VM
         // op the proc issues re-enters Core::run (depth > 0) directly — no nested
         // frame bookkeeping is needed any more (the call stack IS the nesting).
         let result: Result<Value, Error> = proc.call(unsafe { ruby_args.as_slice() });
-        let value = result.map_err(|e| self.swallow(e))?;
-        ruby_to_jsval(value).map_err(|e| self.swallow(e))
+        let value = result.map_err(|e| e.to_string())?;
+        ruby_to_jsval(value).map_err(|e| e.to_string())
     }
 
     // Context#call (and call_void). Resolves a dotted function path
@@ -2931,20 +2792,11 @@ impl Core {
 
     fn reset(&self, ruby: &Ruby, context_id: i32) -> Result<Value, Error> {
         let reply = self.run(ruby, Request::Reset { context_id })?;
-        // reply_value_deferred, not reply_value: releasing the procs has to happen
-        // before a swallowed kill is finished, or the jump skips it and this
-        // realm's procs stay GC-rooted and their slots unrecycled for the life of
-        // the isolate — a permanent leak in a process that goes on running, since
-        // a killed FIBER leaves its thread alive.
-        let out = self.reply_value_deferred(ruby, reply);
+        let out = self.reply_value(ruby, reply)?;
         // Only on success — a refused reset (unknown/suspended realm) keeps
-        // its attached fns callable. No `?`: BOTH arms have to reach
-        // resume_pending_fatal, or a kill swallowed during a reset that then
-        // fails is left for some later operation, which drops it.
-        if out.is_ok() {
-            self.release_context_procs(context_id);
-        }
-        self.resume_pending_fatal(out)
+        // its attached fns callable.
+        self.release_context_procs(context_id);
+        Ok(out)
     }
 
     // Build a new context; returns its id (replied as an Int).
@@ -2956,12 +2808,9 @@ impl Core {
 
     fn dispose_context(&self, ruby: &Ruby, context_id: i32) -> Result<(), Error> {
         let reply = self.run(ruby, Request::DisposeContext { context_id })?;
-        // Deferred, and both arms delivered, for the same reasons as reset's.
-        let out = self.reply_value_deferred(ruby, reply);
-        if out.is_ok() {
-            self.release_context_procs(context_id);
-        }
-        self.resume_pending_fatal(out.map(|_| ()))
+        self.reply_value(ruby, reply)?;
+        self.release_context_procs(context_id);
+        Ok(())
     }
 
     // Thin ESM primitives. compile_module returns the new module's id.
@@ -3038,10 +2887,7 @@ impl Core {
         // Reclaim THIS op's resolver error and restore the outer op's pair.
         let (_, resolver_err) = self.swap_instantiate(saved_resolve, saved_err);
         if let Some(exc) = resolver_err {
-            // Through resume_pending_fatal like the tail below: this return is
-            // just as much the end of the op, and skipping it would leave a
-            // swallowed kill for some later op to assert.
-            return self.resume_pending_fatal(Err(Error::from(*exc)));
+            return Err(Error::from(*exc));
         }
         self.reply_value(ruby, reply?)
     }
@@ -3266,7 +3112,7 @@ impl Drop for Core {
                  so it cannot be disposed and is leaked.\n\
                  The usual cause is a host function that yielded out of a Fiber \
                  which was never resumed;\n\
-                 `Fiber#kill` unwinds one cleanly if you still hold it. See\n\
+                 `Fiber#kill` recovers one if you still hold it. See\n\
                  https://github.com/ursm/rusty_racer#fibers\n"
             );
             LEAKED_ISOLATES.fetch_add(1, Ordering::Relaxed);

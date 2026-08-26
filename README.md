@@ -337,11 +337,37 @@ What happens next depends on what the stranded operation's Fiber does:
   The isolate cannot be disposed after that; it is leaked, with a warning saying
   why. If you still hold the Fiber, **`Fiber#kill` recovers it**: it resumes the
   Fiber to unwind it, so the stranded operation finishes in order and the isolate
-  goes back to normal. (The one thing that defeats that is a script which catches
-  the error the killed callback throws and carries on — the kill only lands once
-  that operation ends, just as it would wait out any Ruby call in progress, and
-  until then the script can call further host functions, which run on the
-  already-killed Fiber.)
+  goes back to normal. The operation itself fails on the way out — see below for
+  why a kill reaches it as an ordinary error.
+
+### Killing a thread or Fiber inside a host function
+
+**A `Thread#kill` or `Fiber#kill` that lands while a host function's Ruby is
+running does not kill it.** It surfaces as `RustyRacer::RuntimeError: Error:
+Fatal` from the `eval`/`call` that was in flight, and the thread keeps going —
+and CRuby has already marked that thread as killed, so **a second `Thread#kill`
+is a no-op**. `Thread#raise` still works, and is the way out if you have to
+reach in from outside.
+
+A kill inside a **module resolver** is quieter still: the specifier it was
+resolving simply fails to link, so the error names the import
+(`failed to resolve module specifier "./dep.js" imported from /app.js`) with no
+mention of a kill at all.
+
+This is not a choice, it is the boundary. Ruby unwinds a kill with `TAG_FATAL`,
+which arrives while V8's C++ frames are on the stack — and a `longjmp` through
+those is not survivable, so the callback has to catch it like any other error.
+Nor can it be put back afterwards: `rb_jump_tag` does not carry the unwind with
+it, it re-enters whatever the VM still holds in `$!`, and anything protected
+that ran in between (one more host function raising is enough) has cleared it.
+Jumping into that is a segfault in the interpreter rather than a late kill. 0.2.2
+shipped an attempt at this and had to be withdrawn in 0.2.3.
+
+So: if you need to stop work that calls into an isolate, **stop it at a Ruby
+boundary you control** — a flag the host function checks, a `Queue` it reads —
+rather than by killing the thread from outside. `Isolate#terminate` stops the
+*JavaScript* (at V8's next interrupt check, see above), which is the other half
+of the same job.
 
 ## Installation
 
