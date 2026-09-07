@@ -9,8 +9,12 @@ version = "0.2.3"
 edition = "2024"
 publish = false
 
+# cdylib: the standalone gem extension (.so Ruby loads directly).
+# lib (rlib): lets an embedder link rusty_racer as a Rust library and build its
+# own cdylib — capybara-simulated links rusty_racer + a native DOM into one
+# extension and calls rusty_racer::install_classes from its own magnus init.
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["lib", "cdylib"]
 
 [dependencies]
 # rb-sys: exposes magnus::rb_sys (protect — catch a Ruby raise from a host

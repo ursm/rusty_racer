@@ -49,7 +49,6 @@ use magnus::{
     Error, Exception, ExceptionClass, RHash, Ruby, TryConvert, Value, function, method, prelude::*,
 };
 
-mod dom;
 mod marshal;
 use marshal::{JsVal, js_to_jsval, jsval_to_js, jsval_to_ruby, ruby_to_jsval};
 mod ops;
@@ -782,11 +781,7 @@ struct V8State {
 // `istate(scope)`, so it's automatically per-isolate with no thread-local
 // keying. Accessed in SHORT bursts (never held across a JS run) so a re-entrant
 // host callback can borrow it again — same discipline the old thread_locals had.
-pub(crate) struct IsolateState {
-    // The native DOM: the element arena + cached instance template (Stage 2). Lives
-    // here so every binding accessor reaches it via istate!(scope), per-isolate with
-    // no thread-local keying — the same discipline as the fields below.
-    pub(crate) dom: dom::Dom,
+struct IsolateState {
     realms: V8State,
     modules: ModuleReg,
     scripts: ScriptReg,
@@ -834,7 +829,6 @@ pub(crate) struct IsolateState {
 impl IsolateState {
     fn new(host_namespace: Option<String>, auto_microtasks: bool) -> Self {
         IsolateState {
-            dom: dom::Dom::default(),
             realms: V8State {
                 host_namespace,
                 next_context_id: 1,
@@ -1933,6 +1927,19 @@ unsafe extern "C" fn promise_reject_cb(message: v8::PromiseRejectMessage) {
 // reset and create_context so realms can't drift apart. Returns the context
 // Global AND its dedicated microtask queue; the caller owns the queue in
 // V8State alongside the context (see V8State::queues for why per-realm).
+// An embedder-supplied hook run in every realm just after the host namespace is
+// installed, with the fresh realm's scope and context. Set once (OnceLock) by an
+// embedder that links rusty_racer as a library; None for standalone gem use. A
+// plain fn pointer so it stays Send + Sync with no allocation.
+pub type RealmInitHook = fn(&mut v8::PinScope<'_, '_, ()>, &v8::Global<v8::Context>);
+static REALM_INIT_HOOK: std::sync::OnceLock<RealmInitHook> = std::sync::OnceLock::new();
+
+// Register the per-realm init hook. Idempotent-ish: the first call wins (later
+// calls are ignored), which suits a single embedder wiring it once at boot.
+pub fn set_realm_init_hook(hook: RealmInitHook) {
+    let _ = REALM_INIT_HOOK.set(hook);
+}
+
 fn new_realm(
     scope: &mut v8::PinScope<'_, '_, ()>,
 ) -> (v8::Global<v8::Context>, v8::UniqueRef<v8::MicrotaskQueue>) {
@@ -1986,9 +1993,15 @@ fn new_realm(
     if let Some(name) = host_namespace {
         install_host_namespace(scope, &fresh, &name);
     }
-    // Native DOM binding (Stage 2): installs globalThis.__dom into every realm and
-    // builds the element template once per isolate.
-    dom::install(scope, &fresh);
+    // Generic, DOM-agnostic extension seam: an embedder that links rusty_racer as a
+    // library can register one hook (set_realm_init_hook) to run native setup in
+    // every realm — including frame realms the engine creates internally. This is
+    // how capybara-simulated installs its native DOM without rusty_racer knowing
+    // anything about a DOM. Extension state lives in the embedder's OWN typed
+    // isolate slot (rusty_v8 slots are keyed by TypeId), never in IsolateState.
+    if let Some(hook) = REALM_INIT_HOOK.get() {
+        hook(scope, &fresh);
+    }
     (fresh, queue)
 }
 
@@ -3706,6 +3719,16 @@ fn resolve_module_via_ruby(
 
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), Error> {
+    install_classes(ruby)
+}
+
+// Define the RustyRacer::* Ruby classes/modules. Split out of the magnus init so
+// an embedder that links rusty_racer as a LIBRARY (rather than loading its gem
+// .so) can build its own cdylib and call this from its own `#[magnus::init]` —
+// e.g. capybara-simulated, which links rusty_racer + a native DOM into one
+// extension. Standalone gem use goes through `init` above; both define the exact
+// same surface.
+pub fn install_classes(ruby: &Ruby) -> Result<(), Error> {
     let module = ruby.define_module("RustyRacer")?;
 
     // The isolate (VM) + its isolate-level ops; hands out Contexts.
