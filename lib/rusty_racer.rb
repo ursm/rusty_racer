@@ -14,10 +14,18 @@ require_relative "rusty_racer/version"
 # flat fallback.
 versioned = "rusty_racer/#{RUBY_VERSION[/\d+\.\d+/]}/rusty_racer"
 
-if File.exist?(File.join(__dir__, "#{versioned}.#{RbConfig::CONFIG['DLEXT']}"))
-  require_relative versioned
-else
-  require "rusty_racer/rusty_racer"
+# Skip the native load when an embedder has already defined the classes. Linking
+# rusty_racer as a library into another extension's cdylib (e.g.
+# capybara-simulated, which bundles rusty_racer + its native DOM) calls
+# install_classes from that extension's own init; loading this gem's separate .so
+# on top would put a SECOND V8 runtime in the process (unsound). This file is then
+# required only for the pure-Ruby API wrappers below.
+unless defined?(RustyRacer::Isolate)
+  if File.exist?(File.join(__dir__, "#{versioned}.#{RbConfig::CONFIG['DLEXT']}"))
+    require_relative versioned
+  else
+    require "rusty_racer/rusty_racer"
+  end
 end
 
 module RustyRacer
