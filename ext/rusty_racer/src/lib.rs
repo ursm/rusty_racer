@@ -49,6 +49,7 @@ use magnus::{
     Error, Exception, ExceptionClass, RHash, Ruby, TryConvert, Value, function, method, prelude::*,
 };
 
+mod dom;
 mod marshal;
 use marshal::{JsVal, js_to_jsval, jsval_to_js, jsval_to_ruby, ruby_to_jsval};
 mod ops;
@@ -781,7 +782,11 @@ struct V8State {
 // `istate(scope)`, so it's automatically per-isolate with no thread-local
 // keying. Accessed in SHORT bursts (never held across a JS run) so a re-entrant
 // host callback can borrow it again — same discipline the old thread_locals had.
-struct IsolateState {
+pub(crate) struct IsolateState {
+    // The native DOM: the element arena + cached instance template (Stage 2). Lives
+    // here so every binding accessor reaches it via istate!(scope), per-isolate with
+    // no thread-local keying — the same discipline as the fields below.
+    pub(crate) dom: dom::Dom,
     realms: V8State,
     modules: ModuleReg,
     scripts: ScriptReg,
@@ -829,6 +834,7 @@ struct IsolateState {
 impl IsolateState {
     fn new(host_namespace: Option<String>, auto_microtasks: bool) -> Self {
         IsolateState {
+            dom: dom::Dom::default(),
             realms: V8State {
                 host_namespace,
                 next_context_id: 1,
@@ -1980,6 +1986,9 @@ fn new_realm(
     if let Some(name) = host_namespace {
         install_host_namespace(scope, &fresh, &name);
     }
+    // Native DOM binding (Stage 2): installs globalThis.__dom into every realm and
+    // builds the element template once per isolate.
+    dom::install(scope, &fresh);
     (fresh, queue)
 }
 
