@@ -140,6 +140,10 @@ fn ensure_templates(scope: &mut v8::PinScope<'_, '_>) {
     }
 }
 
+// All IDL members are installed DONT_ENUM: in a real browser they live
+// non-enumerably on prototypes, so Object.keys(el) / for...in must not surface
+// them. (Prototype placement proper is a slice-3 refinement; DONT_ENUM on the
+// instance template blunts the observable difference in the meantime.)
 fn set_reader(
     scope: &mut v8::PinScope<'_, '_>,
     tmpl: v8::Local<'_, v8::ObjectTemplate>,
@@ -147,7 +151,11 @@ fn set_reader(
     getter: impl v8::MapFnTo<v8::AccessorNameGetterCallback>,
 ) {
     if let Some(key) = v8::String::new(scope, name) {
-        tmpl.set_accessor(key.into(), getter);
+        tmpl.set_accessor_with_configuration(
+            key.into(),
+            v8::AccessorConfiguration::new(getter)
+                .property_attribute(v8::PropertyAttribute::DONT_ENUM),
+        );
     }
 }
 
@@ -159,7 +167,12 @@ fn set_reflected(
     setter: impl v8::MapFnTo<v8::AccessorNameSetterCallback>,
 ) {
     if let Some(key) = v8::String::new(scope, name) {
-        tmpl.set_accessor_with_setter(key.into(), getter, setter);
+        tmpl.set_accessor_with_configuration(
+            key.into(),
+            v8::AccessorConfiguration::new(getter)
+                .setter(setter)
+                .property_attribute(v8::PropertyAttribute::DONT_ENUM),
+        );
     }
 }
 
@@ -171,7 +184,7 @@ fn set_method(
 ) {
     let function = v8::FunctionTemplate::new(scope, callback);
     if let Some(key) = v8::String::new(scope, name) {
-        tmpl.set(key.into(), function.into());
+        tmpl.set_with_attr(key.into(), function.into(), v8::PropertyAttribute::DONT_ENUM);
     }
 }
 
@@ -280,7 +293,7 @@ fn cached_wrapper<'s>(
     let template = get_template(&istate!(scope).dom)?;
     let template = v8::Local::new(scope, &template);
     let obj = template.new_instance(scope)?;
-    let id_value: v8::Local<v8::Value> = v8::Integer::new(scope, node_id as i32).into();
+    let id_value: v8::Local<v8::Value> = v8::Integer::new_from_unsigned(scope, node_id as u32).into();
     obj.set_internal_field(0, id_value.into());
     let global = v8::Global::new(scope, obj);
     if let Some(node) = istate!(scope).dom.nodes.get_mut(node_id) {
@@ -477,7 +490,8 @@ fn get_attribute(
     let Some(id) = object_node_id(scope, args.this()) else {
         return;
     };
-    let name = args.get(0).to_rust_string_lossy(scope);
+    // HTML lowercases the qualified name on getAttribute / setAttribute.
+    let name = args.get(0).to_rust_string_lossy(scope).to_ascii_lowercase();
     let value = {
         let st = istate!(scope);
         st.dom
@@ -503,7 +517,8 @@ fn set_attribute(
     let Some(id) = object_node_id(scope, args.this()) else {
         return;
     };
-    let name = args.get(0).to_rust_string_lossy(scope);
+    // HTML lowercases the qualified name on getAttribute / setAttribute.
+    let name = args.get(0).to_rust_string_lossy(scope).to_ascii_lowercase();
     let value = args.get(1).to_rust_string_lossy(scope);
     if let Some(node) = istate!(scope).dom.nodes.get_mut(id) {
         node.set_attr(&name, value);
@@ -512,6 +527,13 @@ fn set_attribute(
 
 // appendChild(child): detach the child from its current parent, re-parent it here,
 // and return it. Slice 2b ignores the document-fragment / text-node cases.
+//
+// A browser throws HierarchyRequestError when the new child is the parent itself
+// or an ancestor of it — and here that is not just a spec nicety: an accepted
+// cycle would make the tree walks (collect_matches / matches_selector) loop
+// forever with no V8 interrupt point, hanging or aborting the isolate. So the
+// check is load-bearing. (Thrown as a generic Error naming HierarchyRequestError;
+// it becomes a real DOMException once the realm exposes that constructor.)
 fn append_child(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -523,6 +545,29 @@ fn append_child(
     let Some(child) = node_id_of(scope, args.get(0)) else {
         return;
     };
+    // Reject if `child` is `parent` or one of its ancestors (walking up from
+    // `parent` includes `parent` itself, so child == parent is covered).
+    let creates_cycle = {
+        let st = istate!(scope);
+        let mut ancestor = Some(parent);
+        let mut found = false;
+        while let Some(node_id) = ancestor {
+            if node_id == child {
+                found = true;
+                break;
+            }
+            ancestor = st.dom.nodes.get(node_id).and_then(|n| n.parent);
+        }
+        found
+    };
+    if creates_cycle {
+        throw_error(
+            scope,
+            "Failed to execute 'appendChild': The new child is an ancestor of \
+             the parent. (HierarchyRequestError)",
+        );
+        return;
+    }
     {
         let st = istate!(scope);
         if let Some(old_parent) = st.dom.nodes.get(child).and_then(|n| n.parent)
@@ -539,6 +584,13 @@ fn append_child(
     }
     if let Some(obj) = element_wrapper(scope, child) {
         rv.set(obj.into());
+    }
+}
+
+fn throw_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
+    if let Some(msg) = v8::String::new(scope, message) {
+        let exception = v8::Exception::error(scope, msg);
+        scope.throw_exception(exception);
     }
 }
 
@@ -683,6 +735,14 @@ fn data_attr_name(scope: &mut v8::PinScope<'_, '_>, key: v8::Local<'_, v8::Name>
 }
 
 // ── minimal selector matcher (tag / #id / .class + descendant combinator) ───
+//
+// WARNING — this is a stopgap, replaced by the real cascade selector engine at
+// integration. Only type/#id/.class compounds joined by whitespace (descendant)
+// are understood. Any other syntax — child `>`, sibling `+`/`~`, selector lists
+// `,`, attribute `[x]`, pseudo `:hover` — is NOT parsed; it is silently treated as
+// bogus compound tokens that match nothing, so querySelector returns null instead
+// of the right element or a SyntaxError. The failure mode is WRONG RESULTS, not an
+// error — callers must not rely on this for anything past the three simple forms.
 
 #[derive(Default)]
 struct Compound {
@@ -750,21 +810,28 @@ fn matches_compound(node: &NodeData, compound: &Compound) -> bool {
 
 // The rightmost compound must match `node`; each earlier compound must match some
 // ancestor, in order but not necessarily contiguous (the descendant combinator).
+// Indexes via `.get` throughout so a stale id can never panic.
 fn matches_selector(nodes: &[NodeData], node_id: usize, compounds: &[Compound]) -> bool {
     let Some((last, rest)) = compounds.split_last() else {
         return false;
     };
-    if !matches_compound(&nodes[node_id], last) {
+    let Some(node) = nodes.get(node_id) else {
+        return false;
+    };
+    if !matches_compound(node, last) {
         return false;
     }
     let mut remaining = rest.iter().rev();
     let Some(mut want) = remaining.next() else {
         return true;
     };
-    let mut ancestor = nodes[node_id].parent;
+    let mut ancestor = node.parent;
     while let Some(a) = ancestor {
-        ancestor = nodes[a].parent;
-        if matches_compound(&nodes[a], want) {
+        let Some(anode) = nodes.get(a) else {
+            break;
+        };
+        ancestor = anode.parent;
+        if matches_compound(anode, want) {
             match remaining.next() {
                 Some(next) => want = next,
                 None => return true,
@@ -774,7 +841,10 @@ fn matches_selector(nodes: &[NodeData], node_id: usize, compounds: &[Compound]) 
     false
 }
 
-// Preorder (document-order) walk of `root`'s descendants, collecting matches.
+// Preorder (document-order) walk of `root`'s descendants, collecting matches. An
+// explicit stack, not native recursion — a legitimately deep DOM (thousands of
+// nested nodes) would otherwise overflow the native stack. Cycles can't arise
+// because appendChild rejects them, so no visited-set is needed on this hot path.
 fn collect_matches(
     nodes: &[NodeData],
     root: usize,
@@ -782,17 +852,24 @@ fn collect_matches(
     out: &mut Vec<usize>,
     first_only: bool,
 ) {
-    for &child in &nodes[root].children {
-        if matches_selector(nodes, child, compounds) {
-            out.push(child);
+    // Seed with root's children in reverse, so the leftmost is popped first.
+    let mut stack: Vec<usize> = match nodes.get(root) {
+        Some(node) => node.children.iter().rev().copied().collect(),
+        None => return,
+    };
+    while let Some(id) = stack.pop() {
+        let Some(node) = nodes.get(id) else {
+            continue;
+        };
+        if matches_selector(nodes, id, compounds) {
+            out.push(id);
             if first_only {
                 return;
             }
         }
-        collect_matches(nodes, child, compounds, out, first_only);
-        if first_only && !out.is_empty() {
-            return;
-        }
+        // Push this node's children reversed, so its subtree is visited (in
+        // document order) before its later siblings — preorder DFS.
+        stack.extend(node.children.iter().rev().copied());
     }
 }
 
