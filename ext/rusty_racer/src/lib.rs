@@ -1578,6 +1578,25 @@ struct Script {
 // PlatformAlreadyInitialized.
 static V8_INITED: AtomicBool = AtomicBool::new(false);
 
+// The shared default platform, kept so ops can pump its foreground task queue (see
+// `platform()` / op_pump_message_loop). V8 posts FinalizationRegistry cleanup — and other
+// deferred foreground work — as platform tasks that only run when the embedder pumps the
+// message loop; without a handle to the platform we could never drive them. The platform is
+// process-global and thread-safe by V8's own contract (it is shared across every isolate on
+// every owner thread), which is what makes the SharedRef sound to park in a `static`.
+struct SharedPlatform(v8::SharedRef<v8::Platform>);
+// SAFETY: v8's default platform is explicitly designed to be shared across isolates and their
+// owner threads; PumpMessageLoop is called per-isolate on that isolate's owner thread. The
+// SharedRef is a refcounted handle to that one shared object.
+unsafe impl Send for SharedPlatform {}
+unsafe impl Sync for SharedPlatform {}
+static PLATFORM: std::sync::OnceLock<SharedPlatform> = std::sync::OnceLock::new();
+
+// The shared platform, once V8 is initialized. `None` before init (no op can run then anyway).
+pub(crate) fn platform() -> Option<&'static v8::SharedRef<v8::Platform>> {
+    PLATFORM.get().map(|p| &p.0)
+}
+
 fn init_v8() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -1590,6 +1609,10 @@ fn init_v8() {
             Ordering::Relaxed,
         );
         let platform = v8::new_default_platform(0, false).make_shared();
+        // Keep a handle before handing ownership to V8, so ops can pump the foreground task
+        // queue (FinalizationRegistry cleanup etc.). make_shared yields a refcounted SharedRef;
+        // clone one into the static and give the other to V8.
+        let _ = PLATFORM.set(SharedPlatform(platform.clone()));
         v8::V8::initialize_platform(platform);
         v8::V8::initialize();
         V8_INITED.store(true, Ordering::SeqCst);
@@ -2717,6 +2740,23 @@ impl Core {
         Ok(())
     }
 
+    // Isolate#pump_message_loop: run every pending foreground platform task, without blocking.
+    // These are the deferred tasks V8 posts to the platform's task runner rather than running
+    // inline — most importantly FinalizationRegistry cleanup callbacks (posted after a GC finds a
+    // registered target dead) and WeakRef clearing. A pure microtask checkpoint does NOT drive
+    // them; only pumping the message loop does. Returns nothing; safe to call any time (a no-op
+    // when the queue is empty).
+    fn pump_message_loop(&self, ruby: &Ruby) -> Result<(), Error> {
+        let reply = self.run(
+            ruby,
+            Request::PumpMessageLoop {
+                timeout_ms: self.default_timeout_ms,
+            },
+        )?;
+        self.reply_value(ruby, reply)?;
+        Ok(())
+    }
+
     fn eval_t(
         &self,
         ruby: &Ruby,
@@ -3211,6 +3251,12 @@ impl Isolate {
     // visits, and distinguishes reclaimable garbage from a genuine leak.
     fn low_memory_notification(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
         rb_self.core.low_memory_notification(ruby)
+    }
+    // Isolate#pump_message_loop: run pending foreground platform tasks (FinalizationRegistry
+    // cleanup callbacks and WeakRef clearing among them), without blocking. Pair it with a GC
+    // (low_memory_notification) or call it periodically so weak-collection callbacks actually fire.
+    fn pump_message_loop(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
+        rb_self.core.pump_message_loop(ruby)
     }
     // dynamic_import_resolver = ->(specifier, referrer_url) { module } for import().
     fn set_dynamic_import_resolver(rb_self: &Self, proc: Proc) {
@@ -3752,6 +3798,10 @@ pub fn install_classes(ruby: &Ruby) -> Result<(), Error> {
     isolate.define_method(
         "low_memory_notification",
         method!(Isolate::low_memory_notification, 0),
+    )?;
+    isolate.define_method(
+        "pump_message_loop",
+        method!(Isolate::pump_message_loop, 0),
     )?;
     isolate.define_method("dispose", method!(Isolate::dispose, 0))?;
     isolate.define_method("disposed?", method!(Isolate::disposed, 0))?;

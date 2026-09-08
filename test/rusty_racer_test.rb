@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "minitest/autorun"
+require "timeout"
 require "rusty_racer"
 
 # The probe suite cibuildgem runs natively on each platform — proving the
@@ -496,6 +497,51 @@ class RustyRacerTest < Minitest::Test
     assert_nil iso.low_memory_notification
     # The isolate is still fully usable after a forced GC.
     assert_equal 3, ctx.eval('1 + 2')
+  end
+
+  def test_pump_message_loop_runs_finalization_registry_callbacks
+    iso = RustyRacer::Isolate.new
+    ctx = iso.context
+    # A FinalizationRegistry callback is a deferred PLATFORM task: V8 posts it after a GC finds a
+    # registered target dead, and it runs only when the message loop is pumped — a microtask checkpoint
+    # does NOT run it. Register a target, drop it, GC, and pump: the callback must fire.
+    ctx.eval(<<~JS)
+      globalThis.fires = 0;
+      globalThis.reg = new FinalizationRegistry(() => { globalThis.fires++; });
+      (function () { let o = {}; globalThis.reg.register(o, 1); o = null; })();
+    JS
+    fired = false
+    10.times do
+      iso.low_memory_notification
+      iso.pump_message_loop
+      break if (fired = ctx.eval('globalThis.fires') >= 1)
+    end
+    assert fired, 'FinalizationRegistry callback never ran after GC + pump_message_loop'
+    assert_equal 3, ctx.eval('1 + 2') # isolate still usable
+  end
+
+  def test_pump_message_loop_is_a_noop_when_idle
+    iso = RustyRacer::Isolate.new
+    # No pending tasks: pumping must not block and must leave the isolate usable.
+    assert_nil iso.pump_message_loop
+    assert_equal 4, iso.context.eval('2 + 2')
+  end
+
+  def test_pump_message_loop_time_caps_a_runaway_cleanup_callback
+    iso = RustyRacer::Isolate.new(timeout_ms: 50)
+    ctx = iso.context
+    # A FinalizationRegistry cleanup callback is arbitrary user JS, run during the pump. A runaway one
+    # must be time-capped and terminable like every other JS entrypoint — not hang the owner thread.
+    ctx.eval(<<~JS)
+      globalThis.reg = new FinalizationRegistry(() => { for (;;) {} });
+      (function () { let o = {}; globalThis.reg.register(o, 1); o = null; })();
+    JS
+    iso.low_memory_notification # post the cleanup task
+    # A Ruby-side timeout is only a backstop: a correct watchdog raises well within it.
+    Timeout.timeout(10) do
+      assert_raises(RustyRacer::ScriptTerminatedError) { iso.pump_message_loop }
+    end
+    assert_equal 2, ctx.eval('1 + 1') # isolate still usable after the terminate
   end
 
   def test_context_reset_does_not_leak_native_contexts
