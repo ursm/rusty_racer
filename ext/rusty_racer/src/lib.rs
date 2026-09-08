@@ -1931,7 +1931,7 @@ unsafe extern "C" fn promise_reject_cb(message: v8::PromiseRejectMessage) {
 // installed, with the fresh realm's scope and context. Set once (OnceLock) by an
 // embedder that links rusty_racer as a library; None for standalone gem use. A
 // plain fn pointer so it stays Send + Sync with no allocation.
-pub type RealmInitHook = fn(&mut v8::PinScope<'_, '_, ()>, &v8::Global<v8::Context>);
+pub type RealmInitHook = fn(&mut v8::PinScope<'_, '_, ()>, &v8::Global<v8::Context>, i32);
 static REALM_INIT_HOOK: std::sync::OnceLock<RealmInitHook> = std::sync::OnceLock::new();
 
 // Register the per-realm init hook. Idempotent-ish: the first call wins (later
@@ -1942,6 +1942,7 @@ pub fn set_realm_init_hook(hook: RealmInitHook) {
 
 fn new_realm(
     scope: &mut v8::PinScope<'_, '_, ()>,
+    context_id: i32,
 ) -> (v8::Global<v8::Context>, v8::UniqueRef<v8::MicrotaskQueue>) {
     // Explicit policy like the isolate's: rusty drives every drain by hand
     // (auto_drain / NS.drainMicrotasks), so V8 must never auto-run this queue.
@@ -2000,7 +2001,7 @@ fn new_realm(
     // anything about a DOM. Extension state lives in the embedder's OWN typed
     // isolate slot (rusty_v8 slots are keyed by TypeId), never in IsolateState.
     if let Some(hook) = REALM_INIT_HOOK.get() {
-        hook(scope, &fresh);
+        hook(scope, &fresh, context_id);
     }
     (fresh, queue)
 }
@@ -2267,7 +2268,7 @@ impl Isolate {
         // namespace from the slot (seeded above).
         {
             v8::scope!(let scope, &mut isolate);
-            let (main_context, main_queue) = new_realm(scope);
+            let (main_context, main_queue) = new_realm(scope, 0);
             istate!(scope).realms.main_context = Some(main_context);
             istate!(scope).realms.main_queue = Some(main_queue);
             // The shared graveyard for retired realms' contexts (see V8State).

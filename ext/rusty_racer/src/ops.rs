@@ -775,7 +775,7 @@ fn op_reset(scope: &mut v8::PinScope<'_, '_, ()>, context_id: i32) -> VmReply {
             "cannot reset a realm while a request for it is suspended on the V8 stack".into(),
         )))
     } else {
-        let (fresh, fresh_queue) = new_realm(scope);
+        let (fresh, fresh_queue) = new_realm(scope, context_id);
         {
             let realms = &mut istate!(scope).realms;
             // Swap in the fresh realm and PARK the old context + queue in
@@ -812,7 +812,7 @@ fn op_create_context(scope: &mut v8::PinScope<'_, '_, ()>) -> VmReply {
         realms.next_context_id += 1;
         id
     };
-    let (fresh, fresh_queue) = new_realm(scope);
+    let (fresh, fresh_queue) = new_realm(scope, id);
     istate!(scope).realms.contexts.insert(id, fresh);
     istate!(scope).realms.queues.insert(id, fresh_queue);
     VmReply::Done(Ok(JsVal::Int(id as i64)))
