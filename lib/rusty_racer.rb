@@ -107,10 +107,11 @@ module RustyRacer
     # the binding's job (V8's host contract), and static imports met while linking
     # resolve through this same block (also with the realm as the 3rd arg).
     # (Module#instantiate's own resolve block keeps its 2-arg form.)
-    # Held in an ivar so the proc stays alive for the isolate's lifetime (the
-    # native side only keeps a weak handle).
+    # The native side keeps the proc alive itself (in the isolate's roots array,
+    # marked by its wrappers), so it is NOT held in an ivar here: that second
+    # reference would outlive `dispose`, which exists to drop whatever the resolver
+    # captured the moment the isolate can no longer call it.
     def dynamic_import_resolver=(resolver)
-      @dynamic_import_resolver = resolver
       _set_dynamic_import_resolver(resolver)
     end
   end
