@@ -188,7 +188,9 @@ pub(crate) enum Request {
     // the deferred work V8 posts to its task runner rather than running inline, most
     // importantly FinalizationRegistry cleanup callbacks (arbitrary JS, so time-capped by
     // timeout_ms). Realm-independent.
-    PumpMessageLoop { timeout_ms: u64 },
+    PumpMessageLoop {
+        timeout_ms: u64,
+    },
 }
 
 // compile_module result: the module's id plus any produced bytecode cache and

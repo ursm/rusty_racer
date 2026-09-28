@@ -65,8 +65,8 @@ use std::sync::{Arc, Mutex, Once, Weak};
 use magnus::block::Proc;
 use magnus::value::{BoxValue, Opaque, ReprValue};
 use magnus::{
-    DataTypeFunctions, Error, Exception, ExceptionClass, RArray, RHash, Ruby, TryConvert, TypedData,
-    Value, function, gc, method, prelude::*,
+    DataTypeFunctions, Error, Exception, ExceptionClass, RArray, RHash, Ruby, TryConvert,
+    TypedData, Value, function, gc, method, prelude::*,
 };
 
 mod marshal;
@@ -3954,10 +3954,7 @@ pub fn install_classes(ruby: &Ruby) -> Result<(), Error> {
         "low_memory_notification",
         method!(Isolate::low_memory_notification, 0),
     )?;
-    isolate.define_method(
-        "pump_message_loop",
-        method!(Isolate::pump_message_loop, 0),
-    )?;
+    isolate.define_method("pump_message_loop", method!(Isolate::pump_message_loop, 0))?;
     isolate.define_method("dispose", method!(Isolate::dispose, 0))?;
     isolate.define_method("disposed?", method!(Isolate::disposed, 0))?;
 
