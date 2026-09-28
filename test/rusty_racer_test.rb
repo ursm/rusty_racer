@@ -2397,7 +2397,11 @@ class RustyRacerTest < Minitest::Test
     3.times { GC.start }
     live_before   = RustyRacer.live_isolate_count
     leaked_before = RustyRacer.leaked_isolate_count
-    refs = Array.new(3) { attached_isolate_capture }
+    # Built inside a FIBER that has finished by the time GC runs: still this thread (the
+    # owner), but on a stack that is gone, so no conservative-scan residue of the isolates
+    # or their captures is left for the collector to find (one stale slot on the test
+    # thread's own stack kept a capture alive on arm64 Ruby 3.3).
+    refs = Fiber.new { Array.new(3) { attached_isolate_capture } }.resume
     3.times { GC.start }
     assert_equal 0, refs.count(&:weakref_alive?),
                  'a dropped isolate kept its attached proc (and its captures) alive'
