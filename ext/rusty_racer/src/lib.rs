@@ -31,10 +31,29 @@
 // OUTERMOST op cancels a stale terminate so it can't poison the next op, while a
 // nested op's cancel never erases a termination aimed at the suspended outer JS.
 //
-// Attached procs and the dynamic-import resolver are GC-rooted via
-// rb_gc_register_address (see RootedProc): marked, so the extension may hold the
-// only reference, and pinned, so GC.compact cannot move them behind the
-// extension's back.
+// Attached procs and the dynamic-import resolver are kept alive by the ISOLATE'S
+// OWN ROOTS ARRAY (Core.roots), which every wrapper marks — never by a GC root.
+// A root would be a leak: a host fn closes over its embedder's world, and that
+// world reaches back to this isolate's wrappers, so rooting the proc roots the
+// whole cycle and mark-and-sweep can never break it (the wrapper's free would
+// then never run, and the procs would never be released — one un-disposable
+// isolate per embedder session). Marked from the wrappers instead, the cycle is
+// ordinary Ruby garbage. `mark` PINS each entry (GC.compact must not move them:
+// the copies living in Rust are invisible to the compactor and would go stale),
+// which an RArray's own movable marking would not do.
+//
+// Two things stay OUTSIDE that array, deliberately:
+//   - the owner Thread (_owner_root) keeps its rb_gc_register_address, because the
+//     guarantee it buys has to outlive the last wrapper: Core::drop compares the
+//     raw owner VALUE when no wrapper is left to mark anything, and a freed Thread
+//     slot reused by a live thread would be a false owner match (see RootedThread).
+//     It is not the cycle above — a Thread reaches back to an isolate only if the
+//     embedder parks its world in that thread's thread-local storage.
+//   - an isolate whose last wrapper is collected on a thread OTHER than its owner
+//     still cannot be disposed (V8 forbids it) and is counted leaked, as it always
+//     was — see Core::drop. Collection now happens where it never used to, so that
+//     counter reports cases it used to miss entirely; disposing explicitly on the
+//     owner thread is still the only way to free a foreign-owned isolate promptly.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -44,9 +63,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once, Weak};
 
 use magnus::block::Proc;
-use magnus::value::{BoxValue, ReprValue};
+use magnus::value::{BoxValue, Opaque, ReprValue};
 use magnus::{
-    Error, Exception, ExceptionClass, RHash, Ruby, TryConvert, Value, function, method, prelude::*,
+    DataTypeFunctions, Error, Exception, ExceptionClass, RArray, RHash, Ruby, TryConvert,
+    TypedData, Value, function, gc, method, prelude::*,
 };
 
 mod marshal;
@@ -62,9 +82,13 @@ use watchdog::{
 
 // A Ruby Proc rooted for as long as the Core holds it. BoxValue registers a
 // stable heap address with rb_gc_register_address, which both MARKS the proc
-// (the extension may hold the only reference — e.g. attach("f", -> {...}))
 // and PINS it (GC.compact must not move it: the copies living in Rust are
 // invisible to the compactor and would go stale).
+//
+// Only for a proc the isolate holds TRANSIENTLY — today just the instantiate
+// resolver, parked in the slot for the length of one InstantiateModule op and
+// restored after it. Anything held for the isolate's LIFE goes in the roots
+// array instead (see the module header): a lasting root is a lasting leak.
 //
 // SAFETY of the manual Send: the !Send contents (and BoxValue's drop, which
 // calls rb_gc_unregister_address) only run under the GVL. Two conventions
@@ -122,13 +146,14 @@ macro_rules! istate {
 pub(crate) use istate;
 
 // One attach()'d host fn: the realm it was attached into — so resetting or
-// disposing that realm can release the GC root — the rooted proc itself (None
-// once released; the slot index stays valid as a host_fn_id), and the name it
-// was attached under, kept only so a diagnostic can say which host function is
-// involved (one String per attach, never per call).
+// disposing that realm can release it — whether it is still attached (the slot
+// index stays valid as a host_fn_id either way), and the name it was attached
+// under, kept only so a diagnostic can say which host function is involved (one
+// String per attach, never per call). The PROC itself lives in the roots array
+// at `proc_root_index(id)`, where the GC can see it without taking this lock.
 struct ProcSlot {
     context_id: i32,
-    proc: Option<RootedProc>,
+    live: bool,
     name: String,
 }
 
@@ -157,16 +182,31 @@ impl ProcTable {
     }
 
     // Release every live proc attached into |context_id| (its realm is gone),
-    // returning each slot to the free list. Idempotent: an already-released slot
-    // has proc == None and is skipped, so it can't be double-freed.
-    fn release(&mut self, context_id: i32) {
+    // returning their ids so the caller can clear their roots-array entries (a Ruby
+    // write, which this table never does: it is locked on paths a GC must not have to
+    // wait behind) and only THEN put them on the free list. Idempotent: an
+    // already-released slot is skipped, so it can't be double-freed.
+    fn release(&mut self, context_id: i32) -> Vec<usize> {
+        let mut released = Vec::new();
         for (id, slot) in self.slots.iter_mut().enumerate() {
-            if slot.context_id == context_id && slot.proc.is_some() {
-                slot.proc = None;
-                self.free.push(id);
+            if slot.context_id == context_id && slot.live {
+                slot.live = false;
+                released.push(id);
             }
         }
+        released
     }
+}
+
+// The isolate's ROOTS ARRAY: every Ruby object the isolate must keep alive for as
+// long as a wrapper of it is reachable, in one place the GC can be shown without
+// taking any Rust lock (a mark that had to lock `procs` could deadlock against
+// the thread whose allocation triggered the GC while holding it). Slot 0 is the
+// dynamic-import resolver; the attached host fns follow, one per host_fn_id.
+const ROOT_IMPORT_RESOLVER: isize = 0;
+const ROOT_FIRST_PROC: isize = 1;
+fn proc_root_index(host_fn_id: usize) -> isize {
+    ROOT_FIRST_PROC + host_fn_id as isize
 }
 
 // Look up a RustyRacer::<name> exception class at raise time. The classes are
@@ -301,9 +341,9 @@ enum RubyCall<'a> {
 impl RubyCall<'_> {
     fn describe(&self, core: &Core) -> String {
         match self {
-            // try_lock, not lock: nothing holds this across a callback (call_proc
-            // takes the proc out under the lock and releases it before calling),
-            // but blocking here would turn a diagnostic into a hang.
+            // try_lock, not lock: nothing holds this across a callback (the procs
+            // themselves are read from the roots array, without this lock), but
+            // blocking here would turn a diagnostic into a hang.
             Self::HostFn(id) => match core
                 .procs
                 .try_lock()
@@ -1118,13 +1158,7 @@ fn resolve_imported<'s>(
             }
         }
         None => {
-            let resolver = core
-                .dynamic_import_resolver
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|r| r.get());
-            match resolver {
+            match core.dynamic_import_resolver() {
                 Some(p) => match with_gvl(core, RubyCall::Resolver(&spec), || {
                     resolve_module_via_ruby(core, p, &spec, &ref_url, Some(here.unwrap_or(0)))
                         // Rendering the message reads the Ruby exception, so it too
@@ -1235,13 +1269,7 @@ fn dynamic_import_cb<'s>(
         return Some(promise);
     }
     let core = unsafe { &*core_ptr };
-    let resolver_proc = core
-        .dynamic_import_resolver
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|r| r.get());
-    let id = match resolver_proc {
+    let id = match core.dynamic_import_resolver() {
         // A raising resolver only fails the import() (it rejects generically);
         // it must NOT abort the surrounding eval, so swallow the Err here.
         Some(p) => with_gvl(core, RubyCall::Resolver(&spec), || {
@@ -1500,10 +1528,16 @@ struct Core {
     // stack (bootstrap via callback_scope! onto the ambient scope). Bumped around
     // each `run`.
     depth: std::sync::atomic::AtomicU32,
-    // host_fn_id indexes ProcTable.slots. Mutex (uncontended — single owner
-    // thread) so host_fn_callback can reach it through Core (via the slot's
-    // core_ptr) while a &Core method also holds it. Each proc is GC-rooted while
-    // live — see RootedProc/ProcSlot; reset/dispose releases roots, recycles slots.
+    // Everything this isolate keeps alive on the Ruby side — the attached host fns
+    // and the dynamic-import resolver — in one Array the wrappers MARK (and pin).
+    // See the module header for why these must not be GC roots; ROOT_* for the
+    // layout. Read on the V8 side without the GVL (the import hooks), which is
+    // sound because the entries are pinned and nothing here allocates or raises.
+    roots: Opaque<RArray>,
+    // host_fn_id indexes ProcTable.slots — bookkeeping only (the proc itself is in
+    // `roots`). Mutex (uncontended — single owner thread) so host_fn_callback can
+    // reach it through Core (via the slot's core_ptr) while a &Core method also
+    // holds it. reset/dispose releases the slots and recycles them.
     procs: Mutex<ProcTable>,
     // Default per-eval/call timeout (ms); 0 = none. eval(timeout_ms:)'s explicit
     // value overrides it. Guards against an in-V8 infinite loop without a watchdog.
@@ -1515,9 +1549,6 @@ struct Core {
     // the ceiling after each OOM (to this when set, else V8's captured default — see
     // oom_initial_limit). Space-axis twin of default_timeout_ms.
     memory_limit: usize,
-    // Set by Context#dynamic_import_resolver=; called for a JS import() to map
-    // (specifier, referrer) to an already-loaded Module. GC-rooted like procs.
-    dynamic_import_resolver: Mutex<Option<RootedProc>>,
     // The watchdog (armed per timed op, fires TerminateExecution via the handle)
     // and its thread's join handle, held here so dispose/Drop — which run on the
     // owner thread with no scope — can stop and join it before the isolate drops.
@@ -1528,7 +1559,8 @@ struct Core {
 // The V8 isolate (one per Isolate): lifecycle + the isolate-level ops
 // (terminate, microtask checkpoint, dynamic import). eval/call/etc. live on
 // Context, which an Isolate hands out (a v8::Context).
-#[magnus::wrap(class = "RustyRacer::Isolate")]
+#[derive(TypedData)]
+#[magnus(class = "RustyRacer::Isolate", mark)]
 struct Isolate {
     core: Arc<Core>,
 }
@@ -1537,7 +1569,8 @@ struct Isolate {
 // extra one (id >= 1, via Isolate#create_context). eval/call/attach/
 // compile_module run here. Its own `disposed` is per-context; the Core's is
 // isolate-level.
-#[magnus::wrap(class = "RustyRacer::Context")]
+#[derive(TypedData)]
+#[magnus(class = "RustyRacer::Context", mark)]
 struct Context {
     core: Arc<Core>,
     id: i32,
@@ -1552,7 +1585,8 @@ struct Snapshot {
 }
 
 // Context#compile_module result: a handle to a V8 module (by id).
-#[magnus::wrap(class = "RustyRacer::Module")]
+#[derive(TypedData)]
+#[magnus(class = "RustyRacer::Module", mark)]
 struct JsModule {
     core: Arc<Core>,
     module_id: i32,
@@ -1564,7 +1598,8 @@ struct JsModule {
 }
 
 // Context#compile result: a handle to a classic compiled script (by id).
-#[magnus::wrap(class = "RustyRacer::Script")]
+#[derive(TypedData)]
+#[magnus(class = "RustyRacer::Script", mark)]
 struct Script {
     core: Arc<Core>,
     script_id: i32,
@@ -1573,10 +1608,48 @@ struct Script {
     cache_rejected: bool,
 }
 
+// The four wrappers that hold an Arc<Core> all mark the isolate's roots, because any
+// one of them may be the last one reachable: Ruby code is free to keep only the
+// Context a `Isolate#context` handed it, or only a Module, and the host fns must
+// stay callable through it. Marking the same array four times costs nothing (the GC
+// stops at an already-marked object); missing it once would free a live proc.
+macro_rules! marks_core_roots {
+    ($t:ty) => {
+        impl DataTypeFunctions for $t {
+            fn mark(&self, marker: &gc::Marker) {
+                self.core.mark_roots(marker);
+            }
+        }
+    };
+}
+marks_core_roots!(Isolate);
+marks_core_roots!(Context);
+marks_core_roots!(JsModule);
+marks_core_roots!(Script);
+
 // Set true once V8 is initialized; Platform.set_flags! refuses after that
 // (flags must be set before V8::initialize), like mini_racer's
 // PlatformAlreadyInitialized.
 static V8_INITED: AtomicBool = AtomicBool::new(false);
+
+// The shared default platform, kept so ops can pump its foreground task queue (see
+// `platform()` / op_pump_message_loop). V8 posts FinalizationRegistry cleanup — and other
+// deferred foreground work — as platform tasks that only run when the embedder pumps the
+// message loop; without a handle to the platform we could never drive them. The platform is
+// process-global and thread-safe by V8's own contract (it is shared across every isolate on
+// every owner thread), which is what makes the SharedRef sound to park in a `static`.
+struct SharedPlatform(v8::SharedRef<v8::Platform>);
+// SAFETY: v8's default platform is explicitly designed to be shared across isolates and their
+// owner threads; PumpMessageLoop is called per-isolate on that isolate's owner thread. The
+// SharedRef is a refcounted handle to that one shared object.
+unsafe impl Send for SharedPlatform {}
+unsafe impl Sync for SharedPlatform {}
+static PLATFORM: std::sync::OnceLock<SharedPlatform> = std::sync::OnceLock::new();
+
+// The shared platform, once V8 is initialized. `None` before init (no op can run then anyway).
+pub(crate) fn platform() -> Option<&'static v8::SharedRef<v8::Platform>> {
+    PLATFORM.get().map(|p| &p.0)
+}
 
 fn init_v8() {
     static ONCE: Once = Once::new();
@@ -1590,6 +1663,10 @@ fn init_v8() {
             Ordering::Relaxed,
         );
         let platform = v8::new_default_platform(0, false).make_shared();
+        // Keep a handle before handing ownership to V8, so ops can pump the foreground task
+        // queue (FinalizationRegistry cleanup etc.). make_shared yields a refcounted SharedRef;
+        // clone one into the static and give the other to V8.
+        let _ = PLATFORM.set(SharedPlatform(platform.clone()));
         v8::V8::initialize_platform(platform);
         v8::V8::initialize();
         V8_INITED.store(true, Ordering::SeqCst);
@@ -1927,8 +2004,22 @@ unsafe extern "C" fn promise_reject_cb(message: v8::PromiseRejectMessage) {
 // reset and create_context so realms can't drift apart. Returns the context
 // Global AND its dedicated microtask queue; the caller owns the queue in
 // V8State alongside the context (see V8State::queues for why per-realm).
+// An embedder-supplied hook run in every realm just after the host namespace is
+// installed, with the fresh realm's scope and context. Set once (OnceLock) by an
+// embedder that links rusty_racer as a library; None for standalone gem use. A
+// plain fn pointer so it stays Send + Sync with no allocation.
+pub type RealmInitHook = fn(&mut v8::PinScope<'_, '_, ()>, &v8::Global<v8::Context>, i32);
+static REALM_INIT_HOOK: std::sync::OnceLock<RealmInitHook> = std::sync::OnceLock::new();
+
+// Register the per-realm init hook. Idempotent-ish: the first call wins (later
+// calls are ignored), which suits a single embedder wiring it once at boot.
+pub fn set_realm_init_hook(hook: RealmInitHook) {
+    let _ = REALM_INIT_HOOK.set(hook);
+}
+
 fn new_realm(
     scope: &mut v8::PinScope<'_, '_, ()>,
+    context_id: i32,
 ) -> (v8::Global<v8::Context>, v8::UniqueRef<v8::MicrotaskQueue>) {
     // Explicit policy like the isolate's: rusty drives every drain by hand
     // (auto_drain / NS.drainMicrotasks), so V8 must never auto-run this queue.
@@ -1979,6 +2070,15 @@ fn new_realm(
     let host_namespace = istate!(scope).realms.host_namespace.clone();
     if let Some(name) = host_namespace {
         install_host_namespace(scope, &fresh, &name);
+    }
+    // Generic, DOM-agnostic extension seam: an embedder that links rusty_racer as a
+    // library can register one hook (set_realm_init_hook) to run native setup in
+    // every realm — including frame realms the engine creates internally. This is
+    // how capybara-simulated installs its native DOM without rusty_racer knowing
+    // anything about a DOM. Extension state lives in the embedder's OWN typed
+    // isolate slot (rusty_v8 slots are keyed by TypeId), never in IsolateState.
+    if let Some(hook) = REALM_INIT_HOOK.get() {
+        hook(scope, &fresh, context_id);
     }
     (fresh, queue)
 }
@@ -2193,13 +2293,13 @@ impl Isolate {
     // Core keeps its id + a stable raw ptr so `run` can open scopes on it. The
     // isolate is thread-bound from here on (every op asserts the owner thread).
     fn new(
-        _ruby: &Ruby,
+        ruby: &Ruby,
         host_namespace: Option<String>,
         snapshot: Option<magnus::typed_data::Obj<Snapshot>>,
         timeout_ms: u64,
         memory_limit: usize,
         explicit_microtasks: bool,
-    ) -> Result<Self, Error> {
+    ) -> Result<magnus::typed_data::Obj<Self>, Error> {
         init_v8();
         // A snapshot blob bakes globalThis state in: the first Context::new (in
         // new_realm below) deserializes that default context for free.
@@ -2245,7 +2345,7 @@ impl Isolate {
         // namespace from the slot (seeded above).
         {
             v8::scope!(let scope, &mut isolate);
-            let (main_context, main_queue) = new_realm(scope);
+            let (main_context, main_queue) = new_realm(scope, 0);
             istate!(scope).realms.main_context = Some(main_context);
             istate!(scope).realms.main_queue = Some(main_queue);
             // The shared graveyard for retired realms' contexts (see V8State).
@@ -2275,6 +2375,10 @@ impl Isolate {
         // owner check.
         use magnus::rb_sys::{AsRawValue, FromRawValue};
         let owner_thread = unsafe { Value::from_raw(rb_sys::rb_thread_current()) };
+        // The roots array (see ROOT_IMPORT_RESOLVER): created empty, grown by the
+        // first attach. Nothing roots it — the wrappers mark it, so it lives
+        // exactly as long as this isolate is reachable from Ruby.
+        let roots = ruby.ary_new();
         let core = Arc::new_cyclic(|me| Core {
             me: me.clone(),
             shared: Mutex::new(Shared {
@@ -2288,10 +2392,10 @@ impl Isolate {
             scan_start_field: std::sync::atomic::AtomicUsize::new(0),
             installed_stack_limit: std::sync::atomic::AtomicUsize::new(0),
             depth: std::sync::atomic::AtomicU32::new(0),
+            roots: Opaque::from(roots),
             procs: Mutex::new(ProcTable::default()),
             default_timeout_ms: timeout_ms,
             memory_limit,
-            dynamic_import_resolver: Mutex::new(None),
             watchdog,
             watchdog_join: Mutex::new(Some(watchdog_join)),
         });
@@ -2314,7 +2418,14 @@ impl Isolate {
         // enter/exit stack (an out-of-order drop aborts). Instead each op enters
         // around its run (Core::run) and teardown re-enters just before drop.
         unsafe { (*core.iso_ptr.0).exit() };
-        Ok(Isolate { core })
+        // Wrap HERE rather than returning `Self` for magnus to wrap after this frame is
+        // gone: wrapping allocates, and until the wrapper exists the roots array is
+        // referenced only from the Arc<Core>'s malloc'd block, which Ruby does not scan.
+        // `black_box` keeps the local VALUE live across that allocation — where the
+        // conservative stack scan does reach it.
+        let wrapped = ruby.obj_wrap(Isolate { core });
+        std::hint::black_box(roots);
+        Ok(wrapped)
     }
 }
 
@@ -2578,16 +2689,67 @@ impl Core {
             .clone()
     }
 
+    // ── the roots array (see the module header + ROOT_IMPORT_RESOLVER) ──────
+    // Keep `val` alive for as long as this isolate is reachable from Ruby. On a
+    // Ruby thread with the GVL: storing can grow the Array, which allocates.
+    fn root_store<T: magnus::IntoValue>(
+        &self,
+        ruby: &Ruby,
+        index: isize,
+        val: T,
+    ) -> Result<(), Error> {
+        ruby.get_inner(self.roots).store(index, val)
+    }
+
+    // One entry, or None where nothing is stored (an unset resolver, a released
+    // host fn). Reads the Array WITHOUT the GVL — V8 calls the import hooks with it
+    // released — so it must not run one line of Ruby: `rb_ary_entry` plus
+    // `Proc::from_value` (rb_obj_is_proc) and nothing else. NOT `RArray::entry`,
+    // whose TryConvert would answer a nil slot by CALLING `nil.to_proc`, raising
+    // NoMethodError and rescuing it — Ruby code, an allocation and a longjmp, with
+    // no GVL held (measured: it corrupts the VM — "[BUG] unexpected situation" then
+    // a SEGV — under any concurrent Ruby thread). The entries are pinned by
+    // `mark_roots`, so the VALUE stays put until the caller has it under the GVL.
+    fn root_proc(&self, index: isize) -> Option<Proc> {
+        let roots = unsafe { Ruby::get_unchecked() }.get_inner(self.roots);
+        Proc::from_value(roots.entry::<Value>(index).ok()?)
+    }
+
+    // Show the GC everything this isolate holds. Called from EVERY wrapper's mark
+    // (Isolate, Context, Module, Script all keep an Arc<Core>, and any one of them
+    // may be the last reachable): a wrapper that forgot to would leave a live
+    // isolate's host fns unmarked. `mark` PINS — an Array marks its own elements
+    // MOVABLE, and the copies Rust takes out of it (call_proc, root_proc) would go
+    // stale if the compactor moved one. Takes no Rust lock, by construction.
+    fn mark_roots(&self, marker: &gc::Marker) {
+        let roots = unsafe { Ruby::get_unchecked() }.get_inner(self.roots);
+        marker.mark(roots);
+        // Entry by entry, exactly — not `mark_slice`, whose rb_gc_mark_locations is
+        // CONSERVATIVE (it tests each word for heap-likeness) and measured no faster
+        // here. The walk is O(entries) per wrapper per GC, MINOR GCs included (these
+        // wrappers are not wb_protected, so they are marked every time): measured
+        // 2026-09-13 with 600 procs, ~0.1 ms per GC at the 18 wrappers a real embedder
+        // session holds (capybara-simulated: 1 Isolate + 17 Contexts), ~3 ms at 500. If
+        // that ever bites, the fix is for the derived wrappers to mark the ISOLATE'S
+        // Ruby object and let its own mark walk the array once — which needs Core to
+        // hold that object (an Opaque<Value> nothing stores today), not just a rewrite
+        // of this loop.
+        for i in 0..roots.len() {
+            if let Ok(v) = roots.entry::<Value>(i as isize) {
+                marker.mark(v);
+            }
+        }
+    }
+
     fn call_proc(&self, ruby: &Ruby, host_fn_id: usize, args: &[JsVal]) -> Result<JsVal, String> {
-        let proc = {
-            let procs = self.procs.lock().unwrap();
-            procs
-                .slots
-                .get(host_fn_id)
-                .and_then(|slot| slot.proc.as_ref())
-                .ok_or("unknown host function")?
-                .get()
-        };
+        // Straight from the roots array — a released (or never-attached) id reads
+        // back nil, which is the same "unknown host function" the slot table would
+        // have reported, so the hot path takes no lock at all. `root_proc` and not
+        // `RArray::entry`, for the reason given there: a nil slot must answer None,
+        // never dispatch `to_proc` and raise.
+        let proc = self
+            .root_proc(proc_root_index(host_fn_id))
+            .ok_or("unknown host function")?;
         // Marshal into a Ruby Array, NOT a Vec<Value>: bare Values in a heap Vec
         // are hidden from Ruby's GC mark phase (magnus's own RArray::to_vec doc
         // spells this out). With several args, once arg N is parked in the Vec
@@ -2694,6 +2856,23 @@ impl Core {
         Ok(())
     }
 
+    // Isolate#pump_message_loop: run every pending foreground platform task, without blocking.
+    // These are the deferred tasks V8 posts to the platform's task runner rather than running
+    // inline — most importantly FinalizationRegistry cleanup callbacks (posted after a GC finds a
+    // registered target dead) and WeakRef clearing. A pure microtask checkpoint does NOT drive
+    // them; only pumping the message loop does. Returns nothing; safe to call any time (a no-op
+    // when the queue is empty).
+    fn pump_message_loop(&self, ruby: &Ruby) -> Result<(), Error> {
+        let reply = self.run(
+            ruby,
+            Request::PumpMessageLoop {
+                timeout_ms: self.default_timeout_ms,
+            },
+        )?;
+        self.reply_value(ruby, reply)?;
+        Ok(())
+    }
+
     fn eval_t(
         &self,
         ruby: &Ruby,
@@ -2723,11 +2902,16 @@ impl Core {
         name: String,
         proc: Proc,
     ) -> Result<Value, Error> {
+        // BEFORE the roots write, not just inside `run` below: storing can REALLOC the
+        // array's element storage, which the import hooks read with the GVL released —
+        // and a refused attach must not consume a slot or leave its proc rooted either.
+        self.ensure_owner_and_live(ruby)?;
         let host_fn_id = self.procs.lock().unwrap().alloc(ProcSlot {
             context_id,
-            proc: Some(RootedProc(BoxValue::new(proc))),
+            live: true,
             name: name.clone(),
         });
+        self.root_store(ruby, proc_root_index(host_fn_id), proc)?;
         let reply = self.run(
             ruby,
             Request::Attach {
@@ -2756,20 +2940,31 @@ impl Core {
         if entries.is_empty() {
             return Ok(ruby.qnil().as_value()); // nothing to install, skip the round-trip
         }
-        let named_ids: Vec<(String, usize)> = {
+        self.ensure_owner_and_live(ruby)?; // before the roots writes — see `attach`
+        let allocated: Vec<(String, usize, Proc)> = {
             let mut procs = self.procs.lock().unwrap();
             entries
                 .into_iter()
                 .map(|(name, proc)| {
                     let id = procs.alloc(ProcSlot {
                         context_id,
-                        proc: Some(RootedProc(BoxValue::new(proc))),
+                        live: true,
                         name: name.clone(),
                     });
-                    (name, id)
+                    (name, id, proc)
                 })
                 .collect()
         };
+        // Stored OUTSIDE the table's lock: storing into the array can allocate (the
+        // Array grows), and an allocation may GC — which marks through this isolate's
+        // wrappers, a path that must never wait on `procs`. The Procs parked in the
+        // Vec meanwhile are invisible to the GC (see call_proc's note), but the caller's
+        // `table: RHash` argument is live in its own frame and marks every one of them.
+        let mut named_ids: Vec<(String, usize)> = Vec::with_capacity(allocated.len());
+        for (name, id, proc) in allocated {
+            self.root_store(ruby, proc_root_index(id), proc)?;
+            named_ids.push((name, id));
+        }
         let reply = self.run(
             ruby,
             Request::AttachMany {
@@ -2781,13 +2976,20 @@ impl Core {
         self.reply_value(ruby, reply)
     }
 
-    // Release the GC roots of the procs attached into |context_id| — its
-    // realm is gone (reset or disposed), so the V8-side functions that
-    // referenced them are unreachable. Runs on a Ruby thread (a RootedProc
-    // drop unregisters its GC address). The slots stay: host_fn_ids of other
-    // realms are indices into the same Vec.
-    fn release_context_procs(&self, context_id: i32) {
-        self.procs.lock().unwrap().release(context_id);
+    // Drop the procs attached into |context_id| out of the roots array — its
+    // realm is gone (reset or disposed), so the V8-side functions that referenced
+    // them are unreachable, and holding them would keep the embedder's world alive
+    // for the rest of the isolate's life. Runs on a Ruby thread: it writes nil
+    // into the Array. The slots stay: host_fn_ids of other realms are indices into
+    // the same Vec.
+    fn release_context_procs(&self, ruby: &Ruby, context_id: i32) {
+        // Nil the entries BEFORE the ids go back on the free list, so no attach can
+        // ever be handed an id whose old proc is still in the array.
+        let released = self.procs.lock().unwrap().release(context_id);
+        for &id in &released {
+            let _ = self.root_store(ruby, proc_root_index(id), ruby.qnil());
+        }
+        self.procs.lock().unwrap().free.extend(released);
     }
 
     fn reset(&self, ruby: &Ruby, context_id: i32) -> Result<Value, Error> {
@@ -2795,7 +2997,7 @@ impl Core {
         let out = self.reply_value(ruby, reply)?;
         // Only on success — a refused reset (unknown/suspended realm) keeps
         // its attached fns callable.
-        self.release_context_procs(context_id);
+        self.release_context_procs(ruby, context_id);
         Ok(out)
     }
 
@@ -2809,7 +3011,7 @@ impl Core {
     fn dispose_context(&self, ruby: &Ruby, context_id: i32) -> Result<(), Error> {
         let reply = self.run(ruby, Request::DisposeContext { context_id })?;
         self.reply_value(ruby, reply)?;
-        self.release_context_procs(context_id);
+        self.release_context_procs(ruby, context_id);
         Ok(())
     }
 
@@ -2986,10 +3188,18 @@ impl Core {
         code_cache_from_reply(ruby, reply)
     }
 
-    fn set_dynamic_import_resolver(&self, proc: Proc) {
-        // The old RootedProc (if any) drops here, unregistering its address —
-        // we are on a Ruby thread, so that's GVL-safe.
-        *self.dynamic_import_resolver.lock().unwrap() = Some(RootedProc(BoxValue::new(proc)));
+    // Owner-thread only, like every other writer of the roots array (`attach`,
+    // `attach_many`, `dispose`): the store can REALLOC the array's element storage, and
+    // the import hooks read that storage with the GVL released.
+    fn set_dynamic_import_resolver(&self, ruby: &Ruby, proc: Proc) -> Result<(), Error> {
+        self.ensure_owner_and_live(ruby)?;
+        self.root_store(ruby, ROOT_IMPORT_RESOLVER, proc)
+    }
+
+    // The resolver, or None if none was set. Read on the V8 side without the GVL —
+    // see root_proc.
+    fn dynamic_import_resolver(&self) -> Option<Proc> {
+        self.root_proc(ROOT_IMPORT_RESOLVER)
     }
 
     // Terminate whatever is running. IsolateHandle is Send + refcounted —
@@ -3020,12 +3230,16 @@ impl Core {
         // it entered, and OwnedIsolate's Drop asserts `self == GetCurrent()`
         // (then exits). Between ops the isolate is exited, so we must enter here.
         unsafe { (*self.iso_ptr.0).enter() };
+        // Only the Rust-side bookkeeping. Clearing the roots ARRAY here would be
+        // pointless work: teardown also runs from Core::drop, and by then the array
+        // is garbage itself — the last wrapper marking it is exactly what went away.
+        // `dispose` clears it explicitly instead, for the isolate the caller disposes
+        // but keeps a handle to.
         {
             let mut procs = self.procs.lock().unwrap();
             procs.slots.clear();
             procs.free.clear();
         }
-        *self.dynamic_import_resolver.lock().unwrap() = None;
         {
             let st = istate!(unsafe { &mut *self.iso_ptr.0 });
             st.realms = V8State::default();
@@ -3074,6 +3288,10 @@ impl Core {
             shared.disposed = true;
         }
         self.teardown();
+        // Release the host fns NOW rather than when the wrappers are collected: a
+        // disposed isolate can never call one again, and each closes over as much
+        // of the embedder's world as it happens to capture.
+        let _ = ruby.get_inner(self.roots).clear();
         Ok(())
     }
 }
@@ -3189,9 +3407,15 @@ impl Isolate {
     fn low_memory_notification(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
         rb_self.core.low_memory_notification(ruby)
     }
+    // Isolate#pump_message_loop: run pending foreground platform tasks (FinalizationRegistry
+    // cleanup callbacks and WeakRef clearing among them), without blocking. Pair it with a GC
+    // (low_memory_notification) or call it periodically so weak-collection callbacks actually fire.
+    fn pump_message_loop(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
+        rb_self.core.pump_message_loop(ruby)
+    }
     // dynamic_import_resolver = ->(specifier, referrer_url) { module } for import().
-    fn set_dynamic_import_resolver(rb_self: &Self, proc: Proc) {
-        rb_self.core.set_dynamic_import_resolver(proc);
+    fn set_dynamic_import_resolver(ruby: &Ruby, rb_self: &Self, proc: Proc) -> Result<(), Error> {
+        rb_self.core.set_dynamic_import_resolver(ruby, proc)
     }
     fn dispose(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
         rb_self.core.dispose(ruby)
@@ -3697,6 +3921,16 @@ fn resolve_module_via_ruby(
 
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), Error> {
+    install_classes(ruby)
+}
+
+// Define the RustyRacer::* Ruby classes/modules. Split out of the magnus init so
+// an embedder that links rusty_racer as a LIBRARY (rather than loading its gem
+// .so) can build its own cdylib and call this from its own `#[magnus::init]` —
+// e.g. capybara-simulated, which links rusty_racer + a native DOM into one
+// extension. Standalone gem use goes through `init` above; both define the exact
+// same surface.
+pub fn install_classes(ruby: &Ruby) -> Result<(), Error> {
     let module = ruby.define_module("RustyRacer")?;
 
     // The isolate (VM) + its isolate-level ops; hands out Contexts.
@@ -3720,6 +3954,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
         "low_memory_notification",
         method!(Isolate::low_memory_notification, 0),
     )?;
+    isolate.define_method("pump_message_loop", method!(Isolate::pump_message_loop, 0))?;
     isolate.define_method("dispose", method!(Isolate::dispose, 0))?;
     isolate.define_method("disposed?", method!(Isolate::disposed, 0))?;
 

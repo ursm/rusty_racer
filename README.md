@@ -217,7 +217,8 @@ warm isolate — a per-visit reset that avoids rebuilding the VM. Its contract:
   (or to an empty realm, with no snapshot).
 - **Runtime mutations are dropped.** Anything set on the realm at runtime is gone.
 - **Host fns are dropped.** Functions `attach`/`attach_many`'d into the realm are
-  released (their GC roots freed); re-attach them after a reset.
+  released — the isolate stops holding them, so whatever they captured becomes
+  collectable; re-attach them after a reset.
 - **Modules and classic scripts are dropped.** Handles compiled in the realm die
   with the old context.
 - **The realm id and the shared same-origin token are preserved** — the id keeps

@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "minitest/autorun"
+require "timeout"
 require "rusty_racer"
 
 # The probe suite cibuildgem runs natively on each platform — proving the
@@ -496,6 +497,51 @@ class RustyRacerTest < Minitest::Test
     assert_nil iso.low_memory_notification
     # The isolate is still fully usable after a forced GC.
     assert_equal 3, ctx.eval('1 + 2')
+  end
+
+  def test_pump_message_loop_runs_finalization_registry_callbacks
+    iso = RustyRacer::Isolate.new
+    ctx = iso.context
+    # A FinalizationRegistry callback is a deferred PLATFORM task: V8 posts it after a GC finds a
+    # registered target dead, and it runs only when the message loop is pumped — a microtask checkpoint
+    # does NOT run it. Register a target, drop it, GC, and pump: the callback must fire.
+    ctx.eval(<<~JS)
+      globalThis.fires = 0;
+      globalThis.reg = new FinalizationRegistry(() => { globalThis.fires++; });
+      (function () { let o = {}; globalThis.reg.register(o, 1); o = null; })();
+    JS
+    fired = false
+    10.times do
+      iso.low_memory_notification
+      iso.pump_message_loop
+      break if (fired = ctx.eval('globalThis.fires') >= 1)
+    end
+    assert fired, 'FinalizationRegistry callback never ran after GC + pump_message_loop'
+    assert_equal 3, ctx.eval('1 + 2') # isolate still usable
+  end
+
+  def test_pump_message_loop_is_a_noop_when_idle
+    iso = RustyRacer::Isolate.new
+    # No pending tasks: pumping must not block and must leave the isolate usable.
+    assert_nil iso.pump_message_loop
+    assert_equal 4, iso.context.eval('2 + 2')
+  end
+
+  def test_pump_message_loop_time_caps_a_runaway_cleanup_callback
+    iso = RustyRacer::Isolate.new(timeout_ms: 50)
+    ctx = iso.context
+    # A FinalizationRegistry cleanup callback is arbitrary user JS, run during the pump. A runaway one
+    # must be time-capped and terminable like every other JS entrypoint — not hang the owner thread.
+    ctx.eval(<<~JS)
+      globalThis.reg = new FinalizationRegistry(() => { for (;;) {} });
+      (function () { let o = {}; globalThis.reg.register(o, 1); o = null; })();
+    JS
+    iso.low_memory_notification # post the cleanup task
+    # A Ruby-side timeout is only a backstop: a correct watchdog raises well within it.
+    Timeout.timeout(10) do
+      assert_raises(RustyRacer::ScriptTerminatedError) { iso.pump_message_loop }
+    end
+    assert_equal 2, ctx.eval('1 + 1') # isolate still usable after the terminate
   end
 
   def test_context_reset_does_not_leak_native_contexts
@@ -2334,6 +2380,38 @@ class RustyRacerTest < Minitest::Test
     refute ref.weakref_alive?, 'dispose left the attached proc (and its captures) GC-rooted'
   end
 
+  # An isolate that is merely DROPPED — never disposed — must be collectable, and with it
+  # everything its attached host fns close over. GC-ROOTING the procs made that impossible:
+  # a host fn reaches its embedder's world, and that world reaches back to this isolate's
+  # own wrappers, so the root pinned the whole cycle for the life of the process (one
+  # un-disposable isolate, and its V8 heap, per embedder session). Marked from the wrappers
+  # instead, the cycle is ordinary garbage. Built on the OWNER thread (this one), because an
+  # isolate whose last wrapper drops on another thread cannot be disposed and is counted
+  # leaked by design.
+  def test_dropping_an_isolate_releases_it_and_its_attached_procs
+    # Drain first: this sweep also reaps whatever earlier tests dropped (which before
+    # this was impossible), and the count has to be exact to mean anything. Some of
+    # those arrive as LEAKED — the thread-kill and buffer-transfer tests build isolates
+    # on threads that are gone by then, and V8 forbids disposing one off its owner
+    # thread — which is why `leaked_before` is a snapshot and not a zero.
+    3.times { GC.start }
+    live_before   = RustyRacer.live_isolate_count
+    leaked_before = RustyRacer.leaked_isolate_count
+    # Built inside a FIBER that has finished by the time GC runs: still this thread (the
+    # owner), but on a stack that is gone, so no conservative-scan residue of the isolates
+    # or their captures is left for the collector to find (one stale slot on the test
+    # thread's own stack kept a capture alive on arm64 Ruby 3.3).
+    refs = Fiber.new { Array.new(3) { attached_isolate_capture } }.resume
+    3.times { GC.start }
+    assert_equal 0, refs.count(&:weakref_alive?),
+                 'a dropped isolate kept its attached proc (and its captures) alive'
+    # …and collecting them DISPOSED them: every isolate this test built is gone from
+    # the registry, and none of them was counted as un-disposable.
+    assert_equal live_before, RustyRacer.live_isolate_count,
+                 'a dropped isolate was collected but never disposed'
+    assert_equal leaked_before, RustyRacer.leaked_isolate_count
+  end
+
   def test_deep_caller_js_overflow_throws_not_fatal
     # In-thread V8 runs on the Ruby thread's stack, so the V8 stack limit must be
     # reset to the current native stack each op. If it stayed fixed at a shallow
@@ -2946,8 +3024,9 @@ class RustyRacerTest < Minitest::Test
 
   def test_attached_proc_survives_gc_compact
     skip 'GC.compact unavailable' unless GC.respond_to?(:compact)
-    # rooting pins the proc, so compaction cannot move it out from under the
-    # raw VALUE copies the extension holds
+    # the wrappers' mark PINS the proc, so compaction cannot move it out from
+    # under the raw VALUE copies the extension holds (an Array — where the procs
+    # live — marks its own elements movable, which alone would not be enough)
     @ctx.attach('f', -> { 'alive' })
     assert_equal 'alive', @ctx.eval('f()')
     GC.compact
@@ -3310,22 +3389,35 @@ class RustyRacerTest < Minitest::Test
     InlineRun.new(false, e)
   end
 
-  # Run an isolate's whole lifecycle — create, attach a proc capturing a fresh
-  # object, then |op| (which must release the proc's GC root) — entirely on ONE
-  # throwaway thread (the isolate's owner; the isolate is thread-confined, so the
-  # op MUST run on its creating thread). Doing it off the test thread leaves no
-  # conservative stack residue here, so a still-alive WeakRef afterwards means a
-  # genuine leaked root, not a stale stack slot. Returns the WeakRef.
-  def capture_released_by(&op)
+  # One isolate's whole lifecycle — create, attach a proc capturing a fresh object,
+  # use it, then |op| (nothing, or whatever is meant to release the proc). Returns a
+  # WeakRef to the captured object; a method, so its locals die with the frame.
+  def attached_isolate_capture
     require 'weakref'
+    iso = RustyRacer::Isolate.new
+    ctx = iso.context
+    captured = Object.new
+    ctx.attach('f', proc { captured.object_id })
+    ctx.eval('f()')
+    ref = WeakRef.new(captured)
+    yield(iso, ctx) if block_given?
+    ref
+  end
+
+  # The same lifecycle run entirely on ONE throwaway thread (the isolate's owner; it
+  # is thread-confined, so the op MUST run on its creating thread). Doing it off the
+  # test thread leaves no conservative stack residue here, so a still-alive WeakRef
+  # afterwards means a genuine leaked root, not a stale stack slot. Returns the WeakRef.
+  def capture_released_by(&op)
     Thread.new {
-      iso = RustyRacer::Isolate.new
-      ctx = iso.context
-      captured = Object.new
-      ctx.attach('f', proc { captured.object_id })
-      ref = WeakRef.new(captured)
-      op.call(iso, ctx)
-      ref
+      attached_isolate_capture {|iso, ctx|
+        op.call(iso, ctx)
+        # Dispose on the way out: this thread IS the isolate's owner, and once it ends
+        # nothing can dispose the isolate ever again (V8 forbids it from another
+        # thread), so the suite would end with one un-disposable isolate per call —
+        # and `leaked_isolate_count` is something other tests assert on.
+        iso.dispose
+      }
     }.value
   end
 end

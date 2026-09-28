@@ -184,6 +184,13 @@ pub(crate) enum Request {
     // near-heap-limit callback, and tells reclaimable garbage apart from a real
     // leak (memory that survives this is genuinely retained).
     LowMemoryNotification,
+    // Run pending foreground platform tasks (Platform::PumpMessageLoop) without blocking —
+    // the deferred work V8 posts to its task runner rather than running inline, most
+    // importantly FinalizationRegistry cleanup callbacks (arbitrary JS, so time-capped by
+    // timeout_ms). Realm-independent.
+    PumpMessageLoop {
+        timeout_ms: u64,
+    },
 }
 
 // compile_module result: the module's id plus any produced bytecode cache and
@@ -439,7 +446,8 @@ fn request_realm(state: &IsolateState, request: &Request) -> Option<i32> {
         | Request::ScriptCodeCache { .. }
         | Request::ModuleCodeCache { .. }
         | Request::HeapStatistics
-        | Request::LowMemoryNotification => None,
+        | Request::LowMemoryNotification
+        | Request::PumpMessageLoop { .. } => None,
     }
 }
 
@@ -544,6 +552,7 @@ fn dispatch_one(
         Request::ModuleCodeCache { module_id } => op_module_code_cache(scope, module_id),
         Request::HeapStatistics => op_heap_statistics(scope),
         Request::LowMemoryNotification => op_low_memory_notification(scope),
+        Request::PumpMessageLoop { timeout_ms } => op_pump_message_loop(scope, timeout_ms),
     }
 }
 
@@ -569,6 +578,38 @@ fn op_heap_statistics(scope: &mut v8::PinScope<'_, '_, ()>) -> VmReply {
 fn op_low_memory_notification(scope: &mut v8::PinScope<'_, '_, ()>) -> VmReply {
     scope.low_memory_notification();
     VmReply::Done(Ok(JsVal::Undefined))
+}
+
+// Drain the platform's foreground task queue: run every pending task, then stop (never blocks
+// waiting for work). This is what actually fires FinalizationRegistry cleanup callbacks — V8
+// posts them here after a GC finds a registered target dead, and PerformMicrotaskCheckpoint does
+// NOT run them. Runs on the isolate's owner thread, with the isolate entered (the cleanup task
+// enters the target's realm itself). A no-op when the platform is uninitialized or the queue empty.
+//
+// A cleanup callback is ARBITRARY user JS, so it gets the same bracket every other JS-running op has:
+// a watchdog time-caps a runaway (`while(true){}`) callback and makes it terminable, and the
+// `pump_message_loop(…, false)` loop stays bounded because a fired terminate blocks further JS. After
+// the tasks run, a microtask checkpoint drains any microtasks they queued (a promise reaction), so
+// cleanup-triggered continuations settle in this op — matching the binding's auto-microtask model.
+fn op_pump_message_loop(scope: &mut v8::PinScope<'_, '_, ()>, timeout_ms: u64) -> VmReply {
+    let watchdog = arm_watchdog(scope, timeout_ms);
+    if let Some(platform) = crate::platform() {
+        while v8::Platform::pump_message_loop(platform, scope, false) {}
+    }
+    if let Some(ctx) = context_for(istate!(scope), 0) {
+        let context = v8::Local::new(scope, &ctx);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        checkpoint_draining(scope);
+    }
+    let fired = disarm_watchdog(scope, watchdog);
+    if fired {
+        istate!(scope).watchdog_fired = true;
+    }
+    VmReply::Done(if fired {
+        Err(VmError::Terminated)
+    } else {
+        Ok(JsVal::Undefined)
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -775,7 +816,7 @@ fn op_reset(scope: &mut v8::PinScope<'_, '_, ()>, context_id: i32) -> VmReply {
             "cannot reset a realm while a request for it is suspended on the V8 stack".into(),
         )))
     } else {
-        let (fresh, fresh_queue) = new_realm(scope);
+        let (fresh, fresh_queue) = new_realm(scope, context_id);
         {
             let realms = &mut istate!(scope).realms;
             // Swap in the fresh realm and PARK the old context + queue in
@@ -812,7 +853,7 @@ fn op_create_context(scope: &mut v8::PinScope<'_, '_, ()>) -> VmReply {
         realms.next_context_id += 1;
         id
     };
-    let (fresh, fresh_queue) = new_realm(scope);
+    let (fresh, fresh_queue) = new_realm(scope, id);
     istate!(scope).realms.contexts.insert(id, fresh);
     istate!(scope).realms.queues.insert(id, fresh_queue);
     VmReply::Done(Ok(JsVal::Int(id as i64)))

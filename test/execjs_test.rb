@@ -84,7 +84,7 @@ class ExecJSTest < Minitest::Test
 
     define_method("test_stringify_value_#{i}") do
       context = @runtime.compile('function json(obj) { return JSON.stringify(obj); }')
-      assert_value JSON.generate(value, quirks_mode: true), context.call('json', value)
+      assert_value JSON.generate(value), context.call('json', value)
     end
   end
 

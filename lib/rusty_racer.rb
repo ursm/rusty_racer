@@ -14,10 +14,18 @@ require_relative "rusty_racer/version"
 # flat fallback.
 versioned = "rusty_racer/#{RUBY_VERSION[/\d+\.\d+/]}/rusty_racer"
 
-if File.exist?(File.join(__dir__, "#{versioned}.#{RbConfig::CONFIG['DLEXT']}"))
-  require_relative versioned
-else
-  require "rusty_racer/rusty_racer"
+# Skip the native load when an embedder has already defined the classes. Linking
+# rusty_racer as a library into another extension's cdylib (e.g.
+# capybara-simulated, which bundles rusty_racer + its native DOM) calls
+# install_classes from that extension's own init; loading this gem's separate .so
+# on top would put a SECOND V8 runtime in the process (unsound). This file is then
+# required only for the pure-Ruby API wrappers below.
+unless defined?(RustyRacer::Isolate)
+  if File.exist?(File.join(__dir__, "#{versioned}.#{RbConfig::CONFIG['DLEXT']}"))
+    require_relative versioned
+  else
+    require "rusty_racer/rusty_racer"
+  end
 end
 
 module RustyRacer
@@ -99,10 +107,11 @@ module RustyRacer
     # the binding's job (V8's host contract), and static imports met while linking
     # resolve through this same block (also with the realm as the 3rd arg).
     # (Module#instantiate's own resolve block keeps its 2-arg form.)
-    # Held in an ivar so the proc stays alive for the isolate's lifetime (the
-    # native side only keeps a weak handle).
+    # The native side keeps the proc alive itself (in the isolate's roots array,
+    # marked by its wrappers), so it is NOT held in an ivar here: that second
+    # reference would outlive `dispose`, which exists to drop whatever the resolver
+    # captured the moment the isolate can no longer call it.
     def dynamic_import_resolver=(resolver)
-      @dynamic_import_resolver = resolver
       _set_dynamic_import_resolver(resolver)
     end
   end
