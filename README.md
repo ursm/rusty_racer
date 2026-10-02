@@ -203,6 +203,12 @@ Also available:
   `microtasks: :auto` also drains at the end of each outermost eval/call/evaluate;
   `microtasks: :explicit` leaves it fully manual. There is no event loop or timers
   either way.
+- **`Isolate#pump_message_loop`** — runs the tasks V8 posts instead of running
+  inline, most visibly `FinalizationRegistry` cleanup callbacks: a microtask
+  checkpoint never runs them, so without a pump a collected target's callback
+  never fires. It drains every pending task without blocking, then a microtask
+  checkpoint; with nothing pending it is a no-op. The callbacks are ordinary JS,
+  so the pump is capped by `timeout_ms` like an `eval`.
 - **`Isolate#terminate`**, **`Isolate#dynamic_import_resolver=`**,
   **`Context#reset`** (below), and **`Platform.set_flags!`**.
 
