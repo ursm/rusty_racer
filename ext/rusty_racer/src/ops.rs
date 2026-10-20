@@ -240,30 +240,15 @@ pub(crate) fn run_source(
     // Compile and run as distinct phases so a compile failure maps to
     // ParseError and a thrown exception to RuntimeError (csim rescues both).
     let Some(code) = v8::String::new(tc, source) else {
-        return Err(VmError::Parse("source too large".into()));
+        return Err(VmError::Parse("source too large".into(), None));
     };
     let origin = script_origin(tc, filename);
     let script = match v8::Script::compile(tc, code, Some(&origin)) {
         Some(script) => script,
         None if tc.has_terminated() => return Err(VmError::Terminated),
         None => {
-            let msg = tc
-                .exception()
-                .map(|e| e.to_rust_string_lossy(tc))
-                .unwrap_or_else(|| "parse error".to_string());
-            // Append the location V8 recorded; always name the file, add the
-            // line when V8 reports one.
-            let message = tc.message();
-            let res = message
-                .and_then(|m| m.get_script_resource_name(tc))
-                .filter(|v| v.is_string())
-                .map(|v| v.to_rust_string_lossy(tc))
-                .unwrap_or_else(|| filename.to_string());
-            let loc = match message.and_then(|m| m.get_line_number(tc)) {
-                Some(line) => format!(" at {res}:{line}"),
-                None => format!(" at {res}"),
-            };
-            return Err(VmError::Parse(format!("{msg}{loc}")));
+            let (exc, message) = (tc.exception(), tc.message());
+            return Err(parse_error(tc, exc, message, filename, "parse error"));
         }
     };
     match script.run(tc) {
@@ -957,21 +942,14 @@ fn op_compile_module(
                         // A module compile failure is a parse error
                         // (compile-time), not a thrown exception.
                         None => {
-                            let msg = tc
-                                .exception()
-                                .map(|e| e.to_rust_string_lossy(tc))
-                                .unwrap_or_else(|| "module parse error".to_string());
-                            let message = tc.message();
-                            let res = message
-                                .and_then(|m| m.get_script_resource_name(tc))
-                                .filter(|v| v.is_string())
-                                .map(|v| v.to_rust_string_lossy(tc))
-                                .unwrap_or_else(|| filename.clone());
-                            let loc = match message.and_then(|m| m.get_line_number(tc)) {
-                                Some(line) => format!(" at {res}:{line}"),
-                                None => format!(" at {res}"),
-                            };
-                            Err(VmError::Parse(format!("{msg}{loc}")))
+                            let (exc, message) = (tc.exception(), tc.message());
+                            Err(parse_error(
+                                tc,
+                                exc,
+                                message,
+                                &filename,
+                                "module parse error",
+                            ))
                         }
                     }
                 }
@@ -1013,10 +991,9 @@ fn op_instantiate_module(scope: &mut v8::PinScope<'_, '_, ()>, module_id: i32) -
                         | v8::ModuleStatus::Evaluated => Ok(JsVal::Undefined),
                         // V8 CHECK-aborts on instantiating an errored
                         // module; surface its exception instead.
-                        v8::ModuleStatus::Errored => Err(VmError::JsError {
-                            message: module.get_exception().to_rust_string_lossy(scope),
-                            backtrace: vec![],
-                        }),
+                        v8::ModuleStatus::Errored => {
+                            Err(rejected_with(scope, module.get_exception()))
+                        }
                         _ => {
                             v8::tc_scope!(let tc, scope);
                             match module.instantiate_module(tc, resolve_imported) {
@@ -1084,10 +1061,9 @@ fn op_evaluate_module(
                         // module that isn't exactly Instantiated, so guard
                         // status explicitly rather than crash.
                         let out = match module.get_status() {
-                            v8::ModuleStatus::Errored => Err(VmError::JsError {
-                                message: module.get_exception().to_rust_string_lossy(scope),
-                                backtrace: vec![],
-                            }),
+                            v8::ModuleStatus::Errored => {
+                                Err(rejected_with(scope, module.get_exception()))
+                            }
                             v8::ModuleStatus::Evaluated => Ok(JsVal::Undefined),
                             v8::ModuleStatus::Instantiated => {
                                 did_eval = true;
@@ -1101,10 +1077,7 @@ fn op_evaluate_module(
                                         match v8::Local::<v8::Promise>::try_from(value) {
                                             Ok(p) if p.state() == v8::PromiseState::Rejected => {
                                                 let reason = p.result(tc);
-                                                Err(VmError::JsError {
-                                                    message: reason.to_rust_string_lossy(tc),
-                                                    backtrace: vec![],
-                                                })
+                                                Err(rejected_with(tc, reason))
                                             }
                                             Ok(p) => {
                                                 eval_promise = Some(v8::Global::new(tc, p));
@@ -1132,10 +1105,7 @@ fn op_evaluate_module(
                             let p = v8::Local::new(scope, &g);
                             if p.state() == v8::PromiseState::Rejected {
                                 let reason = p.result(scope);
-                                Err(VmError::JsError {
-                                    message: reason.to_rust_string_lossy(scope),
-                                    backtrace: vec![],
-                                })
+                                Err(rejected_with(scope, reason))
                             } else {
                                 out
                             }
@@ -1179,10 +1149,7 @@ fn op_module_namespace(scope: &mut v8::PinScope<'_, '_, ()>, module_id: i32) -> 
                 // never initialized — and the useful answer is WHY it errored,
                 // the same one instantiate and evaluate give.
                 if module.get_status() == v8::ModuleStatus::Errored {
-                    Err(VmError::JsError {
-                        message: module.get_exception().to_rust_string_lossy(scope),
-                        backtrace: vec![],
-                    })
+                    Err(rejected_with(scope, module.get_exception()))
                 } else {
                     match require_instantiated(module, "namespace") {
                         Err(e) => Err(e),
@@ -1306,21 +1273,14 @@ fn op_compile_script(
                         None if tc.has_terminated() => Err(VmError::Terminated),
                         // Compile failure = a parse error (with location).
                         None => {
-                            let msg = tc
-                                .exception()
-                                .map(|e| e.to_rust_string_lossy(tc))
-                                .unwrap_or_else(|| "script parse error".to_string());
-                            let message = tc.message();
-                            let res = message
-                                .and_then(|m| m.get_script_resource_name(tc))
-                                .filter(|v| v.is_string())
-                                .map(|v| v.to_rust_string_lossy(tc))
-                                .unwrap_or_else(|| filename.clone());
-                            let loc = match message.and_then(|m| m.get_line_number(tc)) {
-                                Some(line) => format!(" at {res}:{line}"),
-                                None => format!(" at {res}"),
-                            };
-                            Err(VmError::Parse(format!("{msg}{loc}")))
+                            let (exc, message) = (tc.exception(), tc.message());
+                            Err(parse_error(
+                                tc,
+                                exc,
+                                message,
+                                &filename,
+                                "script parse error",
+                            ))
                         }
                     }
                 }

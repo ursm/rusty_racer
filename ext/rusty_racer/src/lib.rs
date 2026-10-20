@@ -221,13 +221,18 @@ fn err_class(ruby: &Ruby, name: &str) -> ExceptionClass {
 
 #[derive(Debug)]
 enum VmError {
-    Parse(String),   // compile-time failure -> RustyRacer::ParseError
+    // compile-time failure -> RustyRacer::ParseError; the SyntaxError V8 made of
+    // it kept as for a JsError (`keep_thrown`)
+    Parse(String, Option<u64>),
     Runtime(String), // internal failure (no JS stack) -> RustyRacer::RuntimeError
     // A thrown JS exception: its message plus the JS stack frames, which become
-    // the Ruby exception's backtrace -> RustyRacer::RuntimeError.
+    // the Ruby exception's backtrace -> RustyRacer::RuntimeError — and the value
+    // thrown, kept (`keep_thrown`), so a host fn the error propagates out of
+    // throws it on.
     JsError {
         message: String,
         backtrace: Vec<String>,
+        thrown: Option<u64>,
     },
     Terminated,  // watchdog/stop -> RustyRacer::ScriptTerminatedError
     OutOfMemory, // memory_limit hit -> RustyRacer::V8OutOfMemoryError
@@ -574,20 +579,22 @@ fn host_fn_callback(
         return;
     }
     let core = unsafe { &*core_ptr };
-    let result: Result<JsVal, String> = with_gvl(core, RubyCall::HostFn(host_fn_id), || {
+    let result: Result<JsVal, HostFnFailure> = with_gvl(core, RubyCall::HostFn(host_fn_id), || {
         let ruby = Ruby::get().unwrap();
         // rb_protect so a Ruby exception raised during arg/return marshalling
         // (ary_new_capa / jsval_to_ruby / ruby_to_jsval can raise on OOM etc.)
         // is CAUGHT here instead of longjmp-ing through V8's C++ frames. The
         // proc's own raise is already a magnus Err; this covers the rest.
         use magnus::rb_sys::AsRawValue;
-        let mut out: Option<Result<JsVal, String>> = None;
+        let mut out: Option<Result<JsVal, HostFnFailure>> = None;
         match magnus::rb_sys::protect(|| {
             out = Some(core.call_proc(&ruby, host_fn_id, &js_args));
             ruby.qnil().as_raw()
         }) {
-            Ok(_) => out.unwrap_or_else(|| Err("host function did not complete".into())),
-            Err(e) => Err(format!("{e}")),
+            Ok(_) => {
+                out.unwrap_or_else(|| Err("host function did not complete".to_string().into()))
+            }
+            Err(e) => Err(format!("{e}").into()),
         }
     });
     match result {
@@ -595,8 +602,30 @@ fn host_fn_callback(
             let v = jsval_to_js(scope, val);
             rv.set(v);
         }
-        // The proc raised (or marshalling failed): surface as a JS exception.
-        Err(message) => throw_js_error(scope, &message),
+        // The proc raised (or marshalling failed): surface as a JS exception —
+        // the value JS threw, where the error is one a JS throw became.
+        Err(failure) => match failure.thrown.and_then(|serial| take_thrown(scope, serial)) {
+            Some(thrown) => {
+                scope.throw_exception(thrown);
+            }
+            None => throw_js_error(scope, &failure.message),
+        },
+    }
+}
+
+// How a host fn failed: the Ruby error's text, and the serial of the JS value
+// it carries when a JS throw is what it became (`keep_thrown`).
+struct HostFnFailure {
+    message: String,
+    thrown: Option<u64>,
+}
+
+impl From<String> for HostFnFailure {
+    fn from(message: String) -> Self {
+        HostFnFailure {
+            message,
+            thrown: None,
+        }
     }
 }
 
@@ -696,7 +725,82 @@ fn capture_js_error(
     let backtrace = stack_str
         .map(|s| parse_js_stack(s.as_str()))
         .unwrap_or_default();
-    VmError::JsError { message, backtrace }
+    let thrown = keep_thrown(scope, exception);
+    VmError::JsError {
+        message,
+        backtrace,
+        thrown,
+    }
+}
+
+// A value JS failed with that no TryCatch caught — an errored module's
+// exception, a rejected promise's reason — as a JsError: its text, no stack
+// frames, and the value kept as a thrown one is.
+fn rejected_with(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) -> VmError {
+    VmError::JsError {
+        message: value.to_rust_string_lossy(scope),
+        backtrace: vec![],
+        thrown: keep_thrown(scope, Some(value)),
+    }
+}
+
+// A compile failure as a ParseError: V8's message, the location it recorded
+// (always the file, the line when it has one), and the SyntaxError kept as a
+// thrown value is.
+fn parse_error(
+    scope: &mut v8::PinScope<'_, '_>,
+    exception: Option<v8::Local<v8::Value>>,
+    message: Option<v8::Local<v8::Message>>,
+    filename: &str,
+    fallback: &str,
+) -> VmError {
+    let msg = exception
+        .map(|e| e.to_rust_string_lossy(scope))
+        .unwrap_or_else(|| fallback.to_string());
+    let res = message
+        .and_then(|m| m.get_script_resource_name(scope))
+        .filter(|v| v.is_string())
+        .map(|v| v.to_rust_string_lossy(scope))
+        .unwrap_or_else(|| filename.to_string());
+    let loc = match message.and_then(|m| m.get_line_number(scope)) {
+        Some(line) => format!(" at {res}:{line}"),
+        None => format!(" at {res}"),
+    };
+    VmError::Parse(format!("{msg}{loc}"), keep_thrown(scope, exception))
+}
+
+// Keep the value JS threw, so a host fn that lets the Ruby error it became
+// propagate throws THAT value on — its identity, class and stack — rather than a
+// fresh Error made of its text: a script a host fn ran for JS fails in JS as the
+// script did. One slot per isolate, since only the latest thrown value can still
+// be on its way back out; the serial (carried by the Ruby exception, see
+// `vm_err`) tells it from a stale one. None on an isolate with no state (the
+// snapshot creator's), where no host fn can ask.
+fn keep_thrown(
+    scope: &mut v8::PinScope<'_, '_>,
+    exception: Option<v8::Local<v8::Value>>,
+) -> Option<u64> {
+    let exception = exception?;
+    let kept = v8::Global::new(scope, exception);
+    let state = scope.get_slot_mut::<IsolateState>()?;
+    state.thrown_serial += 1;
+    state.thrown = Some((state.thrown_serial, kept));
+    Some(state.thrown_serial)
+}
+
+// The Ruby exception's kept thrown value (`keep_thrown`), when it still is the
+// latest: taken, as it is thrown once.
+fn take_thrown<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    serial: u64,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let state = scope.get_slot_mut::<IsolateState>()?;
+    let (kept_serial, _) = state.thrown.as_ref()?;
+    if *kept_serial != serial {
+        return None;
+    }
+    let (_, kept) = state.thrown.take()?;
+    Some(v8::Local::new(scope, kept))
 }
 
 // ---------------------------------------------------------------------------
@@ -864,6 +968,9 @@ struct IsolateState {
     // the ScriptTerminatedError can name what was running. Taken (cleared) when the
     // terminated op's error is built; None for any non-timeout outcome.
     timeout_backtrace: Option<Vec<String>>,
+    // The latest value JS threw out of an op, with its serial (`keep_thrown`).
+    thrown: Option<(u64, v8::Global<v8::Value>)>,
+    thrown_serial: u64,
 }
 
 impl IsolateState {
@@ -888,6 +995,8 @@ impl IsolateState {
             oom_fired: false,
             oom_initial_limit: 0,
             timeout_backtrace: None,
+            thrown: None,
+            thrown_serial: 0,
         }
     }
 }
@@ -2257,7 +2366,7 @@ fn build_snapshot(code: &str, base: Option<Vec<u8>>, warmup: bool) -> Result<Vec
                 )
             {
                 err = Some(match e {
-                    VmError::Parse(m) | VmError::Runtime(m) => m,
+                    VmError::Parse(m, _) | VmError::Runtime(m) => m,
                     VmError::JsError { message, .. } => message,
                     VmError::Terminated => "snapshot code was terminated".to_string(),
                     // Unreachable: the snapshot-creator is a separate isolate
@@ -2741,7 +2850,12 @@ impl Core {
         }
     }
 
-    fn call_proc(&self, ruby: &Ruby, host_fn_id: usize, args: &[JsVal]) -> Result<JsVal, String> {
+    fn call_proc(
+        &self,
+        ruby: &Ruby,
+        host_fn_id: usize,
+        args: &[JsVal],
+    ) -> Result<JsVal, HostFnFailure> {
         // Straight from the roots array — a released (or never-attached) id reads
         // back nil, which is the same "unknown host function" the slot table would
         // have reported, so the hot path takes no lock at all. `root_proc` and not
@@ -2749,7 +2863,7 @@ impl Core {
         // never dispatch `to_proc` and raise.
         let proc = self
             .root_proc(proc_root_index(host_fn_id))
-            .ok_or("unknown host function")?;
+            .ok_or_else(|| "unknown host function".to_string())?;
         // Marshal into a Ruby Array, NOT a Vec<Value>: bare Values in a heap Vec
         // are hidden from Ruby's GC mark phase (magnus's own RArray::to_vec doc
         // spells this out). With several args, once arg N is parked in the Vec
@@ -2769,8 +2883,11 @@ impl Core {
         // op the proc issues re-enters Core::run (depth > 0) directly — no nested
         // frame bookkeeping is needed any more (the call stack IS the nesting).
         let result: Result<Value, Error> = proc.call(unsafe { ruby_args.as_slice() });
-        let value = result.map_err(|e| e.to_string())?;
-        ruby_to_jsval(value).map_err(|e| e.to_string())
+        let value = result.map_err(|e| HostFnFailure {
+            message: e.to_string(),
+            thrown: thrown_serial_of(&e),
+        })?;
+        ruby_to_jsval(value).map_err(|e| e.to_string().into())
     }
 
     // Context#call (and call_void). Resolves a dotted function path
@@ -3808,9 +3925,15 @@ fn binary_bytes(
 
 fn vm_err(ruby: &Ruby, e: VmError) -> Error {
     match e {
-        VmError::Parse(m) => Error::new(err_class(ruby, "ParseError"), m),
+        VmError::Parse(m, thrown) => {
+            carrying_thrown(Error::new(err_class(ruby, "ParseError"), m), thrown)
+        }
         VmError::Runtime(m) => Error::new(err_class(ruby, "RuntimeError"), m),
-        VmError::JsError { message, backtrace } => js_runtime_error(ruby, message, backtrace),
+        VmError::JsError {
+            message,
+            backtrace,
+            thrown,
+        } => carrying_thrown(js_runtime_error(ruby, message, backtrace), thrown),
         VmError::Terminated => Error::new(
             err_class(ruby, "ScriptTerminatedError"),
             "JavaScript was terminated (timeout or stop)",
@@ -3850,6 +3973,32 @@ fn terminated_error(ruby: &Ruby, js_backtrace: Option<Vec<String>>) -> Error {
         Some(e) => Error::from(e),
         None => Error::new(class, message),
     }
+}
+
+// The ivar a Ruby exception carries its thrown value's serial in (`keep_thrown`).
+const THROWN_IVAR: &str = "@__rusty_racer_thrown";
+
+// |error| as an instance carrying |thrown|'s serial, for a host fn it propagates
+// out of to throw the kept value on (`take_thrown`).
+fn carrying_thrown(error: Error, thrown: Option<u64>) -> Error {
+    let Some(serial) = thrown else {
+        return error;
+    };
+    match error_to_exception(&error) {
+        Some(exc) => {
+            let _ = exc.funcall::<_, _, Value>("instance_variable_set", (THROWN_IVAR, serial));
+            Error::from(exc)
+        }
+        None => error,
+    }
+}
+
+// The serial of the thrown value a host fn's raised |error| carries, if any.
+fn thrown_serial_of(error: &Error) -> Option<u64> {
+    let exc = error_to_exception(error)?;
+    exc.funcall::<_, _, Option<u64>>("instance_variable_get", (THROWN_IVAR,))
+        .ok()
+        .flatten()
 }
 
 // Build a RustyRacer::RuntimeError carrying the JS stack as its Ruby backtrace.

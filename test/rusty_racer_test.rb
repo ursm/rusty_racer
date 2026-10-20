@@ -905,6 +905,45 @@ class RustyRacerTest < Minitest::Test
     assert_equal "ruby-saw-it", @ctx.eval("globalThis.captured")
   end
 
+  # A host fn that lets the error a JS throw became propagate throws THAT value on — the one its script threw, not a
+  # fresh Error made of its text — so the JS that called it catches what was thrown.
+  def test_a_host_fn_rethrows_the_value_its_script_threw
+    @ctx.attach('runIt', proc {|src| @ctx.eval(src) })
+    assert_equal [true, 'boom'], @ctx.eval(<<~JS)
+      const thrown = new RangeError('boom');
+      globalThis.thrown = thrown;
+      try { runIt('throw globalThis.thrown'); } catch (e) { [e === thrown, e.message]; }
+    JS
+    assert_equal 42, @ctx.eval("try { runIt('throw 42') } catch (e) { e }")
+    assert_equal true, @ctx.eval("try { runIt('var = ;') } catch (e) { e instanceof SyntaxError }")
+  end
+
+  def test_a_host_fn_raising_its_own_error_throws_an_error_of_its_text
+    @ctx.attach('runIt', proc {|src|
+      begin
+        @ctx.eval(src)
+      rescue RustyRacer::RuntimeError
+        raise 'replaced'
+      end
+    })
+    assert_equal 'replaced', @ctx.eval("try { runIt('throw 42') } catch (e) { e.message }")
+    # …and an error kept from an EARLIER throw is not the latest one's to stand for
+    @ctx.attach('stale', proc {
+      @kept ||= begin
+        @ctx.eval('throw 1')
+      rescue RustyRacer::RuntimeError => e
+        e
+      end
+      begin
+        @ctx.eval('throw 2')
+      rescue RustyRacer::RuntimeError
+        nil
+      end
+      raise @kept
+    })
+    assert_equal 'Error', @ctx.eval('try { stale() } catch (e) { e.constructor.name }')
+  end
+
   def test_attach_does_not_clobber_primitive_global
     @ctx.eval("globalThis.x = 42")
     assert_raises(RustyRacer::RuntimeError) { @ctx.attach("x.y", proc { 1 }) }
