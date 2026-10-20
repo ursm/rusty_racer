@@ -59,7 +59,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once, Weak};
 
 use magnus::block::Proc;
@@ -773,19 +773,24 @@ fn parse_error(
 // propagate throws THAT value on — its identity, class and stack — rather than a
 // fresh Error made of its text: a script a host fn ran for JS fails in JS as the
 // script did. One slot per isolate, since only the latest thrown value can still
-// be on its way back out; the serial (carried by the Ruby exception, see
-// `vm_err`) tells it from a stale one. None on an isolate with no state (the
-// snapshot creator's), where no host fn can ask.
+// be on its way back out, and only until the outermost op returns (`Core::run`),
+// since only a host fn inside it can still ask — kept longer, it would pin the
+// value, and its realm, for as long as nothing else threw. The serial (carried
+// by the Ruby exception, see `carrying_thrown`) tells it from a stale one, and is
+// drawn process-wide, so an error another isolate's op raised never matches this
+// one's slot: its value cannot cross isolates. None on an isolate with no state
+// (the snapshot creator's), where no host fn can ask.
 fn keep_thrown(
     scope: &mut v8::PinScope<'_, '_>,
     exception: Option<v8::Local<v8::Value>>,
 ) -> Option<u64> {
+    static SERIAL: AtomicU64 = AtomicU64::new(0);
     let exception = exception?;
     let kept = v8::Global::new(scope, exception);
     let state = scope.get_slot_mut::<IsolateState>()?;
-    state.thrown_serial += 1;
-    state.thrown = Some((state.thrown_serial, kept));
-    Some(state.thrown_serial)
+    let serial = SERIAL.fetch_add(1, Ordering::Relaxed) + 1;
+    state.thrown = Some((serial, kept));
+    Some(serial)
 }
 
 // The Ruby exception's kept thrown value (`keep_thrown`), when it still is the
@@ -970,7 +975,6 @@ struct IsolateState {
     timeout_backtrace: Option<Vec<String>>,
     // The latest value JS threw out of an op, with its serial (`keep_thrown`).
     thrown: Option<(u64, v8::Global<v8::Value>)>,
-    thrown_serial: u64,
 }
 
 impl IsolateState {
@@ -996,7 +1000,6 @@ impl IsolateState {
             oom_initial_limit: 0,
             timeout_backtrace: None,
             thrown: None,
-            thrown_serial: 0,
         }
     }
 }
@@ -1082,7 +1085,7 @@ fn transfer_registry() -> &'static Mutex<HashMap<u64, SendBackingStore>> {
 // Monotonic token source. Starts at 1 so 0 is free as the JS-side "not
 // transferable — fall back to a copy" sentinel. A token is f64-exact for ~2^53
 // transfers, which a process will never reach.
-static NEXT_TRANSFER_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static NEXT_TRANSFER_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 // Drain EVERY realm's microtask queue once. Each realm has its own queue (see
 // V8State::queues), so a single scope.perform_microtask_checkpoint() — which only
@@ -2750,6 +2753,9 @@ impl Core {
             // on an op.
             if reply.is_none() {
                 self.shared.lock().unwrap().disposed = true;
+            } else if depth == 0 {
+                // No host fn is left to throw a kept value on (`keep_thrown`).
+                istate!(unsafe { &mut *iso }).thrown = None;
             }
             self.depth.fetch_sub(1, Ordering::SeqCst);
             reply
@@ -3975,7 +3981,8 @@ fn terminated_error(ruby: &Ruby, js_backtrace: Option<Vec<String>>) -> Error {
     }
 }
 
-// The ivar a Ruby exception carries its thrown value's serial in (`keep_thrown`).
+// The ivar a Ruby exception carries its thrown value's serial in (`keep_thrown`),
+// beside the message it was raised with.
 const THROWN_IVAR: &str = "@__rusty_racer_thrown";
 
 // |error| as an instance carrying |thrown|'s serial, for a host fn it propagates
@@ -3986,19 +3993,28 @@ fn carrying_thrown(error: Error, thrown: Option<u64>) -> Error {
     };
     match error_to_exception(&error) {
         Some(exc) => {
-            let _ = exc.funcall::<_, _, Value>("instance_variable_set", (THROWN_IVAR, serial));
+            let Ok(message) = exc.funcall::<_, _, Value>("message", ()) else {
+                return Error::from(exc);
+            };
+            let _ = exc
+                .funcall::<_, _, Value>("instance_variable_set", (THROWN_IVAR, (serial, message)));
             Error::from(exc)
         }
         None => error,
     }
 }
 
-// The serial of the thrown value a host fn's raised |error| carries, if any.
+// The serial of the thrown value a host fn's raised |error| carries, if any — not
+// when Ruby re-raised it with a message of its own (`raise e, 'other'` copies
+// the ivar): that error says something the value does not.
 fn thrown_serial_of(error: &Error) -> Option<u64> {
     let exc = error_to_exception(error)?;
-    exc.funcall::<_, _, Option<u64>>("instance_variable_get", (THROWN_IVAR,))
+    let (serial, message): (u64, Value) = exc
+        .funcall::<_, _, Option<(u64, Value)>>("instance_variable_get", (THROWN_IVAR,))
         .ok()
-        .flatten()
+        .flatten()?;
+    let now: Value = exc.funcall("message", ()).ok()?;
+    now.eql(message).ok()?.then_some(serial)
 }
 
 // Build a RustyRacer::RuntimeError carrying the JS stack as its Ruby backtrace.

@@ -944,6 +944,33 @@ class RustyRacerTest < Minitest::Test
     assert_equal 'Error', @ctx.eval('try { stale() } catch (e) { e.constructor.name }')
   end
 
+  # …nor is one from an earlier op, nor another isolate's, nor one Ruby re-raised with a message of its own.
+  def test_a_host_fn_rethrows_only_the_value_its_own_op_threw
+    kept = begin
+      @ctx.eval('throw globalThis.earlier = new TypeError("earlier")')
+    rescue RustyRacer::RuntimeError => e
+      e
+    end
+    @ctx.attach('raiseKept', proc { raise kept })
+    assert_equal [false, 'Error'], @ctx.eval('try { raiseKept() } catch (e) { [e === earlier, e.constructor.name] }')
+
+    other = RustyRacer::Isolate.new.context
+    @ctx.attach('runOther', proc {|src| other.eval(src) })
+    assert_equal [false, 'Error'], @ctx.eval(<<~JS)
+      try { throw globalThis.mine = new TypeError('mine') } catch (_) {}
+      try { runOther('throw new RangeError("theirs")') } catch (e) { [e === mine, e.constructor.name] }
+    JS
+
+    @ctx.attach('rephrase', proc {|src|
+      begin
+        @ctx.eval(src)
+      rescue RustyRacer::RuntimeError => e
+        raise e, 'rephrased'
+      end
+    })
+    assert_equal 'rephrased', @ctx.eval("try { rephrase('throw new Error(\"x\")') } catch (e) { e.message }")
+  end
+
   def test_attach_does_not_clobber_primitive_global
     @ctx.eval("globalThis.x = 42")
     assert_raises(RustyRacer::RuntimeError) { @ctx.attach("x.y", proc { 1 }) }
