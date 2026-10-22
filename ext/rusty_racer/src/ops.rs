@@ -41,7 +41,6 @@ macro_rules! marshalled {
     }};
 }
 
-// One VM operation, built by a magnus method and run inline by Core::run ->
 // What an eval hands back of its completion value: all of it, marshalled; nothing (`Void`: a statement list run for its
 // EFFECT still has one — the last statement's value — and marshalling it can throw, an accessor or a Proxy trap, or walk
 // a huge graph, for a value the caller discards); or a primitive alone (`Primitive`: an object's never walked, undefined
@@ -53,6 +52,7 @@ pub(crate) enum Completion {
     Primitive,
 }
 
+// One VM operation, built by a magnus method and run inline by Core::run ->
 // service_request -> dispatch_one. |context_id| selects which realm the op runs
 // in: 0 = the main realm (Context's own globalThis, swappable by reset_realm),
 // N >= 1 = an extra realm made by create_context.
