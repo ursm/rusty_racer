@@ -1424,6 +1424,35 @@ class RustyRacerTest < Minitest::Test
     assert_equal 21, dep.namespace["x"]
   end
 
+  def test_es_module_evaluate_reports_its_rejection_to_the_named_global
+    # HTML "run a module script": upon rejection, report the exception — a top-level throw's before evaluate returns, a
+    # top-level await's as it settles, the reason the value thrown, and nothing raised
+    @ctx.eval('globalThis.reported = []; globalThis.report = (e) => reported.push(e && e.message || String(e));')
+    sync = @ctx.compile_module('throw new Error("boom");', filename: '/sync.js')
+    sync.instantiate { nil }
+    assert_nil sync.evaluate(report: 'report')
+    assert_equal ['boom'], @ctx.eval('reported')
+    tla = @ctx.compile_module('await new Promise((r) => setTimeout(r, 0)); throw 7;', filename: '/tla.js')
+    @ctx.eval('globalThis.setTimeout = (f) => Promise.resolve().then(f);')
+    tla.instantiate { nil }
+    tla.evaluate(report: 'report')
+    @ctx.eval('0')
+    assert_equal %w[boom 7], @ctx.eval('reported')
+    # (…every run of the record reports: an errored one's error, a pending top-level await's settling)
+    sync.evaluate(report: 'report')
+    assert_equal %w[boom 7 boom], @ctx.eval('reported')
+    pend = @ctx.compile_module('await new Promise((r) => setTimeout(r, 0)); throw 8;', filename: '/pend.js')
+    pend.instantiate { nil }
+    pend.evaluate(report: 'report')
+    pend.evaluate(report: 'report')
+    @ctx.eval('0')
+    assert_equal %w[boom 7 boom 8 8], @ctx.eval('reported')
+    # (…and with no reporter named, a throw still raises)
+    plain = @ctx.compile_module('throw new Error("raised");', filename: '/plain.js')
+    plain.instantiate { nil }
+    assert_raises(RustyRacer::RuntimeError) { plain.evaluate }
+  end
+
   def test_es_module_unresolved_import_raises
     app = @ctx.compile_module('import {x} from "./missing.js";', filename: "/app.js")
     e = assert_raises(RustyRacer::RuntimeError) { app.instantiate { |_spec, _ref| nil } }

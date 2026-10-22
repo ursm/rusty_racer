@@ -3217,12 +3217,13 @@ impl Core {
         self.reply_value(ruby, reply?)
     }
 
-    fn evaluate_module(&self, ruby: &Ruby, module_id: i32) -> Result<Value, Error> {
+    fn evaluate_module(&self, ruby: &Ruby, module_id: i32, report: Option<String>) -> Result<Value, Error> {
         let reply = self.run(
             ruby,
             Request::EvaluateModule {
                 module_id,
                 timeout_ms: self.default_timeout_ms,
+                report,
             },
         )?;
         self.reply_value(ruby, reply)
@@ -3777,9 +3778,10 @@ impl JsModule {
             .core
             .instantiate_module(ruby, rb_self.module_id, resolver)
     }
-    fn evaluate(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
+    // |report|: nil, or the name of the context global that reports the evaluation's rejection (`Request::EvaluateModule`).
+    fn evaluate(ruby: &Ruby, rb_self: &Self, report: Option<String>) -> Result<Value, Error> {
         rb_self.check_live(ruby)?;
-        rb_self.core.evaluate_module(ruby, rb_self.module_id)
+        rb_self.core.evaluate_module(ruby, rb_self.module_id, report)
     }
     fn namespace(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
         rb_self.check_live(ruby)?;
@@ -4166,7 +4168,7 @@ pub fn install_classes(ruby: &Ruby) -> Result<(), Error> {
     // Thin ES-module handle: Context#compile_module -> instantiate/evaluate.
     let jsmodule = module.define_class("Module", ruby.class_object())?;
     jsmodule.define_method("_instantiate", method!(JsModule::instantiate, 1))?;
-    jsmodule.define_method("evaluate", method!(JsModule::evaluate, 0))?;
+    jsmodule.define_method("_evaluate", method!(JsModule::evaluate, 1))?;
     jsmodule.define_method("namespace", method!(JsModule::namespace, 0))?;
     jsmodule.define_method("_status", method!(JsModule::status, 0))?;
     jsmodule.define_method("graph_async?", method!(JsModule::graph_async, 0))?;

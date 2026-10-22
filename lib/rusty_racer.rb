@@ -178,6 +178,15 @@ module RustyRacer
       self
     end
 
+    # Evaluate the instantiated module. Its evaluation's rejection — a top-level throw, a top-level await's — raises
+    # (RustyRacer::RuntimeError, as far as the drain after it settles), or, `report:` naming a function of its context's
+    # global, is that function's to report: called with the rejection's reason — a top-level throw's before this
+    # returns, a top-level await's as it settles — and nothing raised (HTML "run a module script": upon rejection,
+    # report the exception).
+    def evaluate(report: nil)
+      _evaluate(report&.to_s)
+    end
+
     # The V8 module status: :uninstantiated, :instantiating, :instantiated,
     # :evaluating, :evaluated or :errored.
     def status

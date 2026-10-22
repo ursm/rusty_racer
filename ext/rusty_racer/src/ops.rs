@@ -130,6 +130,10 @@ pub(crate) enum Request {
     EvaluateModule {
         module_id: i32,
         timeout_ms: u64,
+        // The name of a function on the module's context's global that reports its evaluation's rejection — HTML "run
+        // a module script": upon rejection, report the exception — now or as a top-level-await module settles; none:
+        // the rejection is the op's error, as far as the drain gets.
+        report: Option<String>,
     },
     ModuleNamespace {
         module_id: i32,
@@ -507,7 +511,8 @@ fn dispatch_one(
         Request::EvaluateModule {
             module_id,
             timeout_ms,
-        } => op_evaluate_module(scope, module_id, timeout_ms, outermost),
+            report,
+        } => op_evaluate_module(scope, module_id, timeout_ms, report, outermost),
         Request::ModuleNamespace { module_id } => op_module_namespace(scope, module_id),
         Request::ModuleStatus { module_id } => op_module_status(scope, module_id),
         Request::ModuleGraphAsync { module_id } => op_module_graph_async(scope, module_id),
@@ -1035,6 +1040,7 @@ fn op_evaluate_module(
     scope: &mut v8::PinScope<'_, '_, ()>,
     module_id: i32,
     timeout_ms: u64,
+    report: Option<String>,
     outermost: bool,
 ) -> VmReply {
     // Top-level module code (and, under :auto, the microtasks its
@@ -1069,16 +1075,22 @@ fn op_evaluate_module(
                         // must not override their real outcome to Terminated.
                         let mut did_eval = false;
                         // V8 CHECK-aborts the process if evaluate runs on a
-                        // module that isn't exactly Instantiated, so guard
-                        // status explicitly rather than crash.
+                        // module that is not instantiated yet (Uninstantiated /
+                        // Instantiating), so guard status explicitly rather than
+                        // crash.
                         let out = match module.get_status() {
-                            v8::ModuleStatus::Errored => {
+                            // (…one evaluated already, with no reporter: nothing more to do, or its error again)
+                            v8::ModuleStatus::Errored if report.is_none() => {
                                 Err(rejected_with(scope, module.get_exception()))
                             }
-                            v8::ModuleStatus::Evaluated => Ok(JsVal::Undefined),
-                            v8::ModuleStatus::Instantiated => {
+                            v8::ModuleStatus::Evaluated if report.is_none() => Ok(JsVal::Undefined),
+                            // (…and with one, Evaluate again, as HTML runs every script element's record — V8 hands back
+                            // the same evaluation promise, rejected with its error or still pending its top-level
+                            // await — so each run reports)
+                            v8::ModuleStatus::Instantiated | v8::ModuleStatus::Evaluated | v8::ModuleStatus::Errored => {
                                 did_eval = true;
                                 v8::tc_scope!(let tc, scope);
+                                let reporter = report.as_deref().and_then(|name| global_function(tc, name));
                                 match module.evaluate(tc) {
                                     // A synchronous top-level throw yields a
                                     // *rejected* promise (not None); a pending
@@ -1086,6 +1098,21 @@ fn op_evaluate_module(
                                     // re-checked after the drain.
                                     Some(value) => {
                                         match v8::Local::<v8::Promise>::try_from(value) {
+                                            // (…its rejection the reporter's: a synchronous throw's at once, before
+                                            // whatever its script's runner does next — its element's `load`, Chrome —
+                                            // the top-level await's as it settles, a microtask)
+                                            Ok(p) if reporter.is_some() => {
+                                                if let Some(reporter) = reporter {
+                                                    if p.state() == v8::PromiseState::Rejected {
+                                                        p.mark_as_handled();
+                                                        let (receiver, reason) = (v8::undefined(tc).into(), p.result(tc));
+                                                        reporter.call(tc, receiver, &[reason]);
+                                                    } else {
+                                                        p.catch(tc, reporter);
+                                                    }
+                                                }
+                                                Ok(JsVal::Undefined)
+                                            }
                                             Ok(p) if p.state() == v8::PromiseState::Rejected => {
                                                 let reason = p.result(tc);
                                                 Err(rejected_with(tc, reason))
@@ -1130,6 +1157,13 @@ fn op_evaluate_module(
         },
     );
     VmReply::Done(outcome)
+}
+
+// The function the current context's global has under `name`, or None.
+fn global_function<'s>(scope: &mut v8::PinScope<'s, '_>, name: &str) -> Option<v8::Local<'s, v8::Function>> {
+    let key = v8::String::new(scope, name)?;
+    let global = scope.get_current_context().global(scope);
+    v8::Local::<v8::Function>::try_from(global.get(scope, key.into())?).ok()
 }
 
 // get_module_namespace and is_graph_async both CHECK-abort (a release check, so
