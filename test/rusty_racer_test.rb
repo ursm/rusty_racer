@@ -1549,6 +1549,19 @@ class RustyRacerTest < Minitest::Test
     assert_nil s.run_void
   end
 
+  def test_eval_primitive_keeps_a_primitive_and_never_walks_an_object
+    # a top-level Script whose completion value is wanted only where it is a string or a number: an object it ends
+    # with — here one whose marshal would throw — is nil, never walked, while its declarations stay the global's
+    assert_equal 'str', @ctx.eval_primitive("let lx = 1; 'str'")
+    assert_equal 'number', @ctx.eval('typeof lx')
+    assert_equal 3, @ctx.eval_primitive('1 + 2')
+    assert_nil @ctx.eval_primitive('new Proxy({}, {ownKeys() { throw new Error("walked") }})')
+    assert_nil @ctx.eval_primitive('Symbol("s")')
+    assert_nil @ctx.eval_primitive('undefined')
+    e = assert_raises(RustyRacer::RuntimeError) { @ctx.eval_primitive('throw new Error("thrown")') }
+    assert_includes e.message, 'thrown'
+  end
+
   def test_eval_void_still_reports_a_real_failure
     # discarding the RESULT must not discard the ERROR
     assert_raises(RustyRacer::ParseError) { @ctx.eval_void('function (') }

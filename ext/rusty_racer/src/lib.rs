@@ -72,7 +72,7 @@ use magnus::{
 mod marshal;
 use marshal::{JsVal, js_to_jsval, jsval_to_js, jsval_to_ruby, ruby_to_jsval};
 mod ops;
-use ops::{Compiled, Request, VmReply, run_source, service_request};
+use ops::{Compiled, Completion, Request, VmReply, run_source, service_request};
 mod stack;
 use stack::{STACK_DEBUG, StackScope, current_real_isolate, discover_scan_start_field};
 mod watchdog;
@@ -2365,7 +2365,7 @@ fn build_snapshot(code: &str, base: Option<Vec<u8>>, warmup: bool) -> Result<Vec
                     // leaves behind); nothing reads its completion value, so
                     // don't marshal it — a bundle ending in an expression must
                     // not fail the snapshot over a value no one wants.
-                    true,
+                    Completion::Void,
                 )
             {
                 err = Some(match e {
@@ -3003,7 +3003,7 @@ impl Core {
         source: String,
         filename: String,
         timeout_ms: u64,
-        void: bool,
+        completion: Completion,
     ) -> Result<Value, Error> {
         let reply = self.run(
             ruby,
@@ -3012,7 +3012,7 @@ impl Core {
                 source,
                 filename,
                 timeout_ms,
-                void,
+                completion,
             },
         )?;
         self.reply_value(ruby, reply)
@@ -3566,14 +3566,14 @@ impl Context {
         Ok(())
     }
     // timeout_ms 0 = use the isolate's default; an explicit value overrides it.
-    // |void| discards the completion value instead of marshalling it.
+    // |completion| 0 marshals the completion value, 1 discards it, 2 keeps a primitive alone (`Completion`).
     fn eval(
         ruby: &Ruby,
         rb_self: &Self,
         source: String,
         timeout_ms: u64,
         filename: String,
-        void: bool,
+        completion: u8,
     ) -> Result<Value, Error> {
         rb_self.check_live(ruby)?;
         let timeout = if timeout_ms == 0 {
@@ -3581,9 +3581,14 @@ impl Context {
         } else {
             timeout_ms
         };
+        let completion = match completion {
+            1 => Completion::Void,
+            2 => Completion::Primitive,
+            _ => Completion::Value,
+        };
         rb_self
             .core
-            .eval_t(ruby, rb_self.id, source, filename, timeout, void)
+            .eval_t(ruby, rb_self.id, source, filename, timeout, completion)
     }
     fn call(ruby: &Ruby, rb_self: &Self, args: &[Value]) -> Result<Value, Error> {
         rb_self.check_live(ruby)?;
@@ -4126,7 +4131,7 @@ pub fn install_classes(ruby: &Ruby) -> Result<(), Error> {
     // A v8::Context (realm): eval/call/attach/compile_module.
     let context = module.define_class("Context", ruby.class_object())?;
     // Backs both keyword-arg wrappers in lib: Context#eval(source, timeout_ms:,
-    // filename:) and #eval_void, which differ only in the 4th arg (the void flag).
+    // filename:), #eval_void and #eval_primitive, which differ only in the 4th arg (what they keep of the completion value).
     context.define_method("_eval", method!(Context::eval, 4))?;
     context.define_method("call", method!(Context::call, -1))?;
     context.define_method("call_void", method!(Context::call_void, -1))?;

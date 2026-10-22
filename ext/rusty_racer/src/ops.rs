@@ -42,6 +42,17 @@ macro_rules! marshalled {
 }
 
 // One VM operation, built by a magnus method and run inline by Core::run ->
+// What an eval hands back of its completion value: all of it, marshalled; nothing (`Void`: a statement list run for its
+// EFFECT still has one — the last statement's value — and marshalling it can throw, an accessor or a Proxy trap, or walk
+// a huge graph, for a value the caller discards); or a primitive alone (`Primitive`: an object's never walked, undefined
+// in its place — for a caller that wants a string or a number of it, as a javascript: URL's evaluation does).
+#[derive(Clone, Copy)]
+pub(crate) enum Completion {
+    Value,
+    Void,
+    Primitive,
+}
+
 // service_request -> dispatch_one. |context_id| selects which realm the op runs
 // in: 0 = the main realm (Context's own globalThis, swappable by reset_realm),
 // N >= 1 = an extra realm made by create_context.
@@ -51,11 +62,7 @@ pub(crate) enum Request {
         source: String,
         filename: String,
         timeout_ms: u64,
-        // void = don't marshal the completion value (see Call's |void|). A
-        // statement-list eval run for its EFFECT still has one — the last
-        // statement's value — and marshalling it can throw (an accessor, a
-        // Proxy trap) or walk a huge graph, for a value the caller discards.
-        void: bool,
+        completion: Completion,
     },
     // Resolve a dotted function path on globalThis and invoke it with marshalled
     // args (v8::Function::call), preserving the holder as `this`. Distinct from
@@ -234,7 +241,7 @@ pub(crate) fn run_source(
     scope: &mut v8::PinScope<'_, '_>,
     source: &str,
     filename: &str,
-    void: bool,
+    completion: Completion,
 ) -> Result<JsVal, VmError> {
     v8::tc_scope!(let tc, scope);
     // Compile and run as distinct phases so a compile failure maps to
@@ -252,8 +259,12 @@ pub(crate) fn run_source(
         }
     };
     match script.run(tc) {
-        Some(_) if void => Ok(JsVal::Undefined),
-        Some(value) => marshalled!(tc, value),
+        Some(value) => match completion {
+            Completion::Value => marshalled!(tc, value),
+            Completion::Primitive if value.is_object() || value.is_symbol() => Ok(JsVal::Undefined),
+            Completion::Primitive => marshalled!(tc, value),
+            Completion::Void => Ok(JsVal::Undefined),
+        },
         None if tc.has_terminated() => Err(VmError::Terminated),
         None => {
             let exc = tc.exception();
@@ -450,9 +461,9 @@ fn dispatch_one(
             source,
             filename,
             timeout_ms,
-            void,
+            completion,
         } => op_eval(
-            scope, context_id, source, filename, timeout_ms, void, outermost,
+            scope, context_id, source, filename, timeout_ms, completion, outermost,
         ),
         Request::Call {
             context_id,
@@ -604,7 +615,7 @@ fn op_eval(
     source: String,
     filename: String,
     timeout_ms: u64,
-    void: bool,
+    completion: Completion,
     outermost: bool,
 ) -> VmReply {
     let outcome = run_js_bracketed(scope, outermost, timeout_ms, "eval", |scope, outermost| {
@@ -613,7 +624,7 @@ fn op_eval(
             Some(ctx) => {
                 let context = v8::Local::new(scope, &ctx);
                 let scope = &mut v8::ContextScope::new(scope, context);
-                let out = run_source(scope, &source, &filename, void);
+                let out = run_source(scope, &source, &filename, completion);
                 auto_drain(scope, outermost);
                 (true, out)
             }
