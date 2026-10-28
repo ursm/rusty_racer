@@ -3217,7 +3217,12 @@ impl Core {
         self.reply_value(ruby, reply?)
     }
 
-    fn evaluate_module(&self, ruby: &Ruby, module_id: i32, report: Option<String>) -> Result<Value, Error> {
+    fn evaluate_module(
+        &self,
+        ruby: &Ruby,
+        module_id: i32,
+        report: Option<String>,
+    ) -> Result<Value, Error> {
         let reply = self.run(
             ruby,
             Request::EvaluateModule {
@@ -3781,7 +3786,9 @@ impl JsModule {
     // |report|: nil, or the name of the context global that reports the evaluation's rejection (`Request::EvaluateModule`).
     fn evaluate(ruby: &Ruby, rb_self: &Self, report: Option<String>) -> Result<Value, Error> {
         rb_self.check_live(ruby)?;
-        rb_self.core.evaluate_module(ruby, rb_self.module_id, report)
+        rb_self
+            .core
+            .evaluate_module(ruby, rb_self.module_id, report)
     }
     fn namespace(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
         rb_self.check_live(ruby)?;

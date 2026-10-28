@@ -1087,10 +1087,13 @@ fn op_evaluate_module(
                             // (…and with one, Evaluate again, as HTML runs every script element's record — V8 hands back
                             // the same evaluation promise, rejected with its error or still pending its top-level
                             // await — so each run reports)
-                            v8::ModuleStatus::Instantiated | v8::ModuleStatus::Evaluated | v8::ModuleStatus::Errored => {
+                            v8::ModuleStatus::Instantiated
+                            | v8::ModuleStatus::Evaluated
+                            | v8::ModuleStatus::Errored => {
                                 did_eval = true;
                                 v8::tc_scope!(let tc, scope);
-                                let reporter = report.as_deref().and_then(|name| global_function(tc, name));
+                                let reporter =
+                                    report.as_deref().and_then(|name| global_function(tc, name));
                                 match module.evaluate(tc) {
                                     // A synchronous top-level throw yields a
                                     // *rejected* promise (not None); a pending
@@ -1105,7 +1108,10 @@ fn op_evaluate_module(
                                                 if let Some(reporter) = reporter {
                                                     if p.state() == v8::PromiseState::Rejected {
                                                         p.mark_as_handled();
-                                                        let (receiver, reason) = (v8::undefined(tc).into(), p.result(tc));
+                                                        let (receiver, reason) = (
+                                                            v8::undefined(tc).into(),
+                                                            p.result(tc),
+                                                        );
                                                         reporter.call(tc, receiver, &[reason]);
                                                     } else {
                                                         p.catch(tc, reporter);
@@ -1160,7 +1166,10 @@ fn op_evaluate_module(
 }
 
 // The function the current context's global has under `name`, or None.
-fn global_function<'s>(scope: &mut v8::PinScope<'s, '_>, name: &str) -> Option<v8::Local<'s, v8::Function>> {
+fn global_function<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    name: &str,
+) -> Option<v8::Local<'s, v8::Function>> {
     let key = v8::String::new(scope, name)?;
     let global = scope.get_current_context().global(scope);
     v8::Local::<v8::Function>::try_from(global.get(scope, key.into())?).ok()
