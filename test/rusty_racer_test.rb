@@ -469,7 +469,8 @@ class RustyRacerTest < Minitest::Test
   def test_a_disposed_realms_host_fn_held_elsewhere_never_runs_the_slots_next_proc
     # A realm's function can outlive the realm — here the main context keeps it,
     # as an embedder's page keeps a navigated-away frame's document. Its slot is
-    # recycled by the next attach, and the old function must not call the new proc.
+    # recycled by the next attach (the only free one in this isolate), and the old
+    # function must not call the new proc.
     iso   = RustyRacer::Isolate.new(host_namespace: 'NS')
     ctx   = iso.context
     frame = iso.create_context
@@ -480,6 +481,20 @@ class RustyRacerTest < Minitest::Test
     fresh = iso.create_context
     fresh.attach('g', proc { 'new' })
     assert_equal 'new', fresh.eval('g()')
+    assert_equal 'unknown host function', ctx.eval('try { kept(); "ran" } catch (e) { e.message }')
+  end
+
+  def test_a_reset_realms_host_fn_held_elsewhere_never_runs_the_slots_next_proc
+    # …and so through a reset, the realm's id kept: the re-attach after it takes the
+    # freed slot (this isolate has no other), and the kept function must not reach it.
+    iso   = RustyRacer::Isolate.new(host_namespace: 'NS')
+    ctx   = iso.context
+    frame = iso.create_context
+    frame.attach('f', proc { 'old' })
+    ctx.eval("globalThis.kept = NS.contextGlobal(#{frame.id}).f")
+    frame.reset
+    frame.attach('f', proc { 'new' })
+    assert_equal 'new', frame.eval('f()')
     assert_equal 'unknown host function', ctx.eval('try { kept(); "ran" } catch (e) { e.message }')
   end
 

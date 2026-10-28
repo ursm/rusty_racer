@@ -93,6 +93,8 @@ ran to completion. When the value is incidental, say so: `#eval_void`,
 result. A statement list has a completion value whether you want one or not, so
 plumbing an object into a global (`globalThis.win = someProxy`) is enough to
 make a plain `#eval` fail after every one of its writes has landed.
+`#eval_primitive` sits between the two: it returns the completion value only
+where it is a primitive, and nil for an object or a symbol, which it never reads.
 
 ES modules (the embedder owns the URL→module registry):
 
@@ -113,6 +115,12 @@ guarantee: `evaluate` ran the whole graph to completion. Since there is no event
 loop here (see below), a `true` graph whose `await` never settles returns from
 `evaluate` with the module body still suspended, and `status` reports
 `:evaluated` either way — so `graph_async?` is what distinguishes the two.
+
+A rejected evaluation — a top-level throw, or a top-level `await` that rejects —
+raises from `evaluate`. Pass `report:` the name of a function on the context's
+global to have it called with the reason instead (HTML's "report the
+exception"), at once for a throw and as it settles for an `await`:
+`app.evaluate(report: "reportError")`.
 
 Classic `<script>`s work the same way: `ctx.compile("1 + 1").run` # => 2.
 
@@ -224,7 +232,9 @@ warm isolate — a per-visit reset that avoids rebuilding the VM. Its contract:
 - **Runtime mutations are dropped.** Anything set on the realm at runtime is gone.
 - **Host fns are dropped.** Functions `attach`/`attach_many`'d into the realm are
   released — the isolate stops holding them, so whatever they captured becomes
-  collectable; re-attach them after a reset.
+  collectable; re-attach them after a reset. One the embedder kept hold of (through
+  another realm, say) throws `unknown host function` when called; it never runs
+  what was attached after it.
 - **Modules and classic scripts are dropped.** Handles compiled in the realm die
   with the old context.
 - **The realm id and the shared same-origin token are preserved** — the id keeps

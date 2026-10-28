@@ -170,7 +170,10 @@ pub(crate) struct HostFnKey {
 }
 
 impl HostFnKey {
-    // (…both halves in one pointer-sized word: V8 builds for 64-bit targets alone)
+    // (…both halves in one pointer-sized word: V8 builds for 64-bit targets alone.
+    // The word is stored as is only while V8's sandbox is off — the v8 crate's
+    // opt-in `v8_enable_sandbox`, which this crate leaves off; a sandboxed External
+    // goes through a pointer table that keeps tags in the high bits.)
     pub(crate) fn to_external(self) -> *mut c_void {
         const { assert!(usize::BITS >= 64) };
         (((self.generation as u64) << 32) | self.index as u64) as usize as *mut c_void
@@ -400,15 +403,17 @@ enum RubyCall<'a> {
 impl RubyCall<'_> {
     fn describe(&self, core: &Core) -> String {
         match self {
-            // try_lock, not lock: nothing holds this across a callback (the procs
-            // themselves are read from the roots array, without this lock), but
-            // blocking here would turn a diagnostic into a hang.
-            Self::HostFn(id) => match core
-                .procs
-                .try_lock()
-                .ok()
-                .and_then(|procs| procs.slots.get(id.index()).map(|slot| slot.name.clone()))
-            {
+            // try_lock, not lock: nothing holds this across a callback (`call_proc`
+            // holds it for one comparison, before the proc runs), but blocking here
+            // would turn a diagnostic into a hang. A slot handed on since names
+            // nobody: its name is another function's.
+            Self::HostFn(id) => match core.procs.try_lock().ok().and_then(|procs| {
+                procs
+                    .slots
+                    .get(id.index())
+                    .filter(|slot| slot.generation == id.generation)
+                    .map(|slot| slot.name.clone())
+            }) {
                 Some(name) => format!("The host function `{name}`"),
                 None => "A host function".to_string(),
             },
@@ -3147,11 +3152,12 @@ impl Core {
     }
 
     // Drop the procs attached into |context_id| out of the roots array — its
-    // realm is gone (reset or disposed), so the V8-side functions that referenced
-    // them are unreachable, and holding them would keep the embedder's world alive
-    // for the rest of the isolate's life. Runs on a Ruby thread: it writes nil
-    // into the Array. The slots stay: the keys of other realms are indices into
-    // the same Vec.
+    // realm is gone (reset or disposed), and holding them would keep the embedder's
+    // world alive for the rest of the isolate's life. A V8 function of that realm
+    // may still be reachable (the embedder can hold the old global), but its key
+    // stops answering (`ProcTable::current`), so it never calls a proc again.
+    // Runs on a Ruby thread: it writes nil into the Array. The slots stay: the
+    // keys of other realms are indices into the same Vec.
     fn release_context_procs(&self, ruby: &Ruby, context_id: i32) {
         // Nil the entries BEFORE the ids go back on the free list, so no attach can
         // ever be handed an id whose old proc is still in the array.
