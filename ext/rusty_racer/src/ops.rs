@@ -83,14 +83,14 @@ pub(crate) enum Request {
     Attach {
         context_id: i32,
         name: String,
-        host_fn_id: usize,
+        host_fn: HostFnKey,
         timeout_ms: u64,
     },
-    // Batch attach: install many (name, host_fn_id) host fns in one round-trip
+    // Batch attach: install many (name, key) host fns in one round-trip
     // (a fresh realm needs ~dozens). Same semantics as Attach, applied in order.
     AttachMany {
         context_id: i32,
-        entries: Vec<(String, usize)>,
+        entries: Vec<(String, HostFnKey)>,
         timeout_ms: u64,
     },
     // reset: swap globalThis for a fresh v8::Context, reusing the same warm
@@ -480,9 +480,9 @@ fn dispatch_one(
         Request::Attach {
             context_id,
             name,
-            host_fn_id,
+            host_fn,
             timeout_ms,
-        } => op_attach(scope, context_id, name, host_fn_id, timeout_ms, outermost),
+        } => op_attach(scope, context_id, name, host_fn, timeout_ms, outermost),
         Request::AttachMany {
             context_id,
             entries,
@@ -700,7 +700,7 @@ fn op_attach(
     scope: &mut v8::PinScope<'_, '_, ()>,
     context_id: i32,
     name: String,
-    host_fn_id: usize,
+    host_fn: HostFnKey,
     timeout_ms: u64,
     outermost: bool,
 ) -> VmReply {
@@ -720,7 +720,7 @@ fn op_attach(
                 Some(ctx) => {
                     let context = v8::Local::new(scope, &ctx);
                     let scope = &mut v8::ContextScope::new(scope, context);
-                    let external = v8::External::new(scope, host_fn_id as *mut c_void);
+                    let external = v8::External::new(scope, host_fn.to_external());
                     let out = match v8::Function::builder(host_fn_callback)
                         .data(external.into())
                         .build(scope)
@@ -748,7 +748,7 @@ fn op_attach(
 fn op_attach_many(
     scope: &mut v8::PinScope<'_, '_, ()>,
     context_id: i32,
-    entries: Vec<(String, usize)>,
+    entries: Vec<(String, HostFnKey)>,
     timeout_ms: u64,
     outermost: bool,
 ) -> VmReply {
@@ -770,8 +770,8 @@ fn op_attach_many(
                     let context = v8::Local::new(scope, &ctx);
                     let scope = &mut v8::ContextScope::new(scope, context);
                     let mut out = Ok(JsVal::Undefined);
-                    for (name, host_fn_id) in &entries {
-                        let external = v8::External::new(scope, *host_fn_id as *mut c_void);
+                    for (name, host_fn) in &entries {
+                        let external = v8::External::new(scope, host_fn.to_external());
                         out = match v8::Function::builder(host_fn_callback)
                             .data(external.into())
                             .build(scope)

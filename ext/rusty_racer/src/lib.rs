@@ -146,23 +146,55 @@ macro_rules! istate {
 pub(crate) use istate;
 
 // One attach()'d host fn: the realm it was attached into — so resetting or
-// disposing that realm can release it — whether it is still attached (the slot
-// index stays valid as a host_fn_id either way), and the name it was attached
-// under, kept only so a diagnostic can say which host function is involved (one
-// String per attach, never per call). The PROC itself lives in the roots array
-// at `proc_root_index(id)`, where the GC can see it without taking this lock.
+// disposing that realm can release it — whether it is still attached, which
+// occupant of the slot it is (`HostFnKey`), and the name it was attached under,
+// kept only so a diagnostic can say which host function is involved (one String
+// per attach, never per call). The PROC itself lives in the roots array at
+// `proc_root_index(index)`, where the GC can see it without taking this lock.
 struct ProcSlot {
     context_id: i32,
     live: bool,
+    generation: u32,
     name: String,
 }
 
-// The isolate's host-fn registry, indexed by host_fn_id. `free` lists slots
+// What a host function's V8 External carries: its slot, and the slot's generation
+// when it was attached. A slot is reused once its realm is released, but a function
+// of that realm can outlive the release — the embedder may still hold its document
+// — so a call has to prove it is the slot's CURRENT occupant, or it would run
+// whichever proc the slot was handed to next.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct HostFnKey {
+    index: u32,
+    generation: u32,
+}
+
+impl HostFnKey {
+    // (…both halves in one pointer-sized word: V8 builds for 64-bit targets alone)
+    pub(crate) fn to_external(self) -> *mut c_void {
+        const { assert!(usize::BITS >= 64) };
+        (((self.generation as u64) << 32) | self.index as u64) as usize as *mut c_void
+    }
+
+    fn from_external(value: *mut c_void) -> Self {
+        let value = value as usize as u64;
+        Self {
+            index: value as u32,
+            generation: (value >> 32) as u32,
+        }
+    }
+
+    fn index(self) -> usize {
+        self.index as usize
+    }
+}
+
+// The isolate's host-fn registry, indexed by HostFnKey::index. `free` lists slots
 // emptied by release_context_procs so a later attach reuses them instead of
 // growing `slots` forever — a long-lived process that re-navigates iframe
-// realms would otherwise leak one slot per attach. Reuse is safe because a slot
-// is only freed when its realm (and the V8 functions that carried its id) is
-// gone, so no stale V8 external can still call a recycled id.
+// realms would otherwise leak one slot per attach. A reused slot's generation
+// moves on, so a function of the released realm that is still reachable calls
+// a key the table no longer answers (`current`) instead of the new occupant.
 #[derive(Default)]
 struct ProcTable {
     slots: Vec<ProcSlot>,
@@ -170,15 +202,37 @@ struct ProcTable {
 }
 
 impl ProcTable {
-    // Take a free slot if one exists, else grow. Returns the host_fn_id.
-    fn alloc(&mut self, slot: ProcSlot) -> usize {
-        if let Some(id) = self.free.pop() {
-            self.slots[id] = slot;
-            id
-        } else {
-            self.slots.push(slot);
-            self.slots.len() - 1
+    // Take a free slot if one exists, its generation the next, else grow.
+    fn alloc(&mut self, context_id: i32, name: String) -> HostFnKey {
+        let (index, generation) = match self.free.pop() {
+            Some(index) => (index, self.slots[index].generation.wrapping_add(1)),
+            None => {
+                self.slots.push(ProcSlot {
+                    context_id,
+                    live: false,
+                    generation: 0,
+                    name: String::new(),
+                });
+                (self.slots.len() - 1, 0)
+            }
+        };
+        self.slots[index] = ProcSlot {
+            context_id,
+            live: true,
+            generation,
+            name,
+        };
+        HostFnKey {
+            index: index as u32,
+            generation,
         }
+    }
+
+    // Whether `key` is its slot's live occupant.
+    fn current(&self, key: HostFnKey) -> bool {
+        self.slots
+            .get(key.index())
+            .is_some_and(|slot| slot.live && slot.generation == key.generation)
     }
 
     // Release every live proc attached into |context_id| (its realm is gone),
@@ -202,11 +256,11 @@ impl ProcTable {
 // long as a wrapper of it is reachable, in one place the GC can be shown without
 // taking any Rust lock (a mark that had to lock `procs` could deadlock against
 // the thread whose allocation triggered the GC while holding it). Slot 0 is the
-// dynamic-import resolver; the attached host fns follow, one per host_fn_id.
+// dynamic-import resolver; the attached host fns follow, one per proc slot.
 const ROOT_IMPORT_RESOLVER: isize = 0;
 const ROOT_FIRST_PROC: isize = 1;
-fn proc_root_index(host_fn_id: usize) -> isize {
-    ROOT_FIRST_PROC + host_fn_id as isize
+fn proc_root_index(index: usize) -> isize {
+    ROOT_FIRST_PROC + index as isize
 }
 
 // Look up a RustyRacer::<name> exception class at raise time. The classes are
@@ -335,9 +389,9 @@ where
 // instead of saying "a host function". Rendered only on that path, so an
 // ordinary callback pays for a pointer and nothing else.
 enum RubyCall<'a> {
-    // An attach()'d host function, by host_fn_id — the name it was attached
+    // An attach()'d host function, by its key — the name it was attached
     // under lives in the isolate's proc table.
-    HostFn(usize),
+    HostFn(HostFnKey),
     // A module resolver (a static instantiate block, a dynamic auto-link, or
     // import()), named by the specifier it was handed.
     Resolver(&'a str),
@@ -353,7 +407,7 @@ impl RubyCall<'_> {
                 .procs
                 .try_lock()
                 .ok()
-                .and_then(|procs| procs.slots.get(*id).map(|slot| slot.name.clone()))
+                .and_then(|procs| procs.slots.get(id.index()).map(|slot| slot.name.clone()))
             {
                 Some(name) => format!("The host function `{name}`"),
                 None => "A host function".to_string(),
@@ -551,8 +605,8 @@ fn host_fn_callback(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let host_fn_id = match v8::Local::<v8::External>::try_from(args.data()) {
-        Ok(e) => e.value() as usize,
+    let host_fn = match v8::Local::<v8::External>::try_from(args.data()) {
+        Ok(e) => HostFnKey::from_external(e.value()),
         Err(_) => return,
     };
     let mut js_args = Vec::with_capacity(args.length() as usize);
@@ -579,7 +633,7 @@ fn host_fn_callback(
         return;
     }
     let core = unsafe { &*core_ptr };
-    let result: Result<JsVal, HostFnFailure> = with_gvl(core, RubyCall::HostFn(host_fn_id), || {
+    let result: Result<JsVal, HostFnFailure> = with_gvl(core, RubyCall::HostFn(host_fn), || {
         let ruby = Ruby::get().unwrap();
         // rb_protect so a Ruby exception raised during arg/return marshalling
         // (ary_new_capa / jsval_to_ruby / ruby_to_jsval can raise on OOM etc.)
@@ -588,7 +642,7 @@ fn host_fn_callback(
         use magnus::rb_sys::AsRawValue;
         let mut out: Option<Result<JsVal, HostFnFailure>> = None;
         match magnus::rb_sys::protect(|| {
-            out = Some(core.call_proc(&ruby, host_fn_id, &js_args));
+            out = Some(core.call_proc(&ruby, host_fn, &js_args));
             ruby.qnil().as_raw()
         }) {
             Ok(_) => {
@@ -1646,7 +1700,7 @@ struct Core {
     // layout. Read on the V8 side without the GVL (the import hooks), which is
     // sound because the entries are pinned and nothing here allocates or raises.
     roots: Opaque<RArray>,
-    // host_fn_id indexes ProcTable.slots — bookkeeping only (the proc itself is in
+    // A HostFnKey indexes ProcTable.slots — bookkeeping only (the proc itself is in
     // `roots`). Mutex (uncontended — single owner thread) so host_fn_callback can
     // reach it through Core (via the slot's core_ptr) while a &Core method also
     // holds it. reset/dispose releases the slots and recycles them.
@@ -2859,16 +2913,20 @@ impl Core {
     fn call_proc(
         &self,
         ruby: &Ruby,
-        host_fn_id: usize,
+        host_fn: HostFnKey,
         args: &[JsVal],
     ) -> Result<JsVal, HostFnFailure> {
-        // Straight from the roots array — a released (or never-attached) id reads
-        // back nil, which is the same "unknown host function" the slot table would
-        // have reported, so the hot path takes no lock at all. `root_proc` and not
-        // `RArray::entry`, for the reason given there: a nil slot must answer None,
-        // never dispatch `to_proc` and raise.
+        // A function of a released realm is refused here, before its slot's roots
+        // entry is read: that entry may by now hold another realm's proc. (The lock
+        // is uncontended and held for the comparison alone — nothing here allocates,
+        // so no GC can need it meanwhile.)
+        if !self.procs.lock().unwrap().current(host_fn) {
+            return Err("unknown host function".to_string().into());
+        }
+        // `root_proc` and not `RArray::entry`, for the reason given there: a nil
+        // slot must answer None, never dispatch `to_proc` and raise.
         let proc = self
-            .root_proc(proc_root_index(host_fn_id))
+            .root_proc(proc_root_index(host_fn.index()))
             .ok_or_else(|| "unknown host function".to_string())?;
         // Marshal into a Ruby Array, NOT a Vec<Value>: bare Values in a heap Vec
         // are hidden from Ruby's GC mark phase (magnus's own RArray::to_vec doc
@@ -3029,18 +3087,14 @@ impl Core {
         // array's element storage, which the import hooks read with the GVL released —
         // and a refused attach must not consume a slot or leave its proc rooted either.
         self.ensure_owner_and_live(ruby)?;
-        let host_fn_id = self.procs.lock().unwrap().alloc(ProcSlot {
-            context_id,
-            live: true,
-            name: name.clone(),
-        });
-        self.root_store(ruby, proc_root_index(host_fn_id), proc)?;
+        let host_fn = self.procs.lock().unwrap().alloc(context_id, name.clone());
+        self.root_store(ruby, proc_root_index(host_fn.index()), proc)?;
         let reply = self.run(
             ruby,
             Request::Attach {
                 context_id,
                 name,
-                host_fn_id,
+                host_fn,
                 timeout_ms: self.default_timeout_ms,
             },
         )?;
@@ -3049,7 +3103,7 @@ impl Core {
 
     // attach_many: install several host fns in ONE round-trip to the V8 thread
     // (a fresh realm needs ~dozens; one rendezvous instead of one per fn). Slots
-    // are allocated up front so each carries a stable host_fn_id; entries are
+    // are allocated up front so each carries a stable key; entries are
     // applied IN ORDER and a build/attach failure aborts the batch with that
     // (name-tagged) error WITHOUT rolling back earlier entries (see the
     // AttachMany arm). On that error path the unused slots are reclaimed at the
@@ -3064,18 +3118,11 @@ impl Core {
             return Ok(ruby.qnil().as_value()); // nothing to install, skip the round-trip
         }
         self.ensure_owner_and_live(ruby)?; // before the roots writes — see `attach`
-        let allocated: Vec<(String, usize, Proc)> = {
+        let allocated: Vec<(String, HostFnKey, Proc)> = {
             let mut procs = self.procs.lock().unwrap();
             entries
                 .into_iter()
-                .map(|(name, proc)| {
-                    let id = procs.alloc(ProcSlot {
-                        context_id,
-                        live: true,
-                        name: name.clone(),
-                    });
-                    (name, id, proc)
-                })
+                .map(|(name, proc)| (name.clone(), procs.alloc(context_id, name), proc))
                 .collect()
         };
         // Stored OUTSIDE the table's lock: storing into the array can allocate (the
@@ -3083,16 +3130,16 @@ impl Core {
         // wrappers, a path that must never wait on `procs`. The Procs parked in the
         // Vec meanwhile are invisible to the GC (see call_proc's note), but the caller's
         // `table: RHash` argument is live in its own frame and marks every one of them.
-        let mut named_ids: Vec<(String, usize)> = Vec::with_capacity(allocated.len());
-        for (name, id, proc) in allocated {
-            self.root_store(ruby, proc_root_index(id), proc)?;
-            named_ids.push((name, id));
+        let mut named_keys: Vec<(String, HostFnKey)> = Vec::with_capacity(allocated.len());
+        for (name, key, proc) in allocated {
+            self.root_store(ruby, proc_root_index(key.index()), proc)?;
+            named_keys.push((name, key));
         }
         let reply = self.run(
             ruby,
             Request::AttachMany {
                 context_id,
-                entries: named_ids,
+                entries: named_keys,
                 timeout_ms: self.default_timeout_ms,
             },
         )?;
@@ -3103,7 +3150,7 @@ impl Core {
     // realm is gone (reset or disposed), so the V8-side functions that referenced
     // them are unreachable, and holding them would keep the embedder's world alive
     // for the rest of the isolate's life. Runs on a Ruby thread: it writes nil
-    // into the Array. The slots stay: host_fn_ids of other realms are indices into
+    // into the Array. The slots stay: the keys of other realms are indices into
     // the same Vec.
     fn release_context_procs(&self, ruby: &Ruby, context_id: i32) {
         // Nil the entries BEFORE the ids go back on the free list, so no attach can
