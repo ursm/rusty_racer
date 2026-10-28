@@ -121,7 +121,7 @@ module RustyRacer
     # `timeout_ms` (0 = the isolate default) caps this eval; `filename` names the
     # script in stack traces and parse-error locations.
     def eval(source, timeout_ms: 0, filename: '<eval>')
-      _eval(source, timeout_ms, filename, false)
+      _eval(source, timeout_ms, filename, 0)
     end
 
     # Run `source` for its EFFECT and return nil, without marshalling its
@@ -132,7 +132,14 @@ module RustyRacer
     # whose writes all landed. `globalThis.win = someProxy` is the shape that
     # bites.
     def eval_void(source, timeout_ms: 0, filename: '<eval>')
-      _eval(source, timeout_ms, filename, true)
+      _eval(source, timeout_ms, filename, 1)
+    end
+
+    # Run `source` and return its completion value only where it is a primitive — a string, a number, a boolean, a
+    # BigInt, null — and nil for an object or a symbol, which is never walked: for a caller that wants a string of it
+    # (a javascript: URL's evaluation), whatever object the source happens to end with.
+    def eval_primitive(source, timeout_ms: 0, filename: '<eval>')
+      _eval(source, timeout_ms, filename, 2)
     end
 
     # Compile a classic <script>; returns a RustyRacer::Script to #run.
@@ -169,6 +176,15 @@ module RustyRacer
 
       _instantiate(block)
       self
+    end
+
+    # Evaluate the instantiated module. Its evaluation's rejection — a top-level throw, a top-level await's — raises
+    # (RustyRacer::RuntimeError, as far as the drain after it settles), or, `report:` naming a function of its context's
+    # global, is that function's to report: called with the rejection's reason — a top-level throw's before this
+    # returns, a top-level await's as it settles — and nothing raised (HTML "run a module script": upon rejection,
+    # report the exception).
+    def evaluate(report: nil)
+      _evaluate(report&.to_s)
     end
 
     # The V8 module status: :uninstantiated, :instantiating, :instantiated,

@@ -41,6 +41,17 @@ macro_rules! marshalled {
     }};
 }
 
+// What an eval hands back of its completion value: all of it, marshalled; nothing (`Void`: a statement list run for its
+// EFFECT still has one — the last statement's value — and marshalling it can throw, an accessor or a Proxy trap, or walk
+// a huge graph, for a value the caller discards); or a primitive alone (`Primitive`: an object's never walked, undefined
+// in its place — for a caller that wants a string or a number of it, as a javascript: URL's evaluation does).
+#[derive(Clone, Copy)]
+pub(crate) enum Completion {
+    Value,
+    Void,
+    Primitive,
+}
+
 // One VM operation, built by a magnus method and run inline by Core::run ->
 // service_request -> dispatch_one. |context_id| selects which realm the op runs
 // in: 0 = the main realm (Context's own globalThis, swappable by reset_realm),
@@ -51,11 +62,7 @@ pub(crate) enum Request {
         source: String,
         filename: String,
         timeout_ms: u64,
-        // void = don't marshal the completion value (see Call's |void|). A
-        // statement-list eval run for its EFFECT still has one — the last
-        // statement's value — and marshalling it can throw (an accessor, a
-        // Proxy trap) or walk a huge graph, for a value the caller discards.
-        void: bool,
+        completion: Completion,
     },
     // Resolve a dotted function path on globalThis and invoke it with marshalled
     // args (v8::Function::call), preserving the holder as `this`. Distinct from
@@ -76,14 +83,14 @@ pub(crate) enum Request {
     Attach {
         context_id: i32,
         name: String,
-        host_fn_id: usize,
+        host_fn: HostFnKey,
         timeout_ms: u64,
     },
-    // Batch attach: install many (name, host_fn_id) host fns in one round-trip
+    // Batch attach: install many (name, key) host fns in one round-trip
     // (a fresh realm needs ~dozens). Same semantics as Attach, applied in order.
     AttachMany {
         context_id: i32,
-        entries: Vec<(String, usize)>,
+        entries: Vec<(String, HostFnKey)>,
         timeout_ms: u64,
     },
     // reset: swap globalThis for a fresh v8::Context, reusing the same warm
@@ -123,6 +130,10 @@ pub(crate) enum Request {
     EvaluateModule {
         module_id: i32,
         timeout_ms: u64,
+        // The name of a function on the module's context's global that reports its evaluation's rejection — HTML "run
+        // a module script": upon rejection, report the exception — now or as a top-level-await module settles; none:
+        // the rejection is the op's error, as far as the drain gets.
+        report: Option<String>,
     },
     ModuleNamespace {
         module_id: i32,
@@ -234,41 +245,30 @@ pub(crate) fn run_source(
     scope: &mut v8::PinScope<'_, '_>,
     source: &str,
     filename: &str,
-    void: bool,
+    completion: Completion,
 ) -> Result<JsVal, VmError> {
     v8::tc_scope!(let tc, scope);
     // Compile and run as distinct phases so a compile failure maps to
     // ParseError and a thrown exception to RuntimeError (csim rescues both).
     let Some(code) = v8::String::new(tc, source) else {
-        return Err(VmError::Parse("source too large".into()));
+        return Err(VmError::Parse("source too large".into(), None));
     };
     let origin = script_origin(tc, filename);
     let script = match v8::Script::compile(tc, code, Some(&origin)) {
         Some(script) => script,
         None if tc.has_terminated() => return Err(VmError::Terminated),
         None => {
-            let msg = tc
-                .exception()
-                .map(|e| e.to_rust_string_lossy(tc))
-                .unwrap_or_else(|| "parse error".to_string());
-            // Append the location V8 recorded; always name the file, add the
-            // line when V8 reports one.
-            let message = tc.message();
-            let res = message
-                .and_then(|m| m.get_script_resource_name(tc))
-                .filter(|v| v.is_string())
-                .map(|v| v.to_rust_string_lossy(tc))
-                .unwrap_or_else(|| filename.to_string());
-            let loc = match message.and_then(|m| m.get_line_number(tc)) {
-                Some(line) => format!(" at {res}:{line}"),
-                None => format!(" at {res}"),
-            };
-            return Err(VmError::Parse(format!("{msg}{loc}")));
+            let (exc, message) = (tc.exception(), tc.message());
+            return Err(parse_error(tc, exc, message, filename, "parse error"));
         }
     };
     match script.run(tc) {
-        Some(_) if void => Ok(JsVal::Undefined),
-        Some(value) => marshalled!(tc, value),
+        Some(value) => match completion {
+            Completion::Value => marshalled!(tc, value),
+            Completion::Primitive if value.is_object() || value.is_symbol() => Ok(JsVal::Undefined),
+            Completion::Primitive => marshalled!(tc, value),
+            Completion::Void => Ok(JsVal::Undefined),
+        },
         None if tc.has_terminated() => Err(VmError::Terminated),
         None => {
             let exc = tc.exception();
@@ -465,9 +465,9 @@ fn dispatch_one(
             source,
             filename,
             timeout_ms,
-            void,
+            completion,
         } => op_eval(
-            scope, context_id, source, filename, timeout_ms, void, outermost,
+            scope, context_id, source, filename, timeout_ms, completion, outermost,
         ),
         Request::Call {
             context_id,
@@ -480,9 +480,9 @@ fn dispatch_one(
         Request::Attach {
             context_id,
             name,
-            host_fn_id,
+            host_fn,
             timeout_ms,
-        } => op_attach(scope, context_id, name, host_fn_id, timeout_ms, outermost),
+        } => op_attach(scope, context_id, name, host_fn, timeout_ms, outermost),
         Request::AttachMany {
             context_id,
             entries,
@@ -511,7 +511,8 @@ fn dispatch_one(
         Request::EvaluateModule {
             module_id,
             timeout_ms,
-        } => op_evaluate_module(scope, module_id, timeout_ms, outermost),
+            report,
+        } => op_evaluate_module(scope, module_id, timeout_ms, report, outermost),
         Request::ModuleNamespace { module_id } => op_module_namespace(scope, module_id),
         Request::ModuleStatus { module_id } => op_module_status(scope, module_id),
         Request::ModuleGraphAsync { module_id } => op_module_graph_async(scope, module_id),
@@ -619,7 +620,7 @@ fn op_eval(
     source: String,
     filename: String,
     timeout_ms: u64,
-    void: bool,
+    completion: Completion,
     outermost: bool,
 ) -> VmReply {
     let outcome = run_js_bracketed(scope, outermost, timeout_ms, "eval", |scope, outermost| {
@@ -628,7 +629,7 @@ fn op_eval(
             Some(ctx) => {
                 let context = v8::Local::new(scope, &ctx);
                 let scope = &mut v8::ContextScope::new(scope, context);
-                let out = run_source(scope, &source, &filename, void);
+                let out = run_source(scope, &source, &filename, completion);
                 auto_drain(scope, outermost);
                 (true, out)
             }
@@ -699,7 +700,7 @@ fn op_attach(
     scope: &mut v8::PinScope<'_, '_, ()>,
     context_id: i32,
     name: String,
-    host_fn_id: usize,
+    host_fn: HostFnKey,
     timeout_ms: u64,
     outermost: bool,
 ) -> VmReply {
@@ -719,7 +720,7 @@ fn op_attach(
                 Some(ctx) => {
                     let context = v8::Local::new(scope, &ctx);
                     let scope = &mut v8::ContextScope::new(scope, context);
-                    let external = v8::External::new(scope, host_fn_id as *mut c_void);
+                    let external = v8::External::new(scope, host_fn.to_external());
                     let out = match v8::Function::builder(host_fn_callback)
                         .data(external.into())
                         .build(scope)
@@ -747,7 +748,7 @@ fn op_attach(
 fn op_attach_many(
     scope: &mut v8::PinScope<'_, '_, ()>,
     context_id: i32,
-    entries: Vec<(String, usize)>,
+    entries: Vec<(String, HostFnKey)>,
     timeout_ms: u64,
     outermost: bool,
 ) -> VmReply {
@@ -769,8 +770,8 @@ fn op_attach_many(
                     let context = v8::Local::new(scope, &ctx);
                     let scope = &mut v8::ContextScope::new(scope, context);
                     let mut out = Ok(JsVal::Undefined);
-                    for (name, host_fn_id) in &entries {
-                        let external = v8::External::new(scope, *host_fn_id as *mut c_void);
+                    for (name, host_fn) in &entries {
+                        let external = v8::External::new(scope, host_fn.to_external());
                         out = match v8::Function::builder(host_fn_callback)
                             .data(external.into())
                             .build(scope)
@@ -957,21 +958,14 @@ fn op_compile_module(
                         // A module compile failure is a parse error
                         // (compile-time), not a thrown exception.
                         None => {
-                            let msg = tc
-                                .exception()
-                                .map(|e| e.to_rust_string_lossy(tc))
-                                .unwrap_or_else(|| "module parse error".to_string());
-                            let message = tc.message();
-                            let res = message
-                                .and_then(|m| m.get_script_resource_name(tc))
-                                .filter(|v| v.is_string())
-                                .map(|v| v.to_rust_string_lossy(tc))
-                                .unwrap_or_else(|| filename.clone());
-                            let loc = match message.and_then(|m| m.get_line_number(tc)) {
-                                Some(line) => format!(" at {res}:{line}"),
-                                None => format!(" at {res}"),
-                            };
-                            Err(VmError::Parse(format!("{msg}{loc}")))
+                            let (exc, message) = (tc.exception(), tc.message());
+                            Err(parse_error(
+                                tc,
+                                exc,
+                                message,
+                                &filename,
+                                "module parse error",
+                            ))
                         }
                     }
                 }
@@ -1013,10 +1007,9 @@ fn op_instantiate_module(scope: &mut v8::PinScope<'_, '_, ()>, module_id: i32) -
                         | v8::ModuleStatus::Evaluated => Ok(JsVal::Undefined),
                         // V8 CHECK-aborts on instantiating an errored
                         // module; surface its exception instead.
-                        v8::ModuleStatus::Errored => Err(VmError::JsError {
-                            message: module.get_exception().to_rust_string_lossy(scope),
-                            backtrace: vec![],
-                        }),
+                        v8::ModuleStatus::Errored => {
+                            Err(rejected_with(scope, module.get_exception()))
+                        }
                         _ => {
                             v8::tc_scope!(let tc, scope);
                             match module.instantiate_module(tc, resolve_imported) {
@@ -1047,6 +1040,7 @@ fn op_evaluate_module(
     scope: &mut v8::PinScope<'_, '_, ()>,
     module_id: i32,
     timeout_ms: u64,
+    report: Option<String>,
     outermost: bool,
 ) -> VmReply {
     // Top-level module code (and, under :auto, the microtasks its
@@ -1081,17 +1075,25 @@ fn op_evaluate_module(
                         // must not override their real outcome to Terminated.
                         let mut did_eval = false;
                         // V8 CHECK-aborts the process if evaluate runs on a
-                        // module that isn't exactly Instantiated, so guard
-                        // status explicitly rather than crash.
+                        // module that is not instantiated yet (Uninstantiated /
+                        // Instantiating), so guard status explicitly rather than
+                        // crash.
                         let out = match module.get_status() {
-                            v8::ModuleStatus::Errored => Err(VmError::JsError {
-                                message: module.get_exception().to_rust_string_lossy(scope),
-                                backtrace: vec![],
-                            }),
-                            v8::ModuleStatus::Evaluated => Ok(JsVal::Undefined),
-                            v8::ModuleStatus::Instantiated => {
+                            // (…one evaluated already, with no reporter: nothing more to do, or its error again)
+                            v8::ModuleStatus::Errored if report.is_none() => {
+                                Err(rejected_with(scope, module.get_exception()))
+                            }
+                            v8::ModuleStatus::Evaluated if report.is_none() => Ok(JsVal::Undefined),
+                            // (…and with one, Evaluate again, as HTML runs every script element's record — V8 hands back
+                            // the same evaluation promise, rejected with its error or still pending its top-level
+                            // await — so each run reports)
+                            v8::ModuleStatus::Instantiated
+                            | v8::ModuleStatus::Evaluated
+                            | v8::ModuleStatus::Errored => {
                                 did_eval = true;
                                 v8::tc_scope!(let tc, scope);
+                                let reporter =
+                                    report.as_deref().and_then(|name| global_function(tc, name));
                                 match module.evaluate(tc) {
                                     // A synchronous top-level throw yields a
                                     // *rejected* promise (not None); a pending
@@ -1099,12 +1101,27 @@ fn op_evaluate_module(
                                     // re-checked after the drain.
                                     Some(value) => {
                                         match v8::Local::<v8::Promise>::try_from(value) {
+                                            // (…its rejection the reporter's: a synchronous throw's at once, before
+                                            // whatever its script's runner does next — its element's `load`, Chrome —
+                                            // the top-level await's as it settles, a microtask)
+                                            Ok(p) if reporter.is_some() => {
+                                                if let Some(reporter) = reporter {
+                                                    if p.state() == v8::PromiseState::Rejected {
+                                                        p.mark_as_handled();
+                                                        let (receiver, reason) = (
+                                                            v8::undefined(tc).into(),
+                                                            p.result(tc),
+                                                        );
+                                                        reporter.call(tc, receiver, &[reason]);
+                                                    } else {
+                                                        p.catch(tc, reporter);
+                                                    }
+                                                }
+                                                Ok(JsVal::Undefined)
+                                            }
                                             Ok(p) if p.state() == v8::PromiseState::Rejected => {
                                                 let reason = p.result(tc);
-                                                Err(VmError::JsError {
-                                                    message: reason.to_rust_string_lossy(tc),
-                                                    backtrace: vec![],
-                                                })
+                                                Err(rejected_with(tc, reason))
                                             }
                                             Ok(p) => {
                                                 eval_promise = Some(v8::Global::new(tc, p));
@@ -1132,10 +1149,7 @@ fn op_evaluate_module(
                             let p = v8::Local::new(scope, &g);
                             if p.state() == v8::PromiseState::Rejected {
                                 let reason = p.result(scope);
-                                Err(VmError::JsError {
-                                    message: reason.to_rust_string_lossy(scope),
-                                    backtrace: vec![],
-                                })
+                                Err(rejected_with(scope, reason))
                             } else {
                                 out
                             }
@@ -1149,6 +1163,16 @@ fn op_evaluate_module(
         },
     );
     VmReply::Done(outcome)
+}
+
+// The function the current context's global has under `name`, or None.
+fn global_function<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    name: &str,
+) -> Option<v8::Local<'s, v8::Function>> {
+    let key = v8::String::new(scope, name)?;
+    let global = scope.get_current_context().global(scope);
+    v8::Local::<v8::Function>::try_from(global.get(scope, key.into())?).ok()
 }
 
 // get_module_namespace and is_graph_async both CHECK-abort (a release check, so
@@ -1179,10 +1203,7 @@ fn op_module_namespace(scope: &mut v8::PinScope<'_, '_, ()>, module_id: i32) -> 
                 // never initialized — and the useful answer is WHY it errored,
                 // the same one instantiate and evaluate give.
                 if module.get_status() == v8::ModuleStatus::Errored {
-                    Err(VmError::JsError {
-                        message: module.get_exception().to_rust_string_lossy(scope),
-                        backtrace: vec![],
-                    })
+                    Err(rejected_with(scope, module.get_exception()))
                 } else {
                     match require_instantiated(module, "namespace") {
                         Err(e) => Err(e),
@@ -1306,21 +1327,14 @@ fn op_compile_script(
                         None if tc.has_terminated() => Err(VmError::Terminated),
                         // Compile failure = a parse error (with location).
                         None => {
-                            let msg = tc
-                                .exception()
-                                .map(|e| e.to_rust_string_lossy(tc))
-                                .unwrap_or_else(|| "script parse error".to_string());
-                            let message = tc.message();
-                            let res = message
-                                .and_then(|m| m.get_script_resource_name(tc))
-                                .filter(|v| v.is_string())
-                                .map(|v| v.to_rust_string_lossy(tc))
-                                .unwrap_or_else(|| filename.clone());
-                            let loc = match message.and_then(|m| m.get_line_number(tc)) {
-                                Some(line) => format!(" at {res}:{line}"),
-                                None => format!(" at {res}"),
-                            };
-                            Err(VmError::Parse(format!("{msg}{loc}")))
+                            let (exc, message) = (tc.exception(), tc.message());
+                            Err(parse_error(
+                                tc,
+                                exc,
+                                message,
+                                &filename,
+                                "script parse error",
+                            ))
                         }
                     }
                 }

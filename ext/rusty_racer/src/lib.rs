@@ -59,7 +59,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once, Weak};
 
 use magnus::block::Proc;
@@ -72,7 +72,7 @@ use magnus::{
 mod marshal;
 use marshal::{JsVal, js_to_jsval, jsval_to_js, jsval_to_ruby, ruby_to_jsval};
 mod ops;
-use ops::{Compiled, Request, VmReply, run_source, service_request};
+use ops::{Compiled, Completion, Request, VmReply, run_source, service_request};
 mod stack;
 use stack::{STACK_DEBUG, StackScope, current_real_isolate, discover_scan_start_field};
 mod watchdog;
@@ -146,23 +146,58 @@ macro_rules! istate {
 pub(crate) use istate;
 
 // One attach()'d host fn: the realm it was attached into — so resetting or
-// disposing that realm can release it — whether it is still attached (the slot
-// index stays valid as a host_fn_id either way), and the name it was attached
-// under, kept only so a diagnostic can say which host function is involved (one
-// String per attach, never per call). The PROC itself lives in the roots array
-// at `proc_root_index(id)`, where the GC can see it without taking this lock.
+// disposing that realm can release it — whether it is still attached, which
+// occupant of the slot it is (`HostFnKey`), and the name it was attached under,
+// kept only so a diagnostic can say which host function is involved (one String
+// per attach, never per call). The PROC itself lives in the roots array at
+// `proc_root_index(index)`, where the GC can see it without taking this lock.
 struct ProcSlot {
     context_id: i32,
     live: bool,
+    generation: u32,
     name: String,
 }
 
-// The isolate's host-fn registry, indexed by host_fn_id. `free` lists slots
+// What a host function's V8 External carries: its slot, and the slot's generation
+// when it was attached. A slot is reused once its realm is released, but a function
+// of that realm can outlive the release — the embedder may still hold its document
+// — so a call has to prove it is the slot's CURRENT occupant, or it would run
+// whichever proc the slot was handed to next.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct HostFnKey {
+    index: u32,
+    generation: u32,
+}
+
+impl HostFnKey {
+    // (…both halves in one pointer-sized word: V8 builds for 64-bit targets alone.
+    // The word is stored as is only while V8's sandbox is off — the v8 crate's
+    // opt-in `v8_enable_sandbox`, which this crate leaves off; a sandboxed External
+    // goes through a pointer table that keeps tags in the high bits.)
+    pub(crate) fn to_external(self) -> *mut c_void {
+        const { assert!(usize::BITS >= 64) };
+        (((self.generation as u64) << 32) | self.index as u64) as usize as *mut c_void
+    }
+
+    fn from_external(value: *mut c_void) -> Self {
+        let value = value as usize as u64;
+        Self {
+            index: value as u32,
+            generation: (value >> 32) as u32,
+        }
+    }
+
+    fn index(self) -> usize {
+        self.index as usize
+    }
+}
+
+// The isolate's host-fn registry, indexed by HostFnKey::index. `free` lists slots
 // emptied by release_context_procs so a later attach reuses them instead of
 // growing `slots` forever — a long-lived process that re-navigates iframe
-// realms would otherwise leak one slot per attach. Reuse is safe because a slot
-// is only freed when its realm (and the V8 functions that carried its id) is
-// gone, so no stale V8 external can still call a recycled id.
+// realms would otherwise leak one slot per attach. A reused slot's generation
+// moves on, so a function of the released realm that is still reachable calls
+// a key the table no longer answers (`current`) instead of the new occupant.
 #[derive(Default)]
 struct ProcTable {
     slots: Vec<ProcSlot>,
@@ -170,15 +205,37 @@ struct ProcTable {
 }
 
 impl ProcTable {
-    // Take a free slot if one exists, else grow. Returns the host_fn_id.
-    fn alloc(&mut self, slot: ProcSlot) -> usize {
-        if let Some(id) = self.free.pop() {
-            self.slots[id] = slot;
-            id
-        } else {
-            self.slots.push(slot);
-            self.slots.len() - 1
+    // Take a free slot if one exists, its generation the next, else grow.
+    fn alloc(&mut self, context_id: i32, name: String) -> HostFnKey {
+        let (index, generation) = match self.free.pop() {
+            Some(index) => (index, self.slots[index].generation.wrapping_add(1)),
+            None => {
+                self.slots.push(ProcSlot {
+                    context_id,
+                    live: false,
+                    generation: 0,
+                    name: String::new(),
+                });
+                (self.slots.len() - 1, 0)
+            }
+        };
+        self.slots[index] = ProcSlot {
+            context_id,
+            live: true,
+            generation,
+            name,
+        };
+        HostFnKey {
+            index: index as u32,
+            generation,
         }
+    }
+
+    // Whether `key` is its slot's live occupant.
+    fn current(&self, key: HostFnKey) -> bool {
+        self.slots
+            .get(key.index())
+            .is_some_and(|slot| slot.live && slot.generation == key.generation)
     }
 
     // Release every live proc attached into |context_id| (its realm is gone),
@@ -202,11 +259,11 @@ impl ProcTable {
 // long as a wrapper of it is reachable, in one place the GC can be shown without
 // taking any Rust lock (a mark that had to lock `procs` could deadlock against
 // the thread whose allocation triggered the GC while holding it). Slot 0 is the
-// dynamic-import resolver; the attached host fns follow, one per host_fn_id.
+// dynamic-import resolver; the attached host fns follow, one per proc slot.
 const ROOT_IMPORT_RESOLVER: isize = 0;
 const ROOT_FIRST_PROC: isize = 1;
-fn proc_root_index(host_fn_id: usize) -> isize {
-    ROOT_FIRST_PROC + host_fn_id as isize
+fn proc_root_index(index: usize) -> isize {
+    ROOT_FIRST_PROC + index as isize
 }
 
 // Look up a RustyRacer::<name> exception class at raise time. The classes are
@@ -221,13 +278,18 @@ fn err_class(ruby: &Ruby, name: &str) -> ExceptionClass {
 
 #[derive(Debug)]
 enum VmError {
-    Parse(String),   // compile-time failure -> RustyRacer::ParseError
+    // compile-time failure -> RustyRacer::ParseError; the SyntaxError V8 made of
+    // it kept as for a JsError (`keep_thrown`)
+    Parse(String, Option<u64>),
     Runtime(String), // internal failure (no JS stack) -> RustyRacer::RuntimeError
     // A thrown JS exception: its message plus the JS stack frames, which become
-    // the Ruby exception's backtrace -> RustyRacer::RuntimeError.
+    // the Ruby exception's backtrace -> RustyRacer::RuntimeError — and the value
+    // thrown, kept (`keep_thrown`), so a host fn the error propagates out of
+    // throws it on.
     JsError {
         message: String,
         backtrace: Vec<String>,
+        thrown: Option<u64>,
     },
     Terminated,  // watchdog/stop -> RustyRacer::ScriptTerminatedError
     OutOfMemory, // memory_limit hit -> RustyRacer::V8OutOfMemoryError
@@ -330,9 +392,9 @@ where
 // instead of saying "a host function". Rendered only on that path, so an
 // ordinary callback pays for a pointer and nothing else.
 enum RubyCall<'a> {
-    // An attach()'d host function, by host_fn_id — the name it was attached
+    // An attach()'d host function, by its key — the name it was attached
     // under lives in the isolate's proc table.
-    HostFn(usize),
+    HostFn(HostFnKey),
     // A module resolver (a static instantiate block, a dynamic auto-link, or
     // import()), named by the specifier it was handed.
     Resolver(&'a str),
@@ -341,15 +403,17 @@ enum RubyCall<'a> {
 impl RubyCall<'_> {
     fn describe(&self, core: &Core) -> String {
         match self {
-            // try_lock, not lock: nothing holds this across a callback (the procs
-            // themselves are read from the roots array, without this lock), but
-            // blocking here would turn a diagnostic into a hang.
-            Self::HostFn(id) => match core
-                .procs
-                .try_lock()
-                .ok()
-                .and_then(|procs| procs.slots.get(*id).map(|slot| slot.name.clone()))
-            {
+            // try_lock, not lock: nothing holds this across a callback (`call_proc`
+            // holds it for one comparison, before the proc runs), but blocking here
+            // would turn a diagnostic into a hang. A slot handed on since names
+            // nobody: its name is another function's.
+            Self::HostFn(id) => match core.procs.try_lock().ok().and_then(|procs| {
+                procs
+                    .slots
+                    .get(id.index())
+                    .filter(|slot| slot.generation == id.generation)
+                    .map(|slot| slot.name.clone())
+            }) {
                 Some(name) => format!("The host function `{name}`"),
                 None => "A host function".to_string(),
             },
@@ -546,8 +610,8 @@ fn host_fn_callback(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let host_fn_id = match v8::Local::<v8::External>::try_from(args.data()) {
-        Ok(e) => e.value() as usize,
+    let host_fn = match v8::Local::<v8::External>::try_from(args.data()) {
+        Ok(e) => HostFnKey::from_external(e.value()),
         Err(_) => return,
     };
     let mut js_args = Vec::with_capacity(args.length() as usize);
@@ -574,20 +638,22 @@ fn host_fn_callback(
         return;
     }
     let core = unsafe { &*core_ptr };
-    let result: Result<JsVal, String> = with_gvl(core, RubyCall::HostFn(host_fn_id), || {
+    let result: Result<JsVal, HostFnFailure> = with_gvl(core, RubyCall::HostFn(host_fn), || {
         let ruby = Ruby::get().unwrap();
         // rb_protect so a Ruby exception raised during arg/return marshalling
         // (ary_new_capa / jsval_to_ruby / ruby_to_jsval can raise on OOM etc.)
         // is CAUGHT here instead of longjmp-ing through V8's C++ frames. The
         // proc's own raise is already a magnus Err; this covers the rest.
         use magnus::rb_sys::AsRawValue;
-        let mut out: Option<Result<JsVal, String>> = None;
+        let mut out: Option<Result<JsVal, HostFnFailure>> = None;
         match magnus::rb_sys::protect(|| {
-            out = Some(core.call_proc(&ruby, host_fn_id, &js_args));
+            out = Some(core.call_proc(&ruby, host_fn, &js_args));
             ruby.qnil().as_raw()
         }) {
-            Ok(_) => out.unwrap_or_else(|| Err("host function did not complete".into())),
-            Err(e) => Err(format!("{e}")),
+            Ok(_) => {
+                out.unwrap_or_else(|| Err("host function did not complete".to_string().into()))
+            }
+            Err(e) => Err(format!("{e}").into()),
         }
     });
     match result {
@@ -595,8 +661,30 @@ fn host_fn_callback(
             let v = jsval_to_js(scope, val);
             rv.set(v);
         }
-        // The proc raised (or marshalling failed): surface as a JS exception.
-        Err(message) => throw_js_error(scope, &message),
+        // The proc raised (or marshalling failed): surface as a JS exception —
+        // the value JS threw, where the error is one a JS throw became.
+        Err(failure) => match failure.thrown.and_then(|serial| take_thrown(scope, serial)) {
+            Some(thrown) => {
+                scope.throw_exception(thrown);
+            }
+            None => throw_js_error(scope, &failure.message),
+        },
+    }
+}
+
+// How a host fn failed: the Ruby error's text, and the serial of the JS value
+// it carries when a JS throw is what it became (`keep_thrown`).
+struct HostFnFailure {
+    message: String,
+    thrown: Option<u64>,
+}
+
+impl From<String> for HostFnFailure {
+    fn from(message: String) -> Self {
+        HostFnFailure {
+            message,
+            thrown: None,
+        }
     }
 }
 
@@ -696,7 +784,87 @@ fn capture_js_error(
     let backtrace = stack_str
         .map(|s| parse_js_stack(s.as_str()))
         .unwrap_or_default();
-    VmError::JsError { message, backtrace }
+    let thrown = keep_thrown(scope, exception);
+    VmError::JsError {
+        message,
+        backtrace,
+        thrown,
+    }
+}
+
+// A value JS failed with that no TryCatch caught — an errored module's
+// exception, a rejected promise's reason — as a JsError: its text, no stack
+// frames, and the value kept as a thrown one is.
+fn rejected_with(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) -> VmError {
+    VmError::JsError {
+        message: value.to_rust_string_lossy(scope),
+        backtrace: vec![],
+        thrown: keep_thrown(scope, Some(value)),
+    }
+}
+
+// A compile failure as a ParseError: V8's message, the location it recorded
+// (always the file, the line when it has one), and the SyntaxError kept as a
+// thrown value is.
+fn parse_error(
+    scope: &mut v8::PinScope<'_, '_>,
+    exception: Option<v8::Local<v8::Value>>,
+    message: Option<v8::Local<v8::Message>>,
+    filename: &str,
+    fallback: &str,
+) -> VmError {
+    let msg = exception
+        .map(|e| e.to_rust_string_lossy(scope))
+        .unwrap_or_else(|| fallback.to_string());
+    let res = message
+        .and_then(|m| m.get_script_resource_name(scope))
+        .filter(|v| v.is_string())
+        .map(|v| v.to_rust_string_lossy(scope))
+        .unwrap_or_else(|| filename.to_string());
+    let loc = match message.and_then(|m| m.get_line_number(scope)) {
+        Some(line) => format!(" at {res}:{line}"),
+        None => format!(" at {res}"),
+    };
+    VmError::Parse(format!("{msg}{loc}"), keep_thrown(scope, exception))
+}
+
+// Keep the value JS threw, so a host fn that lets the Ruby error it became
+// propagate throws THAT value on — its identity, class and stack — rather than a
+// fresh Error made of its text: a script a host fn ran for JS fails in JS as the
+// script did. One slot per isolate, since only the latest thrown value can still
+// be on its way back out, and only until the outermost op returns (`Core::run`),
+// since only a host fn inside it can still ask — kept longer, it would pin the
+// value, and its realm, for as long as nothing else threw. The serial (carried
+// by the Ruby exception, see `carrying_thrown`) tells it from a stale one, and is
+// drawn process-wide, so an error another isolate's op raised never matches this
+// one's slot: its value cannot cross isolates. None on an isolate with no state
+// (the snapshot creator's), where no host fn can ask.
+fn keep_thrown(
+    scope: &mut v8::PinScope<'_, '_>,
+    exception: Option<v8::Local<v8::Value>>,
+) -> Option<u64> {
+    static SERIAL: AtomicU64 = AtomicU64::new(0);
+    let exception = exception?;
+    let kept = v8::Global::new(scope, exception);
+    let state = scope.get_slot_mut::<IsolateState>()?;
+    let serial = SERIAL.fetch_add(1, Ordering::Relaxed) + 1;
+    state.thrown = Some((serial, kept));
+    Some(serial)
+}
+
+// The Ruby exception's kept thrown value (`keep_thrown`), when it still is the
+// latest: taken, as it is thrown once.
+fn take_thrown<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    serial: u64,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let state = scope.get_slot_mut::<IsolateState>()?;
+    let (kept_serial, _) = state.thrown.as_ref()?;
+    if *kept_serial != serial {
+        return None;
+    }
+    let (_, kept) = state.thrown.take()?;
+    Some(v8::Local::new(scope, kept))
 }
 
 // ---------------------------------------------------------------------------
@@ -864,6 +1032,8 @@ struct IsolateState {
     // the ScriptTerminatedError can name what was running. Taken (cleared) when the
     // terminated op's error is built; None for any non-timeout outcome.
     timeout_backtrace: Option<Vec<String>>,
+    // The latest value JS threw out of an op, with its serial (`keep_thrown`).
+    thrown: Option<(u64, v8::Global<v8::Value>)>,
 }
 
 impl IsolateState {
@@ -888,6 +1058,7 @@ impl IsolateState {
             oom_fired: false,
             oom_initial_limit: 0,
             timeout_backtrace: None,
+            thrown: None,
         }
     }
 }
@@ -973,7 +1144,7 @@ fn transfer_registry() -> &'static Mutex<HashMap<u64, SendBackingStore>> {
 // Monotonic token source. Starts at 1 so 0 is free as the JS-side "not
 // transferable — fall back to a copy" sentinel. A token is f64-exact for ~2^53
 // transfers, which a process will never reach.
-static NEXT_TRANSFER_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static NEXT_TRANSFER_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 // Drain EVERY realm's microtask queue once. Each realm has its own queue (see
 // V8State::queues), so a single scope.perform_microtask_checkpoint() — which only
@@ -1534,7 +1705,7 @@ struct Core {
     // layout. Read on the V8 side without the GVL (the import hooks), which is
     // sound because the entries are pinned and nothing here allocates or raises.
     roots: Opaque<RArray>,
-    // host_fn_id indexes ProcTable.slots — bookkeeping only (the proc itself is in
+    // A HostFnKey indexes ProcTable.slots — bookkeeping only (the proc itself is in
     // `roots`). Mutex (uncontended — single owner thread) so host_fn_callback can
     // reach it through Core (via the slot's core_ptr) while a &Core method also
     // holds it. reset/dispose releases the slots and recycles them.
@@ -2253,11 +2424,11 @@ fn build_snapshot(code: &str, base: Option<Vec<u8>>, warmup: bool) -> Result<Vec
                     // leaves behind); nothing reads its completion value, so
                     // don't marshal it — a bundle ending in an expression must
                     // not fail the snapshot over a value no one wants.
-                    true,
+                    Completion::Void,
                 )
             {
                 err = Some(match e {
-                    VmError::Parse(m) | VmError::Runtime(m) => m,
+                    VmError::Parse(m, _) | VmError::Runtime(m) => m,
                     VmError::JsError { message, .. } => message,
                     VmError::Terminated => "snapshot code was terminated".to_string(),
                     // Unreachable: the snapshot-creator is a separate isolate
@@ -2641,6 +2812,9 @@ impl Core {
             // on an op.
             if reply.is_none() {
                 self.shared.lock().unwrap().disposed = true;
+            } else if depth == 0 {
+                // No host fn is left to throw a kept value on (`keep_thrown`).
+                istate!(unsafe { &mut *iso }).thrown = None;
             }
             self.depth.fetch_sub(1, Ordering::SeqCst);
             reply
@@ -2741,15 +2915,24 @@ impl Core {
         }
     }
 
-    fn call_proc(&self, ruby: &Ruby, host_fn_id: usize, args: &[JsVal]) -> Result<JsVal, String> {
-        // Straight from the roots array — a released (or never-attached) id reads
-        // back nil, which is the same "unknown host function" the slot table would
-        // have reported, so the hot path takes no lock at all. `root_proc` and not
-        // `RArray::entry`, for the reason given there: a nil slot must answer None,
-        // never dispatch `to_proc` and raise.
+    fn call_proc(
+        &self,
+        ruby: &Ruby,
+        host_fn: HostFnKey,
+        args: &[JsVal],
+    ) -> Result<JsVal, HostFnFailure> {
+        // A function of a released realm is refused here, before its slot's roots
+        // entry is read: that entry may by now hold another realm's proc. (The lock
+        // is uncontended and held for the comparison alone — nothing here allocates,
+        // so no GC can need it meanwhile.)
+        if !self.procs.lock().unwrap().current(host_fn) {
+            return Err("unknown host function".to_string().into());
+        }
+        // `root_proc` and not `RArray::entry`, for the reason given there: a nil
+        // slot must answer None, never dispatch `to_proc` and raise.
         let proc = self
-            .root_proc(proc_root_index(host_fn_id))
-            .ok_or("unknown host function")?;
+            .root_proc(proc_root_index(host_fn.index()))
+            .ok_or_else(|| "unknown host function".to_string())?;
         // Marshal into a Ruby Array, NOT a Vec<Value>: bare Values in a heap Vec
         // are hidden from Ruby's GC mark phase (magnus's own RArray::to_vec doc
         // spells this out). With several args, once arg N is parked in the Vec
@@ -2769,8 +2952,11 @@ impl Core {
         // op the proc issues re-enters Core::run (depth > 0) directly — no nested
         // frame bookkeeping is needed any more (the call stack IS the nesting).
         let result: Result<Value, Error> = proc.call(unsafe { ruby_args.as_slice() });
-        let value = result.map_err(|e| e.to_string())?;
-        ruby_to_jsval(value).map_err(|e| e.to_string())
+        let value = result.map_err(|e| HostFnFailure {
+            message: e.to_string(),
+            thrown: thrown_serial_of(&e),
+        })?;
+        ruby_to_jsval(value).map_err(|e| e.to_string().into())
     }
 
     // Context#call (and call_void). Resolves a dotted function path
@@ -2880,7 +3066,7 @@ impl Core {
         source: String,
         filename: String,
         timeout_ms: u64,
-        void: bool,
+        completion: Completion,
     ) -> Result<Value, Error> {
         let reply = self.run(
             ruby,
@@ -2889,7 +3075,7 @@ impl Core {
                 source,
                 filename,
                 timeout_ms,
-                void,
+                completion,
             },
         )?;
         self.reply_value(ruby, reply)
@@ -2906,18 +3092,14 @@ impl Core {
         // array's element storage, which the import hooks read with the GVL released —
         // and a refused attach must not consume a slot or leave its proc rooted either.
         self.ensure_owner_and_live(ruby)?;
-        let host_fn_id = self.procs.lock().unwrap().alloc(ProcSlot {
-            context_id,
-            live: true,
-            name: name.clone(),
-        });
-        self.root_store(ruby, proc_root_index(host_fn_id), proc)?;
+        let host_fn = self.procs.lock().unwrap().alloc(context_id, name.clone());
+        self.root_store(ruby, proc_root_index(host_fn.index()), proc)?;
         let reply = self.run(
             ruby,
             Request::Attach {
                 context_id,
                 name,
-                host_fn_id,
+                host_fn,
                 timeout_ms: self.default_timeout_ms,
             },
         )?;
@@ -2926,7 +3108,7 @@ impl Core {
 
     // attach_many: install several host fns in ONE round-trip to the V8 thread
     // (a fresh realm needs ~dozens; one rendezvous instead of one per fn). Slots
-    // are allocated up front so each carries a stable host_fn_id; entries are
+    // are allocated up front so each carries a stable key; entries are
     // applied IN ORDER and a build/attach failure aborts the batch with that
     // (name-tagged) error WITHOUT rolling back earlier entries (see the
     // AttachMany arm). On that error path the unused slots are reclaimed at the
@@ -2941,18 +3123,11 @@ impl Core {
             return Ok(ruby.qnil().as_value()); // nothing to install, skip the round-trip
         }
         self.ensure_owner_and_live(ruby)?; // before the roots writes — see `attach`
-        let allocated: Vec<(String, usize, Proc)> = {
+        let allocated: Vec<(String, HostFnKey, Proc)> = {
             let mut procs = self.procs.lock().unwrap();
             entries
                 .into_iter()
-                .map(|(name, proc)| {
-                    let id = procs.alloc(ProcSlot {
-                        context_id,
-                        live: true,
-                        name: name.clone(),
-                    });
-                    (name, id, proc)
-                })
+                .map(|(name, proc)| (name.clone(), procs.alloc(context_id, name), proc))
                 .collect()
         };
         // Stored OUTSIDE the table's lock: storing into the array can allocate (the
@@ -2960,16 +3135,16 @@ impl Core {
         // wrappers, a path that must never wait on `procs`. The Procs parked in the
         // Vec meanwhile are invisible to the GC (see call_proc's note), but the caller's
         // `table: RHash` argument is live in its own frame and marks every one of them.
-        let mut named_ids: Vec<(String, usize)> = Vec::with_capacity(allocated.len());
-        for (name, id, proc) in allocated {
-            self.root_store(ruby, proc_root_index(id), proc)?;
-            named_ids.push((name, id));
+        let mut named_keys: Vec<(String, HostFnKey)> = Vec::with_capacity(allocated.len());
+        for (name, key, proc) in allocated {
+            self.root_store(ruby, proc_root_index(key.index()), proc)?;
+            named_keys.push((name, key));
         }
         let reply = self.run(
             ruby,
             Request::AttachMany {
                 context_id,
-                entries: named_ids,
+                entries: named_keys,
                 timeout_ms: self.default_timeout_ms,
             },
         )?;
@@ -2977,11 +3152,12 @@ impl Core {
     }
 
     // Drop the procs attached into |context_id| out of the roots array — its
-    // realm is gone (reset or disposed), so the V8-side functions that referenced
-    // them are unreachable, and holding them would keep the embedder's world alive
-    // for the rest of the isolate's life. Runs on a Ruby thread: it writes nil
-    // into the Array. The slots stay: host_fn_ids of other realms are indices into
-    // the same Vec.
+    // realm is gone (reset or disposed), and holding them would keep the embedder's
+    // world alive for the rest of the isolate's life. A V8 function of that realm
+    // may still be reachable (the embedder can hold the old global), but its key
+    // stops answering (`ProcTable::current`), so it never calls a proc again.
+    // Runs on a Ruby thread: it writes nil into the Array. The slots stay: the
+    // keys of other realms are indices into the same Vec.
     fn release_context_procs(&self, ruby: &Ruby, context_id: i32) {
         // Nil the entries BEFORE the ids go back on the free list, so no attach can
         // ever be handed an id whose old proc is still in the array.
@@ -3094,12 +3270,18 @@ impl Core {
         self.reply_value(ruby, reply?)
     }
 
-    fn evaluate_module(&self, ruby: &Ruby, module_id: i32) -> Result<Value, Error> {
+    fn evaluate_module(
+        &self,
+        ruby: &Ruby,
+        module_id: i32,
+        report: Option<String>,
+    ) -> Result<Value, Error> {
         let reply = self.run(
             ruby,
             Request::EvaluateModule {
                 module_id,
                 timeout_ms: self.default_timeout_ms,
+                report,
             },
         )?;
         self.reply_value(ruby, reply)
@@ -3443,14 +3625,14 @@ impl Context {
         Ok(())
     }
     // timeout_ms 0 = use the isolate's default; an explicit value overrides it.
-    // |void| discards the completion value instead of marshalling it.
+    // |completion| 0 marshals the completion value, 1 discards it, 2 keeps a primitive alone (`Completion`).
     fn eval(
         ruby: &Ruby,
         rb_self: &Self,
         source: String,
         timeout_ms: u64,
         filename: String,
-        void: bool,
+        completion: u8,
     ) -> Result<Value, Error> {
         rb_self.check_live(ruby)?;
         let timeout = if timeout_ms == 0 {
@@ -3458,9 +3640,14 @@ impl Context {
         } else {
             timeout_ms
         };
+        let completion = match completion {
+            1 => Completion::Void,
+            2 => Completion::Primitive,
+            _ => Completion::Value,
+        };
         rb_self
             .core
-            .eval_t(ruby, rb_self.id, source, filename, timeout, void)
+            .eval_t(ruby, rb_self.id, source, filename, timeout, completion)
     }
     fn call(ruby: &Ruby, rb_self: &Self, args: &[Value]) -> Result<Value, Error> {
         rb_self.check_live(ruby)?;
@@ -3649,9 +3836,12 @@ impl JsModule {
             .core
             .instantiate_module(ruby, rb_self.module_id, resolver)
     }
-    fn evaluate(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
+    // |report|: nil, or the name of the context global that reports the evaluation's rejection (`Request::EvaluateModule`).
+    fn evaluate(ruby: &Ruby, rb_self: &Self, report: Option<String>) -> Result<Value, Error> {
         rb_self.check_live(ruby)?;
-        rb_self.core.evaluate_module(ruby, rb_self.module_id)
+        rb_self
+            .core
+            .evaluate_module(ruby, rb_self.module_id, report)
     }
     fn namespace(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
         rb_self.check_live(ruby)?;
@@ -3808,9 +3998,15 @@ fn binary_bytes(
 
 fn vm_err(ruby: &Ruby, e: VmError) -> Error {
     match e {
-        VmError::Parse(m) => Error::new(err_class(ruby, "ParseError"), m),
+        VmError::Parse(m, thrown) => {
+            carrying_thrown(Error::new(err_class(ruby, "ParseError"), m), thrown)
+        }
         VmError::Runtime(m) => Error::new(err_class(ruby, "RuntimeError"), m),
-        VmError::JsError { message, backtrace } => js_runtime_error(ruby, message, backtrace),
+        VmError::JsError {
+            message,
+            backtrace,
+            thrown,
+        } => carrying_thrown(js_runtime_error(ruby, message, backtrace), thrown),
         VmError::Terminated => Error::new(
             err_class(ruby, "ScriptTerminatedError"),
             "JavaScript was terminated (timeout or stop)",
@@ -3850,6 +4046,42 @@ fn terminated_error(ruby: &Ruby, js_backtrace: Option<Vec<String>>) -> Error {
         Some(e) => Error::from(e),
         None => Error::new(class, message),
     }
+}
+
+// The ivar a Ruby exception carries its thrown value's serial in (`keep_thrown`),
+// beside the message it was raised with.
+const THROWN_IVAR: &str = "@__rusty_racer_thrown";
+
+// |error| as an instance carrying |thrown|'s serial, for a host fn it propagates
+// out of to throw the kept value on (`take_thrown`).
+fn carrying_thrown(error: Error, thrown: Option<u64>) -> Error {
+    let Some(serial) = thrown else {
+        return error;
+    };
+    match error_to_exception(&error) {
+        Some(exc) => {
+            let Ok(message) = exc.funcall::<_, _, Value>("message", ()) else {
+                return Error::from(exc);
+            };
+            let _ = exc
+                .funcall::<_, _, Value>("instance_variable_set", (THROWN_IVAR, (serial, message)));
+            Error::from(exc)
+        }
+        None => error,
+    }
+}
+
+// The serial of the thrown value a host fn's raised |error| carries, if any — not
+// when Ruby re-raised it with a message of its own (`raise e, 'other'` copies
+// the ivar): that error says something the value does not.
+fn thrown_serial_of(error: &Error) -> Option<u64> {
+    let exc = error_to_exception(error)?;
+    let (serial, message): (u64, Value) = exc
+        .funcall::<_, _, Option<(u64, Value)>>("instance_variable_get", (THROWN_IVAR,))
+        .ok()
+        .flatten()?;
+    let now: Value = exc.funcall("message", ()).ok()?;
+    now.eql(message).ok()?.then_some(serial)
 }
 
 // Build a RustyRacer::RuntimeError carrying the JS stack as its Ruby backtrace.
@@ -3961,7 +4193,7 @@ pub fn install_classes(ruby: &Ruby) -> Result<(), Error> {
     // A v8::Context (realm): eval/call/attach/compile_module.
     let context = module.define_class("Context", ruby.class_object())?;
     // Backs both keyword-arg wrappers in lib: Context#eval(source, timeout_ms:,
-    // filename:) and #eval_void, which differ only in the 4th arg (the void flag).
+    // filename:), #eval_void and #eval_primitive, which differ only in the 4th arg (what they keep of the completion value).
     context.define_method("_eval", method!(Context::eval, 4))?;
     context.define_method("call", method!(Context::call, -1))?;
     context.define_method("call_void", method!(Context::call_void, -1))?;
@@ -3996,7 +4228,7 @@ pub fn install_classes(ruby: &Ruby) -> Result<(), Error> {
     // Thin ES-module handle: Context#compile_module -> instantiate/evaluate.
     let jsmodule = module.define_class("Module", ruby.class_object())?;
     jsmodule.define_method("_instantiate", method!(JsModule::instantiate, 1))?;
-    jsmodule.define_method("evaluate", method!(JsModule::evaluate, 0))?;
+    jsmodule.define_method("_evaluate", method!(JsModule::evaluate, 1))?;
     jsmodule.define_method("namespace", method!(JsModule::namespace, 0))?;
     jsmodule.define_method("_status", method!(JsModule::status, 0))?;
     jsmodule.define_method("graph_async?", method!(JsModule::graph_async, 0))?;

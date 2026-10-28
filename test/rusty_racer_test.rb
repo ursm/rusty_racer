@@ -466,6 +466,38 @@ class RustyRacerTest < Minitest::Test
     end
   end
 
+  def test_a_disposed_realms_host_fn_held_elsewhere_never_runs_the_slots_next_proc
+    # A realm's function can outlive the realm — here the main context keeps it,
+    # as an embedder's page keeps a navigated-away frame's document. Its slot is
+    # recycled by the next attach (the only free one in this isolate), and the old
+    # function must not call the new proc.
+    iso   = RustyRacer::Isolate.new(host_namespace: 'NS')
+    ctx   = iso.context
+    frame = iso.create_context
+    frame.attach('f', proc { 'old' })
+    ctx.eval("globalThis.kept = NS.contextGlobal(#{frame.id}).f")
+    assert_equal 'old', ctx.eval('kept()')
+    frame.dispose
+    fresh = iso.create_context
+    fresh.attach('g', proc { 'new' })
+    assert_equal 'new', fresh.eval('g()')
+    assert_equal 'unknown host function', ctx.eval('try { kept(); "ran" } catch (e) { e.message }')
+  end
+
+  def test_a_reset_realms_host_fn_held_elsewhere_never_runs_the_slots_next_proc
+    # …and so through a reset, the realm's id kept: the re-attach after it takes the
+    # freed slot (this isolate has no other), and the kept function must not reach it.
+    iso   = RustyRacer::Isolate.new(host_namespace: 'NS')
+    ctx   = iso.context
+    frame = iso.create_context
+    frame.attach('f', proc { 'old' })
+    ctx.eval("globalThis.kept = NS.contextGlobal(#{frame.id}).f")
+    frame.reset
+    frame.attach('f', proc { 'new' })
+    assert_equal 'new', frame.eval('f()')
+    assert_equal 'unknown host function', ctx.eval('try { kept(); "ran" } catch (e) { e.message }')
+  end
+
   def test_heap_statistics_reports_v8_heap
     iso = RustyRacer::Isolate.new
     ctx = iso.context
@@ -903,6 +935,72 @@ class RustyRacerTest < Minitest::Test
     @ctx.eval("Object.defineProperty(globalThis, 'victim', { set() { globalThis.captured = probe() }, configurable: true })")
     @ctx.attach("victim", proc { 1 })
     assert_equal "ruby-saw-it", @ctx.eval("globalThis.captured")
+  end
+
+  # A host fn that lets the error a JS throw became propagate throws THAT value on — the one its script threw, not a
+  # fresh Error made of its text — so the JS that called it catches what was thrown.
+  def test_a_host_fn_rethrows_the_value_its_script_threw
+    @ctx.attach('runIt', proc {|src| @ctx.eval(src) })
+    assert_equal [true, 'boom'], @ctx.eval(<<~JS)
+      const thrown = new RangeError('boom');
+      globalThis.thrown = thrown;
+      try { runIt('throw globalThis.thrown'); } catch (e) { [e === thrown, e.message]; }
+    JS
+    assert_equal 42, @ctx.eval("try { runIt('throw 42') } catch (e) { e }")
+    assert_equal true, @ctx.eval("try { runIt('var = ;') } catch (e) { e instanceof SyntaxError }")
+  end
+
+  def test_a_host_fn_raising_its_own_error_throws_an_error_of_its_text
+    @ctx.attach('runIt', proc {|src|
+      begin
+        @ctx.eval(src)
+      rescue RustyRacer::RuntimeError
+        raise 'replaced'
+      end
+    })
+    assert_equal 'replaced', @ctx.eval("try { runIt('throw 42') } catch (e) { e.message }")
+    # …and an error kept from an EARLIER throw is not the latest one's to stand for
+    @ctx.attach('stale', proc {
+      @kept ||= begin
+        @ctx.eval('throw 1')
+      rescue RustyRacer::RuntimeError => e
+        e
+      end
+      begin
+        @ctx.eval('throw 2')
+      rescue RustyRacer::RuntimeError
+        nil
+      end
+      raise @kept
+    })
+    assert_equal 'Error', @ctx.eval('try { stale() } catch (e) { e.constructor.name }')
+  end
+
+  # …nor is one from an earlier op, nor another isolate's, nor one Ruby re-raised with a message of its own.
+  def test_a_host_fn_rethrows_only_the_value_its_own_op_threw
+    kept = begin
+      @ctx.eval('throw globalThis.earlier = new TypeError("earlier")')
+    rescue RustyRacer::RuntimeError => e
+      e
+    end
+    @ctx.attach('raiseKept', proc { raise kept })
+    assert_equal [false, 'Error'], @ctx.eval('try { raiseKept() } catch (e) { [e === earlier, e.constructor.name] }')
+
+    other = RustyRacer::Isolate.new.context
+    @ctx.attach('runOther', proc {|src| other.eval(src) })
+    assert_equal [false, 'Error'], @ctx.eval(<<~JS)
+      try { throw globalThis.mine = new TypeError('mine') } catch (_) {}
+      try { runOther('throw new RangeError("theirs")') } catch (e) { [e === mine, e.constructor.name] }
+    JS
+
+    @ctx.attach('rephrase', proc {|src|
+      begin
+        @ctx.eval(src)
+      rescue RustyRacer::RuntimeError => e
+        raise e, 'rephrased'
+      end
+    })
+    assert_equal 'rephrased', @ctx.eval("try { rephrase('throw new Error(\"x\")') } catch (e) { e.message }")
   end
 
   def test_attach_does_not_clobber_primitive_global
@@ -1358,6 +1456,35 @@ class RustyRacerTest < Minitest::Test
     assert_equal 21, dep.namespace["x"]
   end
 
+  def test_es_module_evaluate_reports_its_rejection_to_the_named_global
+    # HTML "run a module script": upon rejection, report the exception — a top-level throw's before evaluate returns, a
+    # top-level await's as it settles, the reason the value thrown, and nothing raised
+    @ctx.eval('globalThis.reported = []; globalThis.report = (e) => reported.push(e && e.message || String(e));')
+    sync = @ctx.compile_module('throw new Error("boom");', filename: '/sync.js')
+    sync.instantiate { nil }
+    assert_nil sync.evaluate(report: 'report')
+    assert_equal ['boom'], @ctx.eval('reported')
+    tla = @ctx.compile_module('await new Promise((r) => setTimeout(r, 0)); throw 7;', filename: '/tla.js')
+    @ctx.eval('globalThis.setTimeout = (f) => Promise.resolve().then(f);')
+    tla.instantiate { nil }
+    tla.evaluate(report: 'report')
+    @ctx.eval('0')
+    assert_equal %w[boom 7], @ctx.eval('reported')
+    # (…every run of the record reports: an errored one's error, a pending top-level await's settling)
+    sync.evaluate(report: 'report')
+    assert_equal %w[boom 7 boom], @ctx.eval('reported')
+    pend = @ctx.compile_module('await new Promise((r) => setTimeout(r, 0)); throw 8;', filename: '/pend.js')
+    pend.instantiate { nil }
+    pend.evaluate(report: 'report')
+    pend.evaluate(report: 'report')
+    @ctx.eval('0')
+    assert_equal %w[boom 7 boom 8 8], @ctx.eval('reported')
+    # (…and with no reporter named, a throw still raises)
+    plain = @ctx.compile_module('throw new Error("raised");', filename: '/plain.js')
+    plain.instantiate { nil }
+    assert_raises(RustyRacer::RuntimeError) { plain.evaluate }
+  end
+
   def test_es_module_unresolved_import_raises
     app = @ctx.compile_module('import {x} from "./missing.js";', filename: "/app.js")
     e = assert_raises(RustyRacer::RuntimeError) { app.instantiate { |_spec, _ref| nil } }
@@ -1481,6 +1608,19 @@ class RustyRacerTest < Minitest::Test
     s = @ctx.compile(src)
     assert_raises(RustyRacer::RuntimeError) { s.run }
     assert_nil s.run_void
+  end
+
+  def test_eval_primitive_keeps_a_primitive_and_never_walks_an_object
+    # a top-level Script whose completion value is wanted only where it is a string or a number: an object it ends
+    # with — here one whose marshal would throw — is nil, never walked, while its declarations stay the global's
+    assert_equal 'str', @ctx.eval_primitive("let lx = 1; 'str'")
+    assert_equal 'number', @ctx.eval('typeof lx')
+    assert_equal 3, @ctx.eval_primitive('1 + 2')
+    assert_nil @ctx.eval_primitive('new Proxy({}, {ownKeys() { throw new Error("walked") }})')
+    assert_nil @ctx.eval_primitive('Symbol("s")')
+    assert_nil @ctx.eval_primitive('undefined')
+    e = assert_raises(RustyRacer::RuntimeError) { @ctx.eval_primitive('throw new Error("thrown")') }
+    assert_includes e.message, 'thrown'
   end
 
   def test_eval_void_still_reports_a_real_failure
