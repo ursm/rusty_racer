@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 
 use magnus::rb_sys::{AsRawValue, FromRawValue};
-use magnus::value::ReprValue;
+use magnus::value::{Lazy, ReprValue};
 use magnus::{
     Error, ExceptionClass, IntoValue, RArray, RHash, RString, Ruby, TryConvert, Value, prelude::*,
 };
@@ -78,6 +78,10 @@ pub(crate) enum JsVal {
     // Back-reference to an already-emitted container (preserves identity; makes
     // cycles representable instead of truncating at a depth cap).
     Ref(u32),
+    // Ruby RustyRacer::HOST_OBJECT <-> a realm's host object (`crate::host_object`):
+    // that of the realm an op runs in — a Context's, a Function handle's, a host
+    // function's own — both ways. Another realm's host object reads as an object.
+    HostObject,
 }
 
 // Cycles and sharing are handled by the Ref table (see JsVal::Ref), so this is
@@ -340,6 +344,14 @@ fn js_to_jsval_d(
     // their toString (the spike's primitive escape hatch).
     if value.is_object() && !value.is_function() {
         let obj = v8::Local::<v8::Object>::try_from(value).unwrap();
+        // The realm's own host object crosses back as RustyRacer::HOST_OBJECT,
+        // not as a Hash of what the bindings keep there. Only an object with no
+        // prototype can be it, which keeps the private read off the common path.
+        if obj.get_prototype(scope).is_some_and(|p| p.is_null())
+            && crate::existing_host_object(scope).is_some_and(|host| host == obj)
+        {
+            return JsVal::HostObject;
+        }
         let id = match js_container_id(scope, seen, value, obj, depth) {
             Ok(id) => id,
             Err(jsval) => return jsval,
@@ -539,6 +551,7 @@ fn jsval_to_js_d<'s>(
         JsVal::Ref(id) => built
             .get(scope, id)
             .unwrap_or_else(|| v8::undefined(scope).into()),
+        JsVal::HostObject => crate::host_object(scope).into(),
     }
 }
 
@@ -669,8 +682,31 @@ fn jsval_to_ruby_d(
             .get(id)
             .copied()
             .unwrap_or_else(|| ruby.qnil().as_value()),
+        JsVal::HostObject => ruby.get_inner(&HOST_OBJECT),
     })
 }
+
+// RustyRacer::HOST_OBJECT: the Ruby value that stands for a realm's host object
+// as it crosses into JS (JsVal::HostObject). The one instance of
+// RustyRacer::HostObject, whose allocator is undefined once it is made, so no
+// other can be; marked for good (Lazy), so it never moves either.
+fn host_object_inspect(_host: Value) -> &'static str {
+    "RustyRacer::HOST_OBJECT"
+}
+
+pub(crate) static HOST_OBJECT: Lazy<Value> = Lazy::new(|ruby| {
+    let class = ruby
+        .define_module("RustyRacer")
+        .and_then(|module| module.define_class("HostObject", ruby.class_object()))
+        .expect("RustyRacer::HostObject is definable");
+    class
+        .define_method("inspect", magnus::method!(host_object_inspect, 0))
+        .expect("HostObject#inspect is definable");
+    let host: Value = class.new_instance(()).expect("a HostObject is allocatable");
+    host.freeze();
+    class.undef_default_alloc_func();
+    host
+});
 
 // A Ruby String marshalled by its encoding TAG (the tag is the type):
 //   - ASCII-8BIT (binary) -> JsVal::Bytes (a JS Uint8Array);
@@ -841,6 +877,11 @@ fn ruby_to_jsval_d(val: Value, seen: &mut RbSeen, depth: u32) -> Result<JsVal, E
         return hash_to_jsval(&ruby, hash, val, seen, depth);
     }
     // What only a class, or a conversion method, can say.
+    //
+    // RustyRacer::HOST_OBJECT -> the realm's host object, by identity.
+    if val.as_raw() == ruby.get_inner(&HOST_OBJECT).as_raw() {
+        return Ok(JsVal::HostObject);
+    }
     //
     // Ruby Time -> JS Date. Before the Numeric fallback: magnus's f64 TryConvert
     // coerces a Time via to_f, so it would otherwise marshal as a bare epoch
@@ -1145,6 +1186,40 @@ mod tests {
                     as_string(scope, "[v[0].get('a'), v[1].has(2)].join()"),
                     "1,true"
                 );
+            },
+        );
+    }
+
+    #[test]
+    fn the_host_object_is_one_per_realm_and_no_property_of_its_global() {
+        in_context(
+            "globalThis.keys = Reflect.ownKeys(globalThis).length",
+            |scope| {
+                let value = jsval_to_js(
+                    scope,
+                    JsVal::Array {
+                        id: 0,
+                        items: vec![JsVal::HostObject, JsVal::HostObject],
+                    },
+                );
+                let held = crate::host_object(scope);
+                let key = v8::String::new(scope, "held").unwrap();
+                held.create_data_property(scope, key.into(), v8::Integer::new(scope, 7).into());
+                global_set(scope, "v", value);
+                // (…the global's keys grown by `keys` and `v` alone)
+                assert_eq!(
+                    as_string(
+                        scope,
+                        "[v[0] === v[1], v[0].held, Object.getPrototypeOf(v[0]), Reflect.ownKeys(globalThis).length - keys].join()"
+                    ),
+                    "true,7,,2"
+                );
+                // (…another realm's is its own)
+                let other = v8::Context::new(scope, Default::default());
+                let scope = &mut v8::ContextScope::new(scope, other);
+                let fresh = crate::host_object(scope);
+                assert!(fresh != held);
+                assert!(crate::host_object(scope) == fresh);
             },
         );
     }

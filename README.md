@@ -123,6 +123,62 @@ realm (`frames[0].fn` in an embedder whose realms see each other) holds that
 realm's function for as long as the handle's own realm lives, as any reference
 kept there would.
 
+### The host object
+
+An embedder that runs a page's script beside its own bindings wants the host's
+functions where the bindings can call them and the page can't. Every realm has a
+**host object** for that: an object of the realm with no prototype, which no
+global holds — the global keeps it under a V8 private key, which no script can
+name. A path the host names that begins with `@` starts there instead of at
+`globalThis`:
+
+```ruby
+# rusty_racer's own functions (contextGlobal, contextOf, drainMicrotasks, …)
+# there too, rather than on a global
+iso = RustyRacer::Isolate.new(host_namespace: "@RustyRacer")
+ctx = iso.context
+
+# Host functions the page never sees: no global, nothing to read, call or replace.
+ctx.attach("@fetch", ->(url) { fetch(url) })
+ctx.attach_many("@net.open" => open_proc, "@net.close" => close_proc)
+
+# The bindings are handed the object as an argument — HOST_OBJECT crosses into
+# JS as the realm's host object — and keep it in a closure or a module binding.
+ctx.call("installBindings", RustyRacer::HOST_OBJECT)
+
+# What they put there, the host calls by its path, with no global name.
+query = ctx.function("@steps.query")  # host.steps.query, `this` = host.steps
+query.call("#main")
+ctx.call("@steps.flush")
+mod.evaluate(report: "@reportError")  # Module#evaluate's reporter, too
+```
+
+An `@` path is walked through **own** properties alone: the intermediates an
+`@` attach makes (`@net` above) have no prototype either, every property it
+makes is *defined*, and a segment an object lacks reads as missing rather than
+off its prototype — so no accessor a page put on `Object.prototype` or
+`Function.prototype` sees the walk, takes the host's function, or hands the host
+one of its own. A `Module#evaluate(report:)` `@` path is walked the same way.
+
+Which realm's: each realm has its own, made as it is first used, and made anew
+with the realm by `reset` (what was attached there goes as a global's does).
+`HOST_OBJECT` is the host object of the realm the operation runs in — a
+Context's, a `Function` handle's (whatever realm the function it calls is of),
+or, as a host function's result, the realm that host function was attached to —
+and that realm's host object crosses back into Ruby as `HOST_OBJECT`; another
+realm's reads as a plain object. With `host_namespace: "@…"` the namespace has
+one member more, `hostObjectOf(id)`: realm `id`'s host object, for one realm's
+bindings to reach another's (a namespace on the global never has it).
+
+Hand it over before any script of the page's runs: `call` reaches the bindings
+by a global name, which a page could otherwise have replaced — and have the
+bindings delete that name as they take it. An embedder linking rusty_racer as a
+library reaches it natively with `rusty_racer::host_object(scope)` instead —
+from its realm init hook, say, to hand it to bindings baked into a snapshot
+before any script runs. The object has no prototype, so V8 keeps it as a
+dictionary: bindings that call through it in a hot loop do better to keep the
+functions they read off it.
+
 ### Releasing handles
 
 A `Function`, `Script` or `Module` handle is released when it is `#dispose`d —

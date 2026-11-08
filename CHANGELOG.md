@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.2.8
+
+### Added
+
+- A **host object** per realm: an object with no prototype that no global
+  holds (its global keeps it under a V8 private key), for the host and the
+  realm's own bindings to share where a page's script can neither read, call nor
+  replace what they put there. Every path the host names starts there when it
+  begins with `@`: `Context#attach('@fetch', proc)` / `#attach_many` put a host
+  function there (intermediates with no prototype, every property defined, not
+  assigned), `#function('@steps.query')` / `#call` / `#call_void` find one
+  there, `Module#evaluate(report: '@reportError')` reports to one there, and
+  `Isolate.new(host_namespace: '@RustyRacer')` installs rusty_racer's own
+  functions (`contextGlobal`, `contextOf`, `drainMicrotasks`, …) there instead
+  of on the global. `RustyRacer::HOST_OBJECT`, as an argument (or a host
+  function's result) crossing into JS, is the realm's host object — how the
+  bindings are handed it, and the realm's host object crosses back into Ruby as
+  `HOST_OBJECT`; an embedder linking rusty_racer as a library reaches it
+  natively with `rusty_racer::host_object(scope)`, from its realm init hook.
+  An `@` path is walked through own properties alone, so nothing a page put on
+  a prototype sees or answers the walk. A namespace on the host object has
+  `hostObjectOf(id)` besides: another realm's host object, for one realm's
+  bindings to reach another's. Made as a realm first uses it, made anew with the
+  realm by `reset`.
+
+### Changed
+
+- A path beginning with `@` no longer names a property of the global whose name
+  begins with `@` (`globalThis["@x"]`): it names the host object's.
+- `Module#evaluate(report:)` looks the reporter up as before — one property,
+  dots and all — on the global, or, for an `@` path, as `Context#function` finds
+  it on the host object.
+
 ## 0.2.7
 
 ### Changed
