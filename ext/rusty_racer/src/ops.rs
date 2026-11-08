@@ -175,9 +175,6 @@ pub(crate) enum Request {
     ModuleGraphAsync {
         module_id: i32,
     },
-    DisposeModule {
-        module_id: i32,
-    },
     // Classic <script> primitives (V8 ScriptCompiler::CompileUnboundScript): an
     // unbound script, compiled in a context, runnable repeatedly, with the same
     // bytecode-cache options as modules. Addressed by id like a module.
@@ -195,9 +192,6 @@ pub(crate) enum Request {
         script_id: i32,
         timeout_ms: u64,
         void: bool,
-    },
-    DisposeScript {
-        script_id: i32,
     },
     // Serialize a bytecode cache from a compiled handle's CURRENT compile state
     // (Script#create_code_cache / Module#create_code_cache). Called after run/
@@ -453,7 +447,7 @@ pub(crate) fn service_request(
     // (the graveyard repoint inside) requires that.
     if outermost {
         flush_retiring(scope);
-        forget_released_functions(scope);
+        forget_released_handles(scope);
     }
     reply
 }
@@ -484,8 +478,6 @@ fn request_realm(state: &IsolateState, request: &Request) -> Option<i32> {
         | Request::DisposeContext { .. }
         | Request::ModuleStatus { .. }
         | Request::ModuleGraphAsync { .. }
-        | Request::DisposeModule { .. }
-        | Request::DisposeScript { .. }
         | Request::ScriptCodeCache { .. }
         | Request::ModuleCodeCache { .. }
         | Request::HeapStatistics
@@ -579,7 +571,6 @@ fn dispatch_one(
         Request::ModuleNamespace { module_id } => op_module_namespace(scope, module_id),
         Request::ModuleStatus { module_id } => op_module_status(scope, module_id),
         Request::ModuleGraphAsync { module_id } => op_module_graph_async(scope, module_id),
-        Request::DisposeModule { module_id } => op_dispose_module(scope, module_id),
         Request::CompileScript {
             context_id,
             source,
@@ -601,7 +592,6 @@ fn dispatch_one(
             timeout_ms,
             void,
         } => op_run_script(scope, script_id, timeout_ms, void, outermost),
-        Request::DisposeScript { script_id } => op_dispose_script(scope, script_id),
         // Serialize the script's CURRENT compile state. The stored handle is
         // the UnboundScript, which V8 fills in with inner-function bytecode as
         // run() lazily compiles them — so calling this after run() captures
@@ -796,22 +786,32 @@ fn op_resolve_function(
 const REALM_GONE: &str = "function's realm was reset or disposed";
 
 // Remove the handles whose Ruby wrappers were disposed or collected
-// (Core.released_functions): their wrappers could not drop the Globals
-// themselves (see FunctionReg). At the outermost request boundary, and only when
-// one was released — a flag read, not a lock, on every other op.
-fn forget_released_functions(scope: &mut v8::PinScope<'_, '_, ()>) {
+// (Core.released) from their registries: a wrapper could not drop its Globals
+// itself. At the outermost request boundary, and only when one was released — a
+// flag read, not a lock, on every other op.
+fn forget_released_handles(scope: &mut v8::PinScope<'_, '_, ()>) {
     let core = istate!(scope).core_ptr;
     if core.is_null() {
         return;
     }
     let core = unsafe { &*core };
-    if !core.functions_released.swap(false, Ordering::Relaxed) {
+    if !core.handles_released.swap(false, Ordering::Relaxed) {
         return;
     }
-    let released = std::mem::take(&mut *core.released_functions.lock().unwrap());
-    let functions = &mut istate!(scope).functions;
-    for id in released {
-        functions.by_id.remove(&id);
+    let released = std::mem::take(&mut *core.released.lock().unwrap());
+    let state = istate!(scope);
+    for handle in released {
+        match handle {
+            Released::Function(id) => {
+                state.functions.by_id.remove(&id);
+            }
+            Released::Module(id) => {
+                state.modules.by_id.remove(&id);
+            }
+            Released::Script(id) => {
+                state.scripts.by_id.remove(&id);
+            }
+        }
     }
 }
 
@@ -1118,13 +1118,13 @@ fn op_compile_module(
                             };
                             let hash = module.get_identity_hash().get();
                             let g = v8::Global::new(tc, module);
+                            let weak = v8::Weak::new(tc, module);
                             let id = {
                                 let m = &mut istate!(tc).modules;
                                 let id = m.next_id;
                                 m.next_id += 1;
-                                m.by_id
-                                    .insert(id, (g.clone(), filename.clone(), context_id));
-                                m.by_hash.entry(hash).or_default().push((g, id));
+                                m.by_id.insert(id, (g, context_id));
+                                m.add_url(hash, weak, filename.clone());
                                 id
                             };
                             Ok(Compiled {
@@ -1439,15 +1439,6 @@ fn op_module_graph_async(scope: &mut v8::PinScope<'_, '_, ()>, module_id: i32) -
     VmReply::Done(outcome)
 }
 
-fn op_dispose_module(scope: &mut v8::PinScope<'_, '_, ()>, module_id: i32) -> VmReply {
-    let m = &mut istate!(scope).modules;
-    m.by_id.remove(&module_id);
-    for bucket in m.by_hash.values_mut() {
-        bucket.retain(|(_, id)| *id != module_id);
-    }
-    VmReply::Done(Ok(JsVal::Undefined))
-}
-
 #[allow(clippy::too_many_arguments)]
 fn op_compile_script(
     scope: &mut v8::PinScope<'_, '_, ()>,
@@ -1560,11 +1551,6 @@ fn op_run_script(
         },
     );
     VmReply::Done(outcome)
-}
-
-fn op_dispose_script(scope: &mut v8::PinScope<'_, '_, ()>, script_id: i32) -> VmReply {
-    istate!(scope).scripts.by_id.remove(&script_id);
-    VmReply::Done(Ok(JsVal::Undefined))
 }
 
 fn op_script_code_cache(scope: &mut v8::PinScope<'_, '_, ()>, script_id: i32) -> VmReply {

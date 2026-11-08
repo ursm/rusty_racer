@@ -123,6 +123,16 @@ realm (`frames[0].fn` in an embedder whose realms see each other) holds that
 realm's function for as long as the handle's own realm lives, as any reference
 kept there would.
 
+### Releasing handles
+
+A `Function`, `Script` or `Module` handle is released when it is `#dispose`d —
+from any thread — or garbage-collected, at the end of the isolate's next
+operation, and with its realm's `reset` or `dispose` at the latest. Releasing a
+handle only drops the isolate's hold on what it names: functions a script
+defined keep working, and a module V8 still keeps — linked into a live graph, or
+reached from another realm — keeps its `import.meta.url` and its url as a
+referrer, wrapper or realm or not.
+
 ### Marshalling and the page's JavaScript
 
 Values cross by copy, not by reference.

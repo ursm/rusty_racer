@@ -871,7 +871,8 @@ fn take_thrown<'s>(
 
 // ---------------------------------------------------------------------------
 // ES modules: V8's raw compile/instantiate/evaluate steps, with the embedder
-// owning the url->Module registry (MODULES) and the resolve policy.
+// owning the url->Module registry and the resolve policy (ModuleReg is only the
+// binding's id and url bookkeeping).
 // ---------------------------------------------------------------------------
 fn module_origin<'s>(scope: &v8::PinScope<'s, '_>, url: &str) -> v8::ScriptOrigin<'s> {
     let name = v8::String::new(scope, url).unwrap();
@@ -890,16 +891,45 @@ fn module_origin<'s>(scope: &v8::PinScope<'s, '_>, url: &str) -> v8::ScriptOrigi
     )
 }
 
-// Registry for the thin compile_module/instantiate API: each compiled module is
-// addressed by an id, with its url kept for the resolve round-trip and a
-// hash bucket to map a referrer Local<Module> back to its id.
+// Registry for the thin compile_module/instantiate API.
 #[derive(Default)]
 struct ModuleReg {
-    // id -> (module, url, owning context id). The context id is needed because
-    // a module is bound to the v8::Context it was compiled in.
-    by_id: HashMap<i32, (v8::Global<v8::Module>, String, i32)>,
-    by_hash: HashMap<i32, Vec<(v8::Global<v8::Module>, i32)>>,
+    // id -> (module, owning context id): what a Module wrapper's ops address.
+    // The context id is needed because a module is bound to the v8::Context it
+    // was compiled in. Strong, and gone once the wrapper is disposed or collected
+    // (Core.released).
+    by_id: HashMap<i32, (v8::Global<v8::Module>, i32)>,
+    // identity hash -> (module, url): a Local<Module> V8 hands a callback
+    // (import.meta, a referrer being linked) back to the url it was compiled
+    // with. WEAK, so a module V8 still keeps — a dependency linked into a live
+    // graph, a function of a disposed realm's module another realm holds —
+    // answers whether its wrapper (or its realm) is still around or not, and
+    // one V8 collected is pruned instead of pinned (`add_url`).
+    urls: HashMap<i32, Vec<(v8::Weak<v8::Module>, String)>>,
+    // `add_url`'s amortization: entries added since the last prune, and the
+    // entries that prune left.
+    added_since_prune: usize,
+    kept_at_prune: usize,
     next_id: i32,
+}
+
+impl ModuleReg {
+    // Index |module|'s url, first pruning the entries of collected modules once
+    // as many have been added since the last prune as it left — a scan
+    // amortized O(1) per compile, keeping the index within about twice the
+    // modules alive.
+    fn add_url(&mut self, hash: i32, module: v8::Weak<v8::Module>, url: String) {
+        if self.added_since_prune > self.kept_at_prune {
+            self.urls.retain(|_, bucket| {
+                bucket.retain(|(module, _)| !module.is_empty());
+                !bucket.is_empty()
+            });
+            self.kept_at_prune = self.urls.values().map(Vec::len).sum();
+            self.added_since_prune = 0;
+        }
+        self.added_since_prune += 1;
+        self.urls.entry(hash).or_default().push((module, url));
+    }
 }
 
 // Classic compiled scripts: id -> (unbound script, owning context id). An
@@ -918,8 +948,8 @@ struct ScriptReg {
 // must not keep its realm's v8::Context alive — and so they are only ever
 // dropped on the owner thread with the isolate entered, which a wrapper's GC
 // free can't promise. A wrapper that is disposed or collected queues its id on
-// Core.released_functions instead, and the next outermost request boundary
-// removes it here. Ids are never reused, so a stale id can only miss.
+// Core.released instead, and the next outermost request boundary removes it
+// here. Ids are never reused, so a stale id can only miss.
 //
 // A path may lead into ANOTHER realm (`frames[0].fn`): the entry belongs to the
 // realm it was resolved in, so it holds that other realm's function until this
@@ -935,6 +965,13 @@ struct FunctionEntry {
     function: v8::Global<v8::Function>,
     receiver: v8::Global<v8::Value>,
     context_id: i32,
+}
+
+// A handle whose Ruby wrapper let go of it, queued on Core.released.
+enum Released {
+    Function(u64),
+    Module(i32),
+    Script(i32),
 }
 
 // The V8 thread's realm registry: the main context (id 0, swappable by reset),
@@ -1239,18 +1276,9 @@ fn auto_drain(scope: &mut v8::PinScope<'_, '_>, outermost: bool) {
 // dead, and a function's Globals would otherwise keep that context alive).
 fn drop_context_artifacts(state: &mut IsolateState, context_id: i32) {
     let m = &mut state.modules;
-    let dead: Vec<i32> = m
-        .by_id
-        .iter()
-        .filter(|(_, (_, _, cid))| *cid == context_id)
-        .map(|(id, _)| *id)
-        .collect();
-    for id in dead {
-        m.by_id.remove(&id);
-        for bucket in m.by_hash.values_mut() {
-            bucket.retain(|(_, mid)| *mid != id);
-        }
-    }
+    // (Not its url index: weak, it pins nothing, and a module of this realm that
+    // another realm still reaches keeps its import.meta.url.)
+    m.by_id.retain(|_, (_, cid)| *cid != context_id);
     state.scripts.by_id.retain(|_, (_, cid)| *cid != context_id);
     state
         .functions
@@ -1279,24 +1307,21 @@ fn script_handle(
         .map(|(g, cid)| (g.clone(), *cid))
 }
 
-// A registered module's url (the filename it was compiled with), by identity
-// against MODULES — the reverse of the id lookup. Used to give a referrer its
-// url for the resolve round-trip and to fill import.meta.url.
+// A compiled module's url (the filename it was compiled with), by identity in
+// the weak url index (ModuleReg.urls) — for as long as V8 keeps the module. Used
+// to give a referrer its url for the resolve round-trip and to fill
+// import.meta.url.
 fn module_url(scope: &mut v8::PinScope<'_, '_>, module: v8::Local<v8::Module>) -> Option<String> {
     let hash = module.get_identity_hash().get();
-    // Snapshot the hash bucket (cloned globals) so the scope is free for the
-    // Local comparison below: istate! borrows the scope and v8::Local::new
-    // needs it too, so they can't overlap in one expression.
-    let bucket = istate!(scope).modules.by_hash.get(&hash)?.clone();
-    let id = bucket
-        .iter()
-        .find(|(g, _)| v8::Local::new(&*scope, g) == module)
-        .map(|(_, id)| *id)?;
-    istate!(scope)
+    // A shared borrow of the slot beside the shared one to_local takes.
+    scope
+        .get_slot::<IsolateState>()?
         .modules
-        .by_id
-        .get(&id)
-        .map(|(_, u, _)| u.clone())
+        .urls
+        .get(&hash)?
+        .iter()
+        .find(|(weak, _)| weak.to_local(scope) == Some(module))
+        .map(|(_, url)| url.clone())
 }
 
 // V8 calls this the first time a module reads import.meta. Fills in
@@ -1420,7 +1445,7 @@ fn resolve_imported<'s>(
         .modules
         .by_id
         .get(&dep_id)
-        .map(|(g, _, cid)| (g.clone(), *cid));
+        .map(|(g, cid)| (g.clone(), *cid));
     let g = match (here, found) {
         (Some(here), Some((g, cid))) if cid == here => g,
         (Some(_), Some(_)) => {
@@ -1497,8 +1522,8 @@ fn dynamic_import_cb<'s>(
                 .modules
                 .by_id
                 .get(&id)
-                .filter(|(_, _, cid)| Some(*cid) == here)
-                .map(|(g, _, _)| g.clone());
+                .filter(|(_, cid)| Some(*cid) == here)
+                .map(|(g, _)| g.clone());
             match g {
                 Some(g) => {
                     let module = v8::Local::new(scope, &g);
@@ -1679,7 +1704,7 @@ fn module_handle(state: &IsolateState, module_id: i32) -> Option<(v8::Global<v8:
         .modules
         .by_id
         .get(&module_id)
-        .map(|(g, _, cid)| (g.clone(), *cid))
+        .map(|(g, cid)| (g.clone(), *cid))
 }
 
 // ---------------------------------------------------------------------------
@@ -1745,14 +1770,14 @@ struct Core {
     // reach it through Core (via the slot's core_ptr) while a &Core method also
     // holds it. reset/dispose releases the slots and recycles them.
     procs: Mutex<ProcTable>,
-    // Function handle ids whose Ruby wrappers were disposed or collected, for the
-    // next outermost request boundary to remove from FunctionReg
-    // (`forget_released_functions`). A wrapper's free may run on any Ruby thread,
-    // outside any op, so all it can do is queue its id here.
-    released_functions: Mutex<Vec<u64>>,
+    // The handles (Function, Module, Script) whose Ruby wrappers were disposed or
+    // collected, for the next outermost request boundary to remove from their
+    // registries (`forget_released_handles`). A wrapper's free may run on any
+    // Ruby thread, outside any op, so all it can do is queue its id here.
+    released: Mutex<Vec<Released>>,
     // Set with each push there, so the request boundary looks at the lock only
     // when there is something under it.
-    functions_released: AtomicBool,
+    handles_released: AtomicBool,
     // Default per-eval/call timeout (ms); 0 = none. eval(timeout_ms:)'s explicit
     // value overrides it. Guards against an in-V8 infinite loop without a watchdog.
     default_timeout_ms: u64,
@@ -2621,8 +2646,8 @@ impl Isolate {
             depth: std::sync::atomic::AtomicU32::new(0),
             roots: Opaque::from(roots),
             procs: Mutex::new(ProcTable::default()),
-            released_functions: Mutex::new(Vec::new()),
-            functions_released: AtomicBool::new(false),
+            released: Mutex::new(Vec::new()),
+            handles_released: AtomicBool::new(false),
             default_timeout_ms: timeout_ms,
             memory_limit,
             watchdog,
@@ -3081,11 +3106,11 @@ impl Core {
         self.reply_value(ruby, reply)
     }
 
-    // A Function wrapper let go of its handle (see released_functions). Takes only
-    // this lock, briefly, and allocates no Ruby object — it runs from a GC free.
-    fn release_function(&self, function_id: u64) {
-        self.released_functions.lock().unwrap().push(function_id);
-        self.functions_released.store(true, Ordering::Relaxed);
+    // A wrapper let go of its handle (see `released`). Takes only this lock,
+    // briefly, and allocates no Ruby object — it runs from a GC free.
+    fn release(&self, handle: Released) {
+        self.released.lock().unwrap().push(handle);
+        self.handles_released.store(true, Ordering::Relaxed);
     }
 
     fn drain_microtasks(&self, ruby: &Ruby) -> Result<Value, Error> {
@@ -3396,11 +3421,6 @@ impl Core {
         self.reply_value(ruby, reply)
     }
 
-    fn dispose_module(&self, ruby: &Ruby, module_id: i32) -> Result<(), Error> {
-        let reply = self.run(ruby, Request::DisposeModule { module_id })?;
-        self.reply_value(ruby, reply).map(|_| ())
-    }
-
     // Classic script: compile, run, dispose.
     #[allow(clippy::too_many_arguments)]
     fn compile_script(
@@ -3444,11 +3464,6 @@ impl Core {
             },
         )?;
         self.reply_value(ruby, reply)
-    }
-
-    fn dispose_script(&self, ruby: &Ruby, script_id: i32) -> Result<(), Error> {
-        let reply = self.run(ruby, Request::DisposeScript { script_id })?;
-        self.reply_value(ruby, reply).map(|_| ())
     }
 
     // Serialize a fresh bytecode cache from a compiled handle's current state
@@ -3997,12 +4012,12 @@ impl JsModule {
         let bytes = rb_self.core.module_code_cache(ruby, rb_self.module_id)?;
         Ok(code_cache_value(ruby, bytes.as_ref()))
     }
-    fn dispose(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
-        if rb_self.disposed.swap(true, Ordering::SeqCst) {
-            return Ok(());
+    // Let go of the module now rather than when this wrapper is collected (see
+    // JsFunction::dispose). Its url still answers while V8 keeps the module.
+    fn dispose(&self) {
+        if !self.disposed.swap(true, Ordering::SeqCst) {
+            self.core.release(Released::Module(self.module_id));
         }
-        let _ = rb_self.core.dispose_module(ruby, rb_self.module_id);
-        Ok(())
     }
     fn disposed(&self) -> bool {
         self.disposed.load(Ordering::SeqCst)
@@ -4048,12 +4063,12 @@ impl Script {
         let bytes = rb_self.core.script_code_cache(ruby, rb_self.script_id)?;
         Ok(code_cache_value(ruby, bytes.as_ref()))
     }
-    fn dispose(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
-        if rb_self.disposed.swap(true, Ordering::SeqCst) {
-            return Ok(());
+    // Let go of the script now rather than when this wrapper is collected (see
+    // JsFunction::dispose).
+    fn dispose(&self) {
+        if !self.disposed.swap(true, Ordering::SeqCst) {
+            self.core.release(Released::Script(self.script_id));
         }
-        let _ = rb_self.core.dispose_script(ruby, rb_self.script_id);
-        Ok(())
     }
     fn disposed(&self) -> bool {
         self.disposed.load(Ordering::SeqCst)
@@ -4088,7 +4103,7 @@ impl JsFunction {
     // thread, any time: the Globals go at the end of the isolate's next op.
     fn dispose(&self) {
         if !self.disposed.swap(true, Ordering::SeqCst) {
-            self.core.release_function(self.function_id);
+            self.core.release(Released::Function(self.function_id));
         }
     }
     fn disposed(&self) -> bool {
@@ -4097,6 +4112,18 @@ impl JsFunction {
 }
 
 impl Drop for JsFunction {
+    fn drop(&mut self) {
+        self.dispose();
+    }
+}
+
+impl Drop for JsModule {
+    fn drop(&mut self) {
+        self.dispose();
+    }
+}
+
+impl Drop for Script {
     fn drop(&mut self) {
         self.dispose();
     }

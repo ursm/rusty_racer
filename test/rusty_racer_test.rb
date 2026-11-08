@@ -2324,6 +2324,95 @@ class RustyRacerTest < Minitest::Test
     assert_raises(RustyRacer::DisposedError) { m.evaluate }
   end
 
+  # A Module or Script whose wrapper is disposed or collected lets go of what the isolate held for it — at the end of
+  # the next op — while what V8 itself still holds (a linked dependency's url, a script's functions) keeps working.
+  # …a dispose from another thread included: it only queues the release.
+  def test_a_disposed_module_lets_go_of_its_record
+    m = @ctx.compile_module('globalThis.ref = new WeakRef(import.meta)')
+    m.instantiate { nil }
+    m.evaluate
+    Thread.new { m.dispose }.join
+    assert_predicate m, :disposed?
+    @ctx.eval('1')
+    @iso.low_memory_notification
+    assert_equal false, @ctx.eval('globalThis.ref.deref() !== undefined')
+  end
+
+  def test_a_kept_module_keeps_its_record
+    m = @ctx.compile_module('globalThis.ref = new WeakRef(import.meta)')
+    m.instantiate { nil }
+    m.evaluate
+    @ctx.eval('1')
+    @iso.low_memory_notification
+    assert_equal true, @ctx.eval('globalThis.ref.deref() !== undefined')
+    assert_equal :evaluated, m.status
+  end
+
+  # Collection, not dispose: run on a throwaway owner thread so no stack slot of the test's keeps a wrapper alive.
+  def test_collected_module_and_script_wrappers_are_released
+    held = Thread.new {
+      iso = RustyRacer::Isolate.new
+      ctx = iso.context
+      make = lambda {
+        m = ctx.compile_module('globalThis.modRef = new WeakRef(import.meta)')
+        m.instantiate { nil }
+        m.evaluate
+        ctx.compile('globalThis.later = () => 42').run
+        nil
+      }
+      make.call
+      4.times { GC.start(full_mark: true, immediate_sweep: true) }
+      ctx.eval('1')
+      iso.low_memory_notification
+      result = ctx.eval('[globalThis.modRef.deref() !== undefined, later()]')
+      iso.dispose
+      result
+    }.value
+    assert_equal [false, 42], held
+  end
+
+  def test_a_collected_dependency_keeps_its_url
+    url = Thread.new {
+      iso = RustyRacer::Isolate.new
+      ctx = iso.context
+      lambda {
+        app = ctx.compile_module("import {url} from './dep.js'; globalThis.readDep = url;", filename: '/app.js')
+        app.instantiate { ctx.compile_module('export const url = () => import.meta.url;', filename: '/dep.js') }
+        app.evaluate
+        nil
+      }.call
+      4.times { GC.start(full_mark: true, immediate_sweep: true) }
+      ctx.eval('1')
+      iso.low_memory_notification
+      ctx.call('readDep').tap { iso.dispose }
+    }.value
+    assert_equal '/dep.js', url
+  end
+
+  def test_a_module_of_a_disposed_realm_another_realm_reaches_keeps_its_url
+    iso = RustyRacer::Isolate.new(host_namespace: 'NS')
+    realm = iso.create_context
+    m = realm.compile_module('globalThis.late = () => import.meta.url;', filename: '/frame.js')
+    m.instantiate { nil }
+    m.evaluate
+    iso.context.eval_void("globalThis.held = NS.contextGlobal(#{realm.id}).late")
+    realm.dispose
+    iso.low_memory_notification
+    assert_equal '/frame.js', iso.context.call('held')
+  ensure
+    iso&.dispose
+  end
+
+  def test_a_dependency_keeps_its_url_after_its_wrapper_goes
+    dep = nil
+    app = @ctx.compile_module("import {url} from './dep.js'; globalThis.readDep = url;", filename: '/app.js')
+    app.instantiate {|_specifier, _referrer| dep = @ctx.compile_module('export const url = () => import.meta.url;', filename: '/dep.js') }
+    dep.dispose
+    app.evaluate
+    @iso.low_memory_notification
+    assert_equal '/dep.js', @ctx.call('readDep')
+  end
+
   def test_call_invokes_global_function
     @ctx.eval("function mul(a, b) { return a * b }")
     assert_equal 6, @ctx.call("mul", 2, 3)
