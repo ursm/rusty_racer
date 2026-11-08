@@ -39,6 +39,10 @@ jobs:
       - name: "Compile + test"
         run: "bundle exec rake test"
       # The Rust unit tests (marshalling without a Ruby VM): `link-ruby`, a dev-only
-      # rb-sys feature, links the test binary against the Ruby set up above.
+      # rb-sys feature, links the test binary against the Ruby set up above. Its
+      # libruby is no system library, so the loader is told where it lives (the
+      # arm runners' Ruby carries no rpath to it).
       - name: "cargo test"
-        run: "cargo test --workspace --lib"
+        run: |
+          LD_LIBRARY_PATH="$(ruby -e 'print RbConfig::CONFIG["libdir"]')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+            cargo test --workspace --lib
