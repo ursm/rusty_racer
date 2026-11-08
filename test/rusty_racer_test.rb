@@ -392,6 +392,152 @@ class RustyRacerTest < Minitest::Test
     assert_equal 2**70 + 1, @ctx.call("inc", 2**70)
   end
 
+  # Context#function: what `call(path, ...)` calls, resolved once — its holder kept as `this`.
+  def test_function_handle_calls_with_its_holder_as_this
+    @ctx.eval('globalThis.a = {b: {base: 100, add(x, y) { return this.base + x + y }}}; function pair(x, y) { return [x, y] }')
+    add = @ctx.function('a.b.add')
+    assert_instance_of RustyRacer::Function, add
+    assert_equal 103, add.call(1, 2)
+    assert_equal [1, 'x'], @ctx.function('pair').call(1, 'x')
+    assert_nil add.call_void(1, 2)
+  end
+
+  def test_function_handle_keeps_what_its_path_named_when_resolved
+    @ctx.eval('globalThis.ns = {f() { return "first" }}')
+    f = @ctx.function('ns.f')
+    @ctx.eval('ns.f = () => "second"; delete globalThis.ns')
+    assert_equal 'first', f.call
+  end
+
+  def test_function_handle_call_void_never_reads_the_result
+    @ctx.eval('function hostile() { return new Proxy({}, {ownKeys() { throw new Error("read") }}) }')
+    hostile = @ctx.function('hostile')
+    assert_nil hostile.call_void
+    error = assert_raises(RustyRacer::RuntimeError) { hostile.call }
+    assert_match(/read/, error.message)
+  end
+
+  def test_function_resolution_errors_raise_like_call
+    @ctx.eval('globalThis.n = 1; Object.defineProperty(globalThis, "trap", {get() { throw new TypeError("trapped") }})')
+    assert_raises(RustyRacer::RuntimeError) { @ctx.function('n') }
+    assert_raises(RustyRacer::RuntimeError) { @ctx.function('missing.f') }
+    error = assert_raises(RustyRacer::RuntimeError) { @ctx.function('trap.f') }
+    assert_match(/TypeError: trapped/, error.message)
+  end
+
+  def test_function_handle_maps_a_throw_to_a_runtime_error_with_its_stack
+    @ctx.eval("function fail() { throw new RangeError('bad') }", filename: 'fail.js')
+    error = assert_raises(RustyRacer::RuntimeError) { @ctx.function('fail').call }
+    assert_equal 'RangeError: bad', error.message
+    assert_match(/fail\.js:1/, error.backtrace.first)
+  end
+
+  def test_function_handle_is_dead_once_its_realm_is_reset
+    @ctx.eval('function f() { return 1 }')
+    f = @ctx.function('f')
+    @ctx.reset
+    @ctx.eval('function f() { return 2 }')
+    error = assert_raises(RustyRacer::DisposedError) { f.call }
+    assert_match(/reset or disposed/, error.message)
+    assert_equal 2, @ctx.function('f').call
+  end
+
+  def test_function_handle_is_dead_once_its_realm_or_isolate_is_disposed
+    realm = @iso.create_context
+    realm.eval('function f() { return 1 }')
+    f = realm.function('f')
+    realm.dispose
+    assert_raises(RustyRacer::DisposedError) { f.call }
+    g = @ctx.function('Math.max')
+    @iso.dispose
+    assert_raises(RustyRacer::DisposedError) { g.call(1) }
+    assert_predicate g, :disposed?
+  end
+
+  def test_function_handle_dispose
+    f = @ctx.function('Math.max')
+    refute_predicate f, :disposed?
+    f.dispose
+    f.dispose
+    assert_predicate f, :disposed?
+    assert_raises(RustyRacer::DisposedError) { f.call(1) }
+    assert_equal 3, @ctx.function('Math.max').call(1, 3)
+  end
+
+  def test_function_handle_does_not_keep_a_disposed_realm_alive
+    @iso.low_memory_notification
+    baseline = @iso.heap_statistics[:number_of_native_contexts]
+    handles = Array.new(20) {
+      realm = @iso.create_context
+      realm.eval('globalThis.big = new Array(10000).fill(0).map((_, i) => ({i})); function f() { return big.length }')
+      handle = realm.function('f')
+      realm.dispose
+      handle
+    }
+    @iso.low_memory_notification
+    after = @iso.heap_statistics[:number_of_native_contexts]
+    assert_operator after, :<=, baseline + 3, "live native contexts grew #{baseline} -> #{after} behind #{handles.size} handles"
+  end
+
+  def test_collected_function_handles_are_released_and_teardown_is_quiet
+    @ctx.eval('function f(x) { return x }')
+    1000.times { @ctx.function('f') }
+    GC.start
+    assert_equal 7, @ctx.function('f').call(7)
+    kept = @ctx.function('f')
+    @iso.dispose
+    @iso = nil
+    @ctx = nil
+    GC.start
+    assert_predicate kept, :disposed?
+  end
+
+  def test_function_handle_works_reentrantly_and_drains_microtasks_only_outermost
+    @ctx.eval(<<~JS)
+      function later() { Promise.resolve().then(() => { globalThis.n = (globalThis.n || 0) + 1 }) }
+      function peek() { return typeof globalThis.n }
+    JS
+    later = @ctx.function('later')
+    peek = @ctx.function('peek')
+    @ctx.attach('nested', proc {
+      later.call
+      peek.call
+    })
+    assert_equal 'undefined', @ctx.call('nested')
+    assert_equal 'number', peek.call
+  end
+
+  def test_function_handle_rethrows_through_a_host_fn
+    @ctx.eval("function boom() { throw globalThis.thrown = new RangeError('x') }")
+    boom = @ctx.function('boom')
+    @ctx.attach('viaHost', proc { boom.call })
+    assert_equal true, @ctx.eval('try { viaHost() } catch (e) { e === globalThis.thrown }')
+  end
+
+  def test_function_handle_times_out_and_leaves_the_isolate_usable
+    iso = RustyRacer::Isolate.new(timeout_ms: 100)
+    ctx = iso.context
+    ctx.eval('function spin() { for (;;) {} }')
+    assert_raises(RustyRacer::ScriptTerminatedError) { ctx.function('spin').call }
+    assert_equal 2, ctx.function('Math.max').call(1, 2)
+  ensure
+    iso&.dispose
+  end
+
+  def test_function_handle_is_thread_confined
+    f = @ctx.function('Math.max')
+    error = Thread.new { (f.call(1) rescue $!) }.value # rubocop:disable Style/RescueModifier
+    assert_instance_of RustyRacer::WrongThreadError, error
+    assert_equal 2, f.call(1, 2)
+  end
+
+  def test_function_handle_of_another_realm_runs_there
+    realm = @iso.create_context
+    realm.eval('globalThis.where = "realm"; function whereAmI() { return globalThis.where }')
+    @ctx.eval('globalThis.where = "main"')
+    assert_equal 'realm', realm.function('whereAmI').call
+  end
+
   def test_call_void_runs_without_marshalling_return
     # call_void runs the fn for its side effect but never walks the return,
     # so a huge/cyclic result is fine and the Ruby return is nil.

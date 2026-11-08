@@ -93,8 +93,8 @@ use watchdog::{
 // SAFETY of the manual Send: the !Send contents (and BoxValue's drop, which
 // calls rb_gc_unregister_address) only run under the GVL. Two conventions
 // keep that true — breaking either is silent UB, so don't:
-//   - Arc<Core> lives ONLY in the four TypedData wrappers (Isolate, Context,
-//     Module, Script). Never clone it into the V8/watchdog threads, or the
+//   - Arc<Core> lives ONLY in the five TypedData wrappers (Isolate, Context,
+//     Module, Script, Function). Never clone it into the V8/watchdog threads, or the
 //     last drop could run off a Ruby thread.
 //   - the wrappers must not set free_immediately: their dfree (and so Core's
 //     drop) has to run outside the GC sweep, where Ruby APIs are forbidden.
@@ -293,6 +293,8 @@ enum VmError {
     },
     Terminated,  // watchdog/stop -> RustyRacer::ScriptTerminatedError
     OutOfMemory, // memory_limit hit -> RustyRacer::V8OutOfMemoryError
+    // A handle whose realm was reset or disposed under it -> RustyRacer::DisposedError
+    Disposed(String),
 }
 
 // V8's near-heap-limit callback (registered on EVERY isolate). V8 calls this,
@@ -909,6 +911,27 @@ struct ScriptReg {
     next_id: i32,
 }
 
+// Context#function's handles: id -> the function its path resolved to, the
+// holder it was read off (its `this`), and the realm it was resolved in. The
+// Globals live HERE, not in the Ruby wrapper, so a reset or disposed realm drops
+// them (drop_context_artifacts) whatever wrappers Ruby still holds — a handle
+// must not keep its realm's v8::Context alive — and so they are only ever
+// dropped on the owner thread with the isolate entered, which a wrapper's GC
+// free can't promise. A wrapper that is disposed or collected queues its id on
+// Core.released_functions instead; the next resolve removes it here. Ids are
+// never reused, so a stale id can only miss.
+#[derive(Default)]
+struct FunctionReg {
+    by_id: HashMap<u64, FunctionEntry>,
+    next_id: u64,
+}
+
+struct FunctionEntry {
+    function: v8::Global<v8::Function>,
+    receiver: v8::Global<v8::Value>,
+    context_id: i32,
+}
+
 // The V8 thread's realm registry: the main context (id 0, swappable by reset),
 // the extra realms from create_context, and the host-namespace name to
 // re-install on fresh realms. Thread-local (like MODULES/SCRIPTS) so
@@ -993,6 +1016,7 @@ struct IsolateState {
     realms: V8State,
     modules: ModuleReg,
     scripts: ScriptReg,
+    functions: FunctionReg,
     active_realms: Vec<i32>,
     instantiating: bool,
     watchdog_fired: bool,
@@ -1046,6 +1070,7 @@ impl IsolateState {
             },
             modules: ModuleReg::default(),
             scripts: ScriptReg::default(),
+            functions: FunctionReg::default(),
             active_realms: Vec::new(),
             instantiating: false,
             watchdog_fired: false,
@@ -1204,8 +1229,9 @@ fn auto_drain(scope: &mut v8::PinScope<'_, '_>, outermost: bool) {
     }
 }
 
-// Drop every module AND script compiled in `context_id` (its v8::Context is
-// going away — on reset or dispose — so those handles are now dead).
+// Drop every module, script and function handle of `context_id` (its
+// v8::Context is going away — on reset or dispose — so those handles are now
+// dead, and a function's Globals would otherwise keep that context alive).
 fn drop_context_artifacts(state: &mut IsolateState, context_id: i32) {
     let m = &mut state.modules;
     let dead: Vec<i32> = m
@@ -1221,6 +1247,10 @@ fn drop_context_artifacts(state: &mut IsolateState, context_id: i32) {
         }
     }
     state.scripts.by_id.retain(|_, (_, cid)| *cid != context_id);
+    state
+        .functions
+        .by_id
+        .retain(|_, entry| entry.context_id != context_id);
     // A promise-reject recorder created in this context is unusable now.
     if state
         .realms
@@ -1710,6 +1740,11 @@ struct Core {
     // reach it through Core (via the slot's core_ptr) while a &Core method also
     // holds it. reset/dispose releases the slots and recycles them.
     procs: Mutex<ProcTable>,
+    // Function handle ids whose Ruby wrappers were disposed or collected, for the
+    // next resolve to remove from FunctionReg (`forget_released_functions`). A
+    // wrapper's free may run on any Ruby thread, outside any op, so all it can do
+    // is queue its id here.
+    released_functions: Mutex<Vec<u64>>,
     // Default per-eval/call timeout (ms); 0 = none. eval(timeout_ms:)'s explicit
     // value overrides it. Guards against an in-V8 infinite loop without a watchdog.
     default_timeout_ms: u64,
@@ -1779,10 +1814,22 @@ struct Script {
     cache_rejected: bool,
 }
 
-// The four wrappers that hold an Arc<Core> all mark the isolate's roots, because any
+// Context#function result: a JS function resolved once, with its `this`, kept in
+// FunctionReg by id — the realm it belongs to rides along so a call enters it
+// without a lookup.
+#[derive(TypedData)]
+#[magnus(class = "RustyRacer::Function", mark)]
+struct JsFunction {
+    core: Arc<Core>,
+    context_id: i32,
+    function_id: u64,
+    disposed: AtomicBool,
+}
+
+// The five wrappers that hold an Arc<Core> all mark the isolate's roots, because any
 // one of them may be the last one reachable: Ruby code is free to keep only the
 // Context a `Isolate#context` handed it, or only a Module, and the host fns must
-// stay callable through it. Marking the same array four times costs nothing (the GC
+// stay callable through it. Marking the same array five times costs nothing (the GC
 // stops at an already-marked object); missing it once would free a live proc.
 macro_rules! marks_core_roots {
     ($t:ty) => {
@@ -1797,6 +1844,7 @@ marks_core_roots!(Isolate);
 marks_core_roots!(Context);
 marks_core_roots!(JsModule);
 marks_core_roots!(Script);
+marks_core_roots!(JsFunction);
 
 // Set true once V8 is initialized; Platform.set_flags! refuses after that
 // (flags must be set before V8::initialize), like mini_racer's
@@ -2428,7 +2476,7 @@ fn build_snapshot(code: &str, base: Option<Vec<u8>>, warmup: bool) -> Result<Vec
                 )
             {
                 err = Some(match e {
-                    VmError::Parse(m, _) | VmError::Runtime(m) => m,
+                    VmError::Parse(m, _) | VmError::Runtime(m) | VmError::Disposed(m) => m,
                     VmError::JsError { message, .. } => message,
                     VmError::Terminated => "snapshot code was terminated".to_string(),
                     // Unreachable: the snapshot-creator is a separate isolate
@@ -2565,6 +2613,7 @@ impl Isolate {
             depth: std::sync::atomic::AtomicU32::new(0),
             roots: Opaque::from(roots),
             procs: Mutex::new(ProcTable::default()),
+            released_functions: Mutex::new(Vec::new()),
             default_timeout_ms: timeout_ms,
             memory_limit,
             watchdog,
@@ -2890,7 +2939,7 @@ impl Core {
     }
 
     // Show the GC everything this isolate holds. Called from EVERY wrapper's mark
-    // (Isolate, Context, Module, Script all keep an Arc<Core>, and any one of them
+    // (Isolate, Context, Module, Script, Function all keep an Arc<Core>, and any one of them
     // may be the last reachable): a wrapper that forgot to would leave a live
     // isolate's host fns unmarked. `mark` PINS — an Array marks its own elements
     // MOVABLE, and the copies Rust takes out of it (call_proc, root_proc) would go
@@ -2975,23 +3024,58 @@ impl Core {
                 "call requires a function name",
             ));
         };
-        let name = String::try_convert(*name)?;
-        let jsargs: Vec<JsVal> = call_args
-            .iter()
-            .map(|v| ruby_to_jsval(*v))
-            .collect::<Result<_, _>>()?;
-
         let reply = self.run(
             ruby,
             Request::Call {
                 context_id,
-                name,
-                args: jsargs,
+                name: String::try_convert(*name)?,
+                args: js_args(call_args)?,
                 void,
                 timeout_ms: self.default_timeout_ms,
             },
         )?;
         self.reply_value(ruby, reply)
+    }
+
+    // Context#function: resolve |path| in the realm once; the handle's id.
+    fn resolve_function(&self, ruby: &Ruby, context_id: i32, path: String) -> Result<u64, Error> {
+        let reply = self.run(
+            ruby,
+            Request::ResolveFunction {
+                context_id,
+                path,
+                timeout_ms: self.default_timeout_ms,
+            },
+        )?;
+        u64::try_convert(self.reply_value(ruby, reply)?)
+    }
+
+    // Function#call (and call_void): Context#call's invocation, of a resolved handle.
+    fn call_function(
+        &self,
+        ruby: &Ruby,
+        context_id: i32,
+        function_id: u64,
+        args: &[Value],
+        void: bool,
+    ) -> Result<Value, Error> {
+        let reply = self.run(
+            ruby,
+            Request::CallFunction {
+                context_id,
+                function_id,
+                args: js_args(args)?,
+                void,
+                timeout_ms: self.default_timeout_ms,
+            },
+        )?;
+        self.reply_value(ruby, reply)
+    }
+
+    // A Function wrapper let go of its handle (see released_functions). Takes only
+    // this lock, briefly, and allocates no Ruby object — it runs from a GC free.
+    fn release_function(&self, function_id: u64) {
+        self.released_functions.lock().unwrap().push(function_id);
     }
 
     fn drain_microtasks(&self, ruby: &Ruby) -> Result<Value, Error> {
@@ -3427,6 +3511,7 @@ impl Core {
             st.realms = V8State::default();
             st.modules = ModuleReg::default();
             st.scripts = ScriptReg::default();
+            st.functions = FunctionReg::default();
             st.instantiate_resolve = None;
         }
         // Unregister the near-heap-limit callback before disposal: dropping the box
@@ -3551,6 +3636,11 @@ fn pending_transfer_count() -> usize {
     transfer_registry().lock().unwrap().len()
 }
 
+// A call's Ruby arguments, marshalled for JS.
+fn js_args(args: &[Value]) -> Result<Vec<JsVal>, Error> {
+    args.iter().map(|v| ruby_to_jsval(*v)).collect()
+}
+
 // Thin magnus-method wrappers.
 // Isolate = the VM and its isolate-level operations; it hands out Contexts.
 impl Isolate {
@@ -3656,6 +3746,18 @@ impl Context {
     fn call_void(ruby: &Ruby, rb_self: &Self, args: &[Value]) -> Result<Value, Error> {
         rb_self.check_live(ruby)?;
         rb_self.core.call(ruby, rb_self.id, args, true)
+    }
+    // function(path) -> Function: what `call(path, ...)` would call, resolved
+    // now, once — its holder kept as its `this` — so each call skips the path walk.
+    fn function(ruby: &Ruby, rb_self: &Self, path: String) -> Result<JsFunction, Error> {
+        rb_self.check_live(ruby)?;
+        let function_id = rb_self.core.resolve_function(ruby, rb_self.id, path)?;
+        Ok(JsFunction {
+            core: rb_self.core.clone(),
+            context_id: rb_self.id,
+            function_id,
+            disposed: AtomicBool::new(false),
+        })
     }
     fn attach(ruby: &Ruby, rb_self: &Self, name: String, proc: Proc) -> Result<Value, Error> {
         rb_self.check_live(ruby)?;
@@ -3948,6 +4050,48 @@ impl Script {
     }
 }
 
+impl JsFunction {
+    fn check_live(&self, ruby: &Ruby) -> Result<(), Error> {
+        // Its realm's reset or dispose is found by the call itself (the handle is
+        // gone from FunctionReg): that is not something this wrapper can see.
+        if self.disposed.load(Ordering::SeqCst) || self.core.is_disposed() {
+            return Err(Error::new(
+                err_class(ruby, "DisposedError"),
+                "disposed function",
+            ));
+        }
+        Ok(())
+    }
+    fn call(ruby: &Ruby, rb_self: &Self, args: &[Value]) -> Result<Value, Error> {
+        rb_self.check_live(ruby)?;
+        rb_self
+            .core
+            .call_function(ruby, rb_self.context_id, rb_self.function_id, args, false)
+    }
+    fn call_void(ruby: &Ruby, rb_self: &Self, args: &[Value]) -> Result<Value, Error> {
+        rb_self.check_live(ruby)?;
+        rb_self
+            .core
+            .call_function(ruby, rb_self.context_id, rb_self.function_id, args, true)
+    }
+    // Let go of the function now rather than when this wrapper is collected. Any
+    // thread, any time: the Globals go at the isolate's next resolve.
+    fn dispose(&self) {
+        if !self.disposed.swap(true, Ordering::SeqCst) {
+            self.core.release_function(self.function_id);
+        }
+    }
+    fn disposed(&self) -> bool {
+        self.disposed.load(Ordering::SeqCst) || self.core.is_disposed()
+    }
+}
+
+impl Drop for JsFunction {
+    fn drop(&mut self) {
+        self.dispose();
+    }
+}
+
 // A bytecode cache as a binary (ASCII-8BIT) Ruby String, or nil when there's
 // none — the shared return shape of #cached_data and #create_code_cache.
 fn code_cache_value(ruby: &Ruby, bytes: Option<&Vec<u8>>) -> Value {
@@ -4015,6 +4159,7 @@ fn vm_err(ruby: &Ruby, e: VmError) -> Error {
             err_class(ruby, "V8OutOfMemoryError"),
             "JavaScript exceeded the isolate memory_limit",
         ),
+        VmError::Disposed(m) => Error::new(err_class(ruby, "DisposedError"), m),
     }
 }
 
@@ -4197,6 +4342,7 @@ pub fn install_classes(ruby: &Ruby) -> Result<(), Error> {
     context.define_method("_eval", method!(Context::eval, 4))?;
     context.define_method("call", method!(Context::call, -1))?;
     context.define_method("call_void", method!(Context::call_void, -1))?;
+    context.define_method("function", method!(Context::function, 1))?;
     context.define_method("attach", method!(Context::attach, 2))?;
     context.define_method("attach_many", method!(Context::attach_many, 1))?;
     context.define_method("reset", method!(Context::reset, 0))?;
@@ -4216,6 +4362,13 @@ pub fn install_classes(ruby: &Ruby) -> Result<(), Error> {
     script.define_method("create_code_cache", method!(Script::create_code_cache, 0))?;
     script.define_method("dispose", method!(Script::dispose, 0))?;
     script.define_method("disposed?", method!(Script::disposed, 0))?;
+
+    // A resolved function: Context#function -> #call / #call_void.
+    let function = module.define_class("Function", ruby.class_object())?;
+    function.define_method("call", method!(JsFunction::call, -1))?;
+    function.define_method("call_void", method!(JsFunction::call_void, -1))?;
+    function.define_method("dispose", method!(JsFunction::dispose, 0))?;
+    function.define_method("disposed?", method!(JsFunction::disposed, 0))?;
 
     // V8 startup blob: Snapshot.new(code) -> Isolate.new(snapshot:).
     let snapshot = module.define_class("Snapshot", ruby.class_object())?;
