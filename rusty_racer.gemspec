@@ -33,6 +33,7 @@ Gem::Specification.new do |spec|
     "ext/rusty_racer/Cargo.{toml,lock}",
     "Cargo.toml",
     "README.md",
+    "CHANGELOG.md",
   ]
   spec.require_paths = ["lib"]
   spec.extensions    = ["ext/rusty_racer/extconf.rb"]
