@@ -492,6 +492,36 @@ class RustyRacerTest < Minitest::Test
     assert_predicate kept, :disposed?
   end
 
+  # Whether a handle still holds its function, seen through a JS WeakRef after a full GC.
+  def function_held?(iso, ctx)
+    ctx.eval_void('delete globalThis.target')
+    iso.low_memory_notification
+    ctx.eval('globalThis.ref.deref() !== undefined')
+  end
+
+  def test_a_disposed_handle_lets_go_of_its_function
+    @ctx.eval('globalThis.target = {f() {}}; globalThis.ref = new WeakRef(target.f)')
+    f = @ctx.function('target.f')
+    assert function_held?(@iso, @ctx)
+    f.dispose
+    @ctx.eval('1')
+    refute function_held?(@iso, @ctx)
+  end
+
+  def test_a_resolve_terminated_after_it_found_the_function_keeps_nothing
+    iso = RustyRacer::Isolate.new(timeout_ms: 200)
+    ctx = iso.context
+    ctx.eval(<<~JS)
+      globalThis.target = {f() {}};
+      globalThis.ref = new WeakRef(target.f);
+      Object.defineProperty(globalThis, 'spun', {get() { Promise.resolve().then(() => { for (;;) {} }); return target }});
+    JS
+    assert_raises(RustyRacer::ScriptTerminatedError) { ctx.function('spun.f') }
+    refute function_held?(iso, ctx)
+  ensure
+    iso&.dispose
+  end
+
   def test_function_handle_works_reentrantly_and_drains_microtasks_only_outermost
     @ctx.eval(<<~JS)
       function later() { Promise.resolve().then(() => { globalThis.n = (globalThis.n || 0) + 1 }) }
@@ -2658,6 +2688,8 @@ class RustyRacerTest < Minitest::Test
     to_hash = Object.new.tap {|o| o.define_singleton_method(:to_hash) { {'x' => 1} } }
     assert_equal [1, 2], @ctx.call('echo', to_ary)
     assert_equal({'x' => 1}, @ctx.call('echo', to_hash))
+    duration = Object.new.tap {|o| o.define_singleton_method(:to_f) { 300.0 } }
+    assert_equal 300, @ctx.call('echo', duration)
     assert_raises(TypeError) { @ctx.call('echo', Object.new) }
   end
 

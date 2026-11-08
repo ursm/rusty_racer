@@ -918,8 +918,13 @@ struct ScriptReg {
 // must not keep its realm's v8::Context alive — and so they are only ever
 // dropped on the owner thread with the isolate entered, which a wrapper's GC
 // free can't promise. A wrapper that is disposed or collected queues its id on
-// Core.released_functions instead; the next resolve removes it here. Ids are
-// never reused, so a stale id can only miss.
+// Core.released_functions instead, and the next outermost request boundary
+// removes it here. Ids are never reused, so a stale id can only miss.
+//
+// A path may lead into ANOTHER realm (`frames[0].fn`): the entry belongs to the
+// realm it was resolved in, so it holds that other realm's function until this
+// one is reset or the handle is released — as any reference this realm keeps
+// to it would.
 #[derive(Default)]
 struct FunctionReg {
     by_id: HashMap<u64, FunctionEntry>,
@@ -1741,10 +1746,13 @@ struct Core {
     // holds it. reset/dispose releases the slots and recycles them.
     procs: Mutex<ProcTable>,
     // Function handle ids whose Ruby wrappers were disposed or collected, for the
-    // next resolve to remove from FunctionReg (`forget_released_functions`). A
-    // wrapper's free may run on any Ruby thread, outside any op, so all it can do
-    // is queue its id here.
+    // next outermost request boundary to remove from FunctionReg
+    // (`forget_released_functions`). A wrapper's free may run on any Ruby thread,
+    // outside any op, so all it can do is queue its id here.
     released_functions: Mutex<Vec<u64>>,
+    // Set with each push there, so the request boundary looks at the lock only
+    // when there is something under it.
+    functions_released: AtomicBool,
     // Default per-eval/call timeout (ms); 0 = none. eval(timeout_ms:)'s explicit
     // value overrides it. Guards against an in-V8 infinite loop without a watchdog.
     default_timeout_ms: u64,
@@ -2376,7 +2384,7 @@ fn install_host_namespace(
     }
     if let Some(key) = v8::String::new(scope, name) {
         let global = context.global(scope);
-        global.set(scope, key.into(), ns.into());
+        global.create_data_property(scope, key.into(), ns.into());
     }
 }
 
@@ -2614,6 +2622,7 @@ impl Isolate {
             roots: Opaque::from(roots),
             procs: Mutex::new(ProcTable::default()),
             released_functions: Mutex::new(Vec::new()),
+            functions_released: AtomicBool::new(false),
             default_timeout_ms: timeout_ms,
             memory_limit,
             watchdog,
@@ -3076,6 +3085,7 @@ impl Core {
     // this lock, briefly, and allocates no Ruby object — it runs from a GC free.
     fn release_function(&self, function_id: u64) {
         self.released_functions.lock().unwrap().push(function_id);
+        self.functions_released.store(true, Ordering::Relaxed);
     }
 
     fn drain_microtasks(&self, ruby: &Ruby) -> Result<Value, Error> {
@@ -4075,7 +4085,7 @@ impl JsFunction {
             .call_function(ruby, rb_self.context_id, rb_self.function_id, args, true)
     }
     // Let go of the function now rather than when this wrapper is collected. Any
-    // thread, any time: the Globals go at the isolate's next resolve.
+    // thread, any time: the Globals go at the end of the isolate's next op.
     fn dispose(&self) {
         if !self.disposed.swap(true, Ordering::SeqCst) {
             self.core.release_function(self.function_id);

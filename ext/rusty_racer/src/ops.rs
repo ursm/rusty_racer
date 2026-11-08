@@ -453,6 +453,7 @@ pub(crate) fn service_request(
     // (the graveyard repoint inside) requires that.
     if outermost {
         flush_retiring(scope);
+        forget_released_functions(scope);
     }
     reply
 }
@@ -742,7 +743,10 @@ fn op_resolve_function(
     timeout_ms: u64,
     outermost: bool,
 ) -> VmReply {
-    forget_released_functions(scope);
+    // The id this resolve registered, for a terminate after it (in the drain, or
+    // the watchdog's verdict over the bracket) to take back: a failed resolve hands
+    // Ruby no wrapper, so nothing else would ever release it.
+    let mut registered = None;
     let outcome = run_js_bracketed(
         scope,
         outermost,
@@ -750,10 +754,7 @@ fn op_resolve_function(
         "function",
         |scope, outermost| {
             let Some(ctx) = context_for(istate!(scope), context_id) else {
-                return (
-                    false,
-                    Err(VmError::Runtime("realm disposed or unknown".into())),
-                );
+                return (false, Err(VmError::Disposed(REALM_GONE.into())));
             };
             let context = v8::Local::new(scope, &ctx);
             let scope = &mut v8::ContextScope::new(scope, context);
@@ -778,24 +779,36 @@ fn op_resolve_function(
                         context_id,
                     },
                 );
+                registered = Some(id);
                 JsVal::Int(id as i64)
             });
             auto_drain(scope, outermost);
             (true, out)
         },
     );
+    if let (Err(_), Some(id)) = (&outcome, registered) {
+        istate!(scope).functions.by_id.remove(&id);
+    }
     VmReply::Done(outcome)
 }
 
-// Remove the handles whose Ruby wrappers were disposed or collected since the
-// last resolve (Core.released_functions): their wrappers could not drop the
-// Globals themselves (see FunctionReg).
+// What a call or a resolve of a handle whose realm is gone raises.
+const REALM_GONE: &str = "function's realm was reset or disposed";
+
+// Remove the handles whose Ruby wrappers were disposed or collected
+// (Core.released_functions): their wrappers could not drop the Globals
+// themselves (see FunctionReg). At the outermost request boundary, and only when
+// one was released — a flag read, not a lock, on every other op.
 fn forget_released_functions(scope: &mut v8::PinScope<'_, '_, ()>) {
     let core = istate!(scope).core_ptr;
     if core.is_null() {
         return;
     }
-    let released = std::mem::take(&mut *unsafe { &*core }.released_functions.lock().unwrap());
+    let core = unsafe { &*core };
+    if !core.functions_released.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    let released = std::mem::take(&mut *core.released_functions.lock().unwrap());
     let functions = &mut istate!(scope).functions;
     for id in released {
         functions.by_id.remove(&id);
@@ -812,10 +825,9 @@ fn op_call_function(
     timeout_ms: u64,
     outermost: bool,
 ) -> VmReply {
-    const GONE: &str = "function's realm was reset or disposed";
     let outcome = run_js_bracketed(scope, outermost, timeout_ms, "call", |scope, outermost| {
         let Some(ctx) = context_for(istate!(scope), context_id) else {
-            return (false, Err(VmError::Disposed(GONE.into())));
+            return (false, Err(VmError::Disposed(REALM_GONE.into())));
         };
         let context = v8::Local::new(scope, &ctx);
         let scope = &mut v8::ContextScope::new(scope, context);
@@ -831,7 +843,7 @@ fn op_call_function(
                 )
             });
         let Some((function, receiver)) = target else {
-            return (false, Err(VmError::Disposed(GONE.into())));
+            return (false, Err(VmError::Disposed(REALM_GONE.into())));
         };
         let out = call_resolved(scope, function, receiver, args, void);
         auto_drain(scope, outermost);

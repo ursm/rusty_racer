@@ -24,8 +24,10 @@
 - Ruby → JS marshalling dispatches on the value's built-in type first: a String,
   Symbol, Array or Hash argument no longer pays for a raised-and-rescued
   conversion probe or a constant lookup (a String argument cost ~1.2 µs more
-  than none; now ~0.07 µs). Subclasses and `to_str` / `to_ary` / `to_hash`
-  conversions marshal as before.
+  than none; now ~0.07 µs). Subclasses, `to_f` (an `ActiveSupport::Duration`),
+  `to_str`, `to_ary` and `to_hash` conversions marshal as before — except that
+  an Array or Hash subclass is now always an array or an object, where one that
+  also defined `to_str` (or a Hash subclass `to_ary`) used to cross as that.
 - A getter or `Proxy` trap that throws while `Context#call` resolves its path
   now raises a `RuntimeError` carrying the JS stack, and the thrown value
   propagates through a host function like any other JS throw.

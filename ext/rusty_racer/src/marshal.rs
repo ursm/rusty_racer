@@ -851,10 +851,10 @@ fn ruby_to_jsval_d(val: Value, seen: &mut RbSeen, depth: u32) -> Result<JsVal, E
         let sec = val.funcall::<_, _, f64>("to_f", ())?;
         return Ok(JsVal::Date(sec * 1000.0));
     }
-    // Any other Numeric (a Rational, a BigDecimal) -> its Float.
-    if val.is_kind_of(ruby.class_numeric())
-        && let Ok(n) = f64::try_convert(val)
-    {
+    // Any other Float-convertible value (a Rational, a BigDecimal, an
+    // ActiveSupport::Duration — whatever rb_num2dbl takes, to_f included) -> its
+    // Float. A probe that raises to say no, but the built-ins are past it by now.
+    if let Ok(n) = f64::try_convert(val) {
         return Ok(JsVal::Num(n));
     }
     // A String-like (to_str) gets the same tag-driven treatment, but its result

@@ -114,9 +114,14 @@ making a property name per call. Reassigning or deleting the path afterwards
 does not change what the handle calls.
 
 A handle lives as long as its realm does. Once its context is `reset` or
-`dispose`d (or the isolate is), `#call` raises `RustyRacer::DisposedError`; it
-never keeps a dead realm alive. `#dispose` lets go of one early, and a handle
-that is simply garbage-collected is released too.
+`dispose`d (or the isolate is), `#call` raises `RustyRacer::DisposedError`, and
+the handle no longer keeps that realm alive. (`#disposed?` answers for the handle
+and its isolate only: a realm's reset is found by the next call.) `#dispose` lets
+go of one early, and a handle that is simply garbage-collected is released too,
+at the end of the isolate's next operation. A path that leads into *another*
+realm (`frames[0].fn` in an embedder whose realms see each other) holds that
+realm's function for as long as the handle's own realm lives, as any reference
+kept there would.
 
 ### Marshalling and the page's JavaScript
 
