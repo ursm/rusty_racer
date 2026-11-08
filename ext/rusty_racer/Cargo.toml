@@ -5,7 +5,7 @@
 # links and loads with no custom archive.
 [package]
 name = "rusty_racer"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2024"
 publish = false
 
@@ -29,8 +29,9 @@ rb-sys = "0.9"
 # (which is built with rusty_v8_enable_simdutf=true) on every platform.
 v8 = { version = "150.4.0", features = ["simdutf"] }
 # pthread stack-bounds query, to set V8's stack limit per op relative to the
-# current native thread (in-thread V8 runs on the Ruby thread's stack).
-libc = "0.2"
+# current native thread (in-thread V8 runs on the Ruby thread's stack). 0.2.172
+# for `_IOWR`, which builds the PROCMAP_QUERY ioctl number per architecture.
+libc = "0.2.172"
 
 # `cargo test` links libruby: the crate calls into it, though the marshalling tests
 # that run without a VM never do.

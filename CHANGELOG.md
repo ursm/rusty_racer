@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.7
+
+### Changed
+
+- An operation on a Ruby Fiber looks its stack's bounds up once per stack
+  rather than once per operation that a 16-entry cache had dropped. Capybara
+  filters each result set in an Enumerator left suspended until GC frees it, so
+  a page of finds runs on hundreds of distinct fiber stacks, and each lookup read
+  all of `/proc/self/maps` — a fifth of a find loop, and slower the larger
+  Ruby's fiber pool grew. Every stack an operation has run on is now kept (Ruby
+  hands its pooled stacks out again and never unmaps them), and on Linux 6.11+ a
+  lookup asks the kernel for the one mapping (`PROCMAP_QUERY`) instead of
+  reading the whole map. A call into V8 from a fresh fiber, steady state: 160 µs
+  → 1.0 µs beside a 2,200-line map, 521 µs → 1.0 µs beside 8,300 lines.
+
 ## 0.2.6
 
 ### Added

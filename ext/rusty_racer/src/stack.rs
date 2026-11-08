@@ -151,33 +151,24 @@ fn native_stack_bounds() -> (usize, usize) {
     (0, 0)
 }
 
-// Lower bound (and upper, for the cache test) of the memory region containing
-// `addr` — i.e. the BOTTOM of the stack `addr` is on. Used for a Ruby Fiber,
-// whose mmap'd stack pthread can't see: V8's limit must sit ABOVE this bottom or
-// a deep fiber recursion overflows the real stack and SEGVs the unmapped guard.
-// (0, 0) if unknown.
+// The BOTTOM of the stack `addr` is on, and the highest address an op has been
+// seen running at on it. Used for a Ruby Fiber, whose mmap'd stack pthread can't
+// see: V8's limit must sit ABOVE this bottom or a deep fiber recursion overflows
+// the real stack and SEGVs the unmapped guard. (0, 0) if unknown.
 //
-// Cached per native thread, several regions at a time, because a miss asks the
-// OS for the whole memory map and costs far more than the op it serves: with ONE
-// slot
-// a workload that alternates between fibers missed on every single op, and an
-// eval went from 1.2us to 31us as soon as two fibers took turns (measured on a
-// 212-line maps; a Rails process has many times that). Ruby pools fiber stacks,
-// so the live set is small and stable — one Enumerator per Capybara result, say
-// — and a handful of slots turns that back into hits.
+// Cached per native thread, for EVERY stack an op has run on, because a miss
+// asks the OS and a workload can run each op on a stack it has never used before:
+// Capybara filters each result set in an Enumerator, left suspended until GC
+// frees it, so a thousand finds run on a thousand distinct fiber stacks. A cache
+// of sixteen slots missed on nearly every one of them, and where a miss reads all
+// of /proc/self/maps — whose length grows with Ruby's fiber pool — those reads
+// were a fifth of the find loop (1003 per 1000 finds). Keeping every stack makes
+// the steady state free: the pool hands the same stacks out again (its free list
+// is LIFO, and it never unmaps them — below), so once each has had an op on it
+// nothing misses. The table is as large as the set of stacks ops have run on,
+// which that pool bounds.
 //
-// Eviction is RANDOM, not round-robin (or LRU, which behaves the same here):
-// ops cycling through more fibers than there are slots are exactly the pattern
-// those policies handle worst, since each eviction takes the entry needed next
-// and the hit rate collapses to zero — one fiber over the size measured as slow
-// as having no cache at all. Evicting at random keeps roughly
-// slots/live-fibers of the accesses, so going over the size degrades gradually
-// instead of falling off a cliff. Empty slots are filled before anything is
-// evicted. Entries are never invalidated: a dead fiber's keeps its slot until
-// some miss draws it, and with a live set that fits there are no misses at all
-// — which is why a hit has to be self-justifying rather than merely plausible.
-//
-// So the mapping's top is never used, or even kept, as an upper bound. A fiber
+// The mapping's top is never used, or even kept, as an upper bound. A fiber
 // stack's mapping can extend far above the stack itself, where the kernel merged
 // it with an adjacent anonymous mapping of the same protection that has nothing
 // to do with the fiber pool (measured: a 644KB stack inside an 8840KB mapping,
@@ -207,94 +198,160 @@ fn native_stack_bounds() -> (usize, usize) {
 // Within that window a cached bottom is the fiber's real bottom: Ruby brackets
 // every fiber stack with PROT_NONE guard pages, so the mapping cannot start
 // below the stack, and a pooled slot is handed to the next fiber with identical
-// bounds.
-const FIBER_REGION_SLOTS: usize = 16;
-
-#[derive(Clone, Copy)]
-struct FiberRegion {
-    // The mapping's bottom, and the key: 0 marks the slot unused.
+// bounds. Entries are never invalidated, and that rests on the pool too: Ruby
+// frees a pool allocation only when built with FIBER_POOL_ALLOCATION_FREE (cont.c
+// defines it for a limited address space, i.e. 32-bit, which V8 doesn't ship for,
+// and for RB_EXPERIMENTAL_FIBER_POOL), so the bounds an op saw on a stack stay
+// the bounds of every later fiber there. Under a build that does unmap, an entry
+// can outlive its memory; a hit is then still right when the memory is mapped
+// again as the same pool's stacks at the same address — the same stride, so the
+// same guards — and wrong, with a bottom below the new one, when a later mapping
+// puts a guard page inside the old window. The same goes for a stack that is not
+// Ruby's: a C extension's own coroutine stack, unmapped once it is done with and
+// its addresses reused, can leave an entry that answers for memory it no longer
+// describes. Ruby's M:N thread stacks are safe the way its fibers are: a freed
+// one is only madvised, never unmapped.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FiberStack {
+    // The bottom of the stack's mapping.
     lo: usize,
     // Highest address a V8 op has run at on this stack.
     seen: usize,
 }
 
-#[derive(Clone, Copy)]
-struct FiberRegions {
-    slots: [FiberRegion; FIBER_REGION_SLOTS],
-    // xorshift64 state for picking a victim. Seeded to a fixed nonzero constant
-    // (the golden-ratio one): nothing here needs unpredictability, only that the
-    // eviction order doesn't line up with the caller's rotation through fibers.
-    rng: u64,
+// Sorted by `lo`, with disjoint [lo, seen] windows — so `seen` ascends too, and
+// both lookups below are binary searches.
+struct FiberStacks(Vec<FiberStack>);
+
+impl FiberStacks {
+    // The entry whose window holds `addr`.
+    fn find(&self, addr: usize) -> Option<FiberStack> {
+        let below = self.0.partition_point(|s| s.lo <= addr);
+        let stack = *self.0.get(below.checked_sub(1)?)?;
+        (addr <= stack.seen).then_some(stack)
+    }
+
+    // (bottom, highest-address-seen) of the stack `addr` is on: the entry's when
+    // one holds it, else `query`'s answer for `addr`, recorded — 0 there being
+    // "unknown", which is recorded nowhere.
+    fn bounds(&mut self, addr: usize, query: impl FnOnce(usize) -> usize) -> (usize, usize) {
+        if let Some(stack) = self.find(addr) {
+            return (stack.lo, stack.seen);
+        }
+        let lo = query(addr);
+        if lo == 0 {
+            return (0, 0);
+        }
+        self.record(lo, addr);
+        (lo, addr)
+    }
+
+    // Record an op at `addr` on the stack whose bottom was just looked up as
+    // `lo`. Being fresh, that replaces every entry overlapping [lo, addr]: the
+    // same stack's narrower window, or one describing memory since mapped afresh.
+    // Every query checks that its mapping holds `addr`, so `lo <= addr`.
+    fn record(&mut self, lo: usize, addr: usize) {
+        debug_assert!(lo <= addr);
+        let from = self.0.partition_point(|s| s.seen < lo);
+        let to = self.0.partition_point(|s| s.lo <= addr);
+        self.0.splice(from..to, [FiberStack { lo, seen: addr }]);
+    }
 }
 
 thread_local! {
-    static FIBER_REGIONS: std::cell::RefCell<FiberRegions> = const {
-        std::cell::RefCell::new(FiberRegions {
-            slots: [FiberRegion { lo: 0, seen: 0 }; FIBER_REGION_SLOTS],
-            rng: 0x9E37_79B9_7F4A_7C15,
-        })
-    };
+    static FIBER_STACKS: std::cell::RefCell<FiberStacks> =
+        const { std::cell::RefCell::new(FiberStacks(Vec::new())) };
 }
 
 // (bottom, highest-address-seen) of the stack `addr` is on. `addr` must be an
 // address the CALLER knows is on that stack and as high up it as it can offer —
 // it both answers the lookup and becomes the entry's `seen` on a miss, so a
-// caller that passes its topmost frame gets the widest sound window. A RefCell
-// rather than a Cell so a hit reads the slots in place instead of copying the
-// whole table out on every fiber op.
+// caller that passes its topmost frame gets the widest sound window. An op run
+// while the thread's locals are being torn down gets the fail-safe (0, 0).
 fn current_region_bounds_cached(addr: usize) -> (usize, usize) {
-    FIBER_REGIONS.with(|c| {
-        if let Some(r) = c
-            .borrow()
-            .slots
-            .iter()
-            .find(|r| r.lo != 0 && addr >= r.lo && addr <= r.seen)
-        {
-            return (r.lo, r.seen);
-        }
-        let (lo, _) = query_region_bounds(addr);
-        if lo == 0 {
-            return (0, 0);
-        }
-        let mut cache = c.borrow_mut();
-        // Prefer the entry for a stack we already know (a frame above anything
-        // seen on it so far, which just widens the window), then an empty slot,
-        // and only then evict.
-        let slot = cache
-            .slots
-            .iter()
-            .position(|r| r.lo == lo)
-            .or_else(|| cache.slots.iter().position(|r| r.lo == 0))
-            .unwrap_or_else(|| {
-                cache.rng ^= cache.rng << 13;
-                cache.rng ^= cache.rng >> 7;
-                cache.rng ^= cache.rng << 17;
-                (cache.rng % FIBER_REGION_SLOTS as u64) as usize
-            });
-        cache.slots[slot] = FiberRegion { lo, seen: addr };
-        (lo, addr)
-    })
+    FIBER_STACKS
+        .try_with(|stacks| stacks.borrow_mut().bounds(addr, query_region_bottom))
+        .unwrap_or((0, 0))
 }
 
-// The [start, end) of the mapping containing `addr`, or (0, 0) when it can't be
-// established. Only called on a cache miss (a new fiber), because it is slow.
+// The bottom of the mapping containing `addr`, or 0 when it can't be
+// established. Only called on a cache miss: a stack no op has run on yet, or a
+// frame above any seen on it.
 //
-// (0, 0) is the fail-safe answer, not an error: every caller falls back to a
-// fixed budget below the SP, which is what this gem did on every platform before
-// any of these lookups existed. So a platform without an implementation, or a
-// lookup that returns something we can't vouch for, degrades to a smaller JS
-// stack rather than to a wrong one.
+// 0 is the fail-safe answer, not an error: every caller falls back to a fixed
+// budget below the SP, which is what this gem did on every platform before any
+// of these lookups existed. So a platform without an implementation, or a lookup
+// that returns something we can't vouch for, degrades to a smaller JS stack
+// rather than to a wrong one.
 //
-// Linux reads /proc/self/maps fresh each time.
+// Linux asks the kernel for the one mapping (PROCMAP_QUERY, 6.11+: ~0.65us for
+// the open, the ioctl and the close, measured beside 3000 mappings) and reads
+// all of /proc/self/maps only where the ioctl isn't there — ~25-200us, growing
+// with the map. The file is opened per call rather than kept: an open file
+// would go on describing the PARENT's address space in a forked child.
 #[cfg(target_os = "linux")]
-fn query_region_bounds(addr: usize) -> (usize, usize) {
+fn query_region_bottom(addr: usize) -> usize {
+    let Ok(mut maps) = std::fs::File::open("/proc/self/maps") else {
+        return 0;
+    };
+    procmap_query_bottom(&maps, addr).unwrap_or_else(|| read_maps_bottom(&mut maps, addr))
+}
+
+// The bottom of the mapping containing `addr`, through the PROCMAP_QUERY ioctl
+// on an open /proc/self/maps; None when the ioctl fails, which on a live stack
+// address means a kernel without it (ENOTTY), or answers with a mapping that
+// does not hold `addr`, which the kernel's never does but an emulated /proc
+// might.
+#[cfg(target_os = "linux")]
+fn procmap_query_bottom(maps: &std::fs::File, addr: usize) -> Option<usize> {
+    use std::os::fd::AsRawFd;
+    // struct procmap_query, from linux/fs.h — not in libc. Only `vma_start` is
+    // read back, but the ioctl number encodes the whole struct's size.
+    #[repr(C)]
+    #[derive(Default)]
+    struct ProcmapQuery {
+        size: u64,
+        query_flags: u64,
+        query_addr: u64,
+        vma_start: u64,
+        vma_end: u64,
+        vma_flags: u64,
+        vma_page_size: u64,
+        vma_offset: u64,
+        inode: u64,
+        dev_major: u32,
+        dev_minor: u32,
+        vma_name_size: u32,
+        build_id_size: u32,
+        vma_name_addr: u64,
+        build_id_addr: u64,
+    }
+    // Flags 0 ask for the mapping COVERING query_addr, not the next one above it.
+    const PROCMAP_QUERY: libc::Ioctl = libc::_IOWR::<ProcmapQuery>(b'f' as u32, 17);
+    let mut query = ProcmapQuery {
+        size: std::mem::size_of::<ProcmapQuery>() as u64,
+        query_addr: addr as u64,
+        ..Default::default()
+    };
+    let rc = unsafe {
+        libc::ioctl(
+            maps.as_raw_fd(),
+            PROCMAP_QUERY,
+            &mut query as *mut ProcmapQuery,
+        )
+    };
+    let (lo, hi) = (query.vma_start as usize, query.vma_end as usize);
+    (rc == 0 && lo <= addr && addr < hi).then_some(lo)
+}
+
+// The bottom of the mapping containing `addr`, from the text of
+// /proc/self/maps, or 0 if no line covers it.
+#[cfg(target_os = "linux")]
+fn read_maps_bottom(maps: &mut std::fs::File, addr: usize) -> usize {
     use std::io::Read;
     let mut buf = String::new();
-    if std::fs::File::open("/proc/self/maps")
-        .and_then(|mut f| f.read_to_string(&mut buf))
-        .is_err()
-    {
-        return (0, 0);
+    if maps.read_to_string(&mut buf).is_err() {
+        return 0;
     }
     for line in buf.lines() {
         // e.g. "7f6a...000-7f6a...000 rw-p 00000000 00:00 0 ..."
@@ -309,10 +366,10 @@ fn query_region_bounds(addr: usize) -> (usize, usize) {
             continue;
         };
         if addr >= lo && addr < hi {
-            return (lo, hi);
+            return lo;
         }
     }
-    (0, 0)
+    0
 }
 
 // macOS has no /proc, so ask the Mach VM directly. mach_vm_region reports the
@@ -322,7 +379,7 @@ fn query_region_bounds(addr: usize) -> (usize, usize) {
 // that isn't tells us we either walked into something that is not a stack or
 // misread the reply, in which case the fixed-budget fallback is the safer answer.
 #[cfg(target_os = "macos")]
-fn query_region_bounds(addr: usize) -> (usize, usize) {
+fn query_region_bottom(addr: usize) -> usize {
     // Not in libc, which points at the `mach2` crate instead; these are the only
     // entry points we need, so declare them here rather than take the dependency.
     // (libc does carry mach_task_self_, but deprecated for the same reason.)
@@ -370,20 +427,20 @@ fn query_region_bounds(addr: usize) -> (usize, usize) {
             mach_port_deallocate(mach_task_self_, object_name);
         }
         if kr != KERN_SUCCESS || size == 0 || info[0] & VM_PROT_READ_WRITE != VM_PROT_READ_WRITE {
-            return (0, 0);
+            return 0;
         }
         let (lo, hi) = (start as usize, start.saturating_add(size) as usize);
         if addr >= lo && addr < hi {
-            (lo, hi)
+            lo
         } else {
-            (0, 0) // `addr` was in a hole; this is the region after it
+            0 // `addr` was in a hole; this is the region after it
         }
     }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn query_region_bounds(_addr: usize) -> (usize, usize) {
-    (0, 0)
+fn query_region_bottom(_addr: usize) -> usize {
+    0
 }
 
 // Set from RUSTY_RACER_STACK_DEBUG at init; gates the per-op stack diagnostics.
@@ -517,7 +574,7 @@ impl<'a> StackScope<'a> {
             } else {
                 // Region unknown. Both shipped platforms implement the lookup,
                 // so reaching this on one of them means the lookup FAILED (see
-                // query_region_bounds for what it refuses to vouch for) — worth
+                // query_region_bottom for what it refuses to vouch for) — worth
                 // chasing rather than assuming, since the budget here is only a
                 // guess: a fixed reserve below the SP, hoping the fiber is that
                 // deep. It usually is for an OUTERMOST fiber op, whose SP sits
@@ -596,12 +653,15 @@ impl<'a> StackScope<'a> {
         //     stack (the cache's `seen`, NOT the mapping top, which can reach far
         //     into an unrelated neighbour — see current_region_bounds_cached);
         //     otherwise we cannot tell it is on our stack at all, and adopting it
-        //     would send the scan up through our guard page. Since that window
-        //     lives in a cache with random eviction, the test can also fail
-        //     because the entry was evicted between the two ops — the scan then
-        //     narrows to this op's own frame, i.e. the same residual documented
-        //     there for a real stack switch, now reachable at random once more
-        //     fiber stacks are live than the cache holds.
+        //     would send the scan up through our guard page. The enclosing op
+        //     ran on this stack at or below `seen` — it widened the entry to its
+        //     own `stack_top` if nothing had — and an entry is only ever replaced
+        //     by a fresh lookup overlapping it, which for a stack still mapped is
+        //     the same stack with a higher `seen`. So the test holds for every
+        //     enclosing op on our stack whose lookup went through this thread's
+        //     table; one that ran on another native thread (an M:N Ruby thread
+        //     that resumed elsewhere inside a host callback) is unknown here, and
+        //     the scan narrows to this op's own frame — the residual below.
         let new_scan_start = if on_native {
             unsafe { v8__base__Stack__GetStackStart() }
         } else if nested && region.0 != 0 && prev_scan_start > sp && prev_scan_start <= region.1 {
@@ -653,5 +713,221 @@ impl Drop for StackScope<'_> {
             self.installed_limit
                 .store(self.restore_limit, Ordering::Relaxed);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stacks(entries: &[(usize, usize)]) -> FiberStacks {
+        FiberStacks(
+            entries
+                .iter()
+                .map(|&(lo, seen)| FiberStack { lo, seen })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn a_lookup_hits_only_inside_a_window() {
+        let table = stacks(&[(0x1000, 0x1800), (0x3000, 0x3400)]);
+        assert_eq!(table.find(0x0fff), None);
+        assert_eq!(
+            table.find(0x1000),
+            Some(FiberStack {
+                lo: 0x1000,
+                seen: 0x1800
+            })
+        );
+        assert_eq!(table.find(0x1800).map(|s| s.lo), Some(0x1000));
+        // Above `seen` is not known to be on that stack, though no other entry
+        // claims it.
+        assert_eq!(table.find(0x1801), None);
+        assert_eq!(table.find(0x3200).map(|s| s.lo), Some(0x3000));
+        assert_eq!(table.find(0x3401), None);
+    }
+
+    #[test]
+    fn a_stack_is_looked_up_once_and_again_only_above_its_window() {
+        let mut table = stacks(&[]);
+        let queries = std::cell::Cell::new(0);
+        let mut bounds = |addr| {
+            table.bounds(addr, |_| {
+                queries.set(queries.get() + 1);
+                0x1000
+            })
+        };
+        assert_eq!(bounds(0x1800), (0x1000, 0x1800));
+        assert_eq!(bounds(0x1400), (0x1000, 0x1800));
+        assert_eq!(bounds(0x1800), (0x1000, 0x1800));
+        assert_eq!(queries.get(), 1);
+        assert_eq!(bounds(0x1c00), (0x1000, 0x1c00));
+        assert_eq!(bounds(0x1900), (0x1000, 0x1c00));
+        assert_eq!(queries.get(), 2);
+    }
+
+    #[test]
+    fn an_unknown_bottom_is_not_recorded() {
+        let mut table = stacks(&[]);
+        assert_eq!(table.bounds(0x1800, |_| 0), (0, 0));
+        assert_eq!(table.0, Vec::new());
+    }
+
+    #[test]
+    fn a_frame_above_the_window_widens_the_same_entry() {
+        let mut table = stacks(&[(0x1000, 0x1800), (0x3000, 0x3400)]);
+        table.record(0x1000, 0x1c00);
+        assert_eq!(table.0, stacks(&[(0x1000, 0x1c00), (0x3000, 0x3400)]).0);
+    }
+
+    #[test]
+    fn a_new_stack_is_inserted_in_order() {
+        let mut table = stacks(&[(0x1000, 0x1800), (0x5000, 0x5400)]);
+        table.record(0x3000, 0x3100);
+        table.record(0x0100, 0x0200);
+        table.record(0x9000, 0x9100);
+        assert_eq!(
+            table.0,
+            stacks(&[
+                (0x0100, 0x0200),
+                (0x1000, 0x1800),
+                (0x3000, 0x3100),
+                (0x5000, 0x5400),
+                (0x9000, 0x9100)
+            ])
+            .0
+        );
+    }
+
+    #[test]
+    fn a_fresh_bottom_replaces_every_entry_it_overlaps() {
+        // Memory once holding two stacks, now one mapping from 0x1400: both old
+        // windows reach into [0x1400, 0x3200], so neither may answer again.
+        let mut table = stacks(&[
+            (0x0100, 0x0200),
+            (0x1000, 0x1800),
+            (0x3000, 0x3400),
+            (0x5000, 0x5400),
+        ]);
+        table.record(0x1400, 0x3200);
+        assert_eq!(
+            table.0,
+            stacks(&[(0x0100, 0x0200), (0x1400, 0x3200), (0x5000, 0x5400)]).0
+        );
+        assert_eq!(table.find(0x1200), None);
+    }
+
+    // A mapping laid out as Ruby's fiber pool lays a stack out: read-write
+    // pages with PROT_NONE guard pages among them. Unmapped on drop.
+    #[cfg(target_os = "linux")]
+    struct GuardedStack {
+        base: usize,
+        len: usize,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl GuardedStack {
+        fn page() -> usize {
+            unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+        }
+
+        // `pages` pages, of which those at the `guards` indexes are PROT_NONE.
+        fn map(pages: usize, guards: &[usize]) -> Self {
+            let len = pages * Self::page();
+            let stack = Self {
+                base: Self::mmap(0, len, 0),
+                len,
+            };
+            stack.protect(guards);
+            stack
+        }
+
+        // Map the same addresses afresh (MAP_FIXED replaces the old mapping in
+        // one step, so no other thread's mmap can land in between), with other
+        // guards.
+        fn remap(&self, guards: &[usize]) {
+            assert_eq!(Self::mmap(self.base, self.len, libc::MAP_FIXED), self.base);
+            self.protect(guards);
+        }
+
+        fn mmap(at: usize, len: usize, flags: libc::c_int) -> usize {
+            let base = unsafe {
+                libc::mmap(
+                    at as *mut c_void,
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | flags,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(base, libc::MAP_FAILED);
+            base as usize
+        }
+
+        fn protect(&self, guards: &[usize]) {
+            for &guard in guards {
+                let page = self.page_at(guard) as *mut c_void;
+                assert_eq!(
+                    unsafe { libc::mprotect(page, Self::page(), libc::PROT_NONE) },
+                    0
+                );
+            }
+        }
+
+        fn page_at(&self, index: usize) -> usize {
+            self.base + index * Self::page()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for GuardedStack {
+        fn drop(&mut self) {
+            unsafe { libc::munmap(self.base as *mut c_void, self.len) };
+        }
+    }
+
+    // Both ways of asking agree with each other and with the layout.
+    #[cfg(target_os = "linux")]
+    fn assert_bottom(addr: usize, expected: usize) {
+        assert_eq!(query_region_bottom(addr), expected);
+        let mut maps = std::fs::File::open("/proc/self/maps").unwrap();
+        assert_eq!(read_maps_bottom(&mut maps, addr), expected);
+        // Older kernels have no PROCMAP_QUERY; where there is one it must agree.
+        if let Some(bottom) = procmap_query_bottom(&maps, addr) {
+            assert_eq!(bottom, expected);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_bottom_is_the_page_above_the_guard() {
+        let stack = GuardedStack::map(8, &[0]);
+        assert_bottom(stack.page_at(5) + 17, stack.page_at(1));
+        assert_bottom(stack.page_at(1), stack.page_at(1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stack_mapped_again_with_other_guards_has_its_new_bottom() {
+        // Unmap a fiber's stack and map the same addresses again with a guard
+        // inside the old one: a lookup is a fresh question, so it answers with
+        // the new bottom, never the one the old mapping had.
+        let stack = GuardedStack::map(8, &[0]);
+        assert_bottom(stack.page_at(6), stack.page_at(1));
+        stack.remap(&[0, 4]);
+        assert_bottom(stack.page_at(6), stack.page_at(5));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_live_stack_is_found_where_it_runs() {
+        // This thread's own stack: the frame is somewhere above its bottom.
+        let marker = 0u8;
+        let addr = &marker as *const u8 as usize;
+        let bottom = query_region_bottom(addr);
+        assert_ne!(bottom, 0);
+        assert!(bottom <= addr);
     }
 }

@@ -2946,14 +2946,12 @@ class RustyRacerTest < Minitest::Test
   end
 
   def test_alternating_fibers_each_get_their_own_stack_bounds
-    # Stack bounds are cached per thread, a few regions at a time so that ops
-    # alternating between fibers don't look them up every time. Each fiber must
-    # still come back with ITS OWN bottom: handing one fiber another's (lower)
-    # bottom would tell V8 it has far more headroom than the fiber really has,
-    # and the recursion below would run through the guard page instead of
-    # throwing. Run more fibers than FIBER_REGION_SLOTS (16, in stack.rs) so
-    # entries are evicted and re-queried rather than all sitting resident — raise
-    # that constant past this count and the test quietly stops covering eviction.
+    # Stack bounds are cached per thread, one entry per stack an op has run on,
+    # so that ops alternating between fibers don't look them up every time. Each
+    # fiber must still come back with ITS OWN bottom: handing one fiber another's
+    # (lower) bottom would tell V8 it has far more headroom than the fiber really
+    # has, and the recursion below would run through the guard page instead of
+    # throwing.
     #
     # probe() reports how deep it got before overflowing, which catches BOTH ways
     # the bounds can be wrong. Too low a bottom (another fiber's) hands V8 far
@@ -2979,6 +2977,35 @@ class RustyRacerTest < Minitest::Test
       end
     end
     assert_equal 2, @ctx.eval('1 + 1')
+  end
+
+  def test_a_fiber_stack_seen_once_is_not_looked_up_again
+    # Capybara filters every result set in an Enumerator, left suspended until GC
+    # frees it, so a page of finds runs its ops on hundreds of distinct fiber
+    # stacks. Reading all of /proc/self/maps for every op on a stack the cache had
+    # dropped cost a fifth of such a find loop. Taking turns on many fibers must
+    # read no map once each has run an op — rchar counts the bytes this process
+    # has read, ours included. A kernel with PROCMAP_QUERY (6.11+) answers a
+    # lookup through an ioctl, which rchar does not count, so there this guards
+    # only the map read; the cargo tests hold the table to one lookup per stack.
+    skip 'rchar is read from /proc/self/io' unless File.readable?('/proc/self/io')
+
+    fibers = Array.new(200) {
+      Fiber.new {
+        loop do
+          Fiber.yield(@ctx.eval('1 + 1'))
+        end
+      }
+    }
+    fibers.each(&:resume)
+    maps   = File.read('/proc/self/maps').bytesize
+    before = bytes_read
+    3.times do
+      fibers.each do |f|
+        assert_equal 2, f.resume
+      end
+    end
+    assert_operator bytes_read - before, :<, maps, 'fiber ops re-read /proc/self/maps'
   end
 
   def test_host_callback_that_evals_inside_a_fiber
@@ -3807,6 +3834,11 @@ class RustyRacerTest < Minitest::Test
   # `stack_bytes`. Ruby sizes fiber stacks from the environment at boot, so this
   # has to be a fresh process; the child inherits this one's $LOAD_PATH so it
   # loads the extension under test rather than an installed gem.
+  # Bytes this process has read through read(2) and friends, from /proc/self/io.
+  def bytes_read
+    Integer(File.read('/proc/self/io')[/^rchar: (\d+)/, 1])
+  end
+
   def fiber_js_depth(stack_bytes)
     script = <<~'RUBY'
       require 'rusty_racer'
