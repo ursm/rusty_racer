@@ -2982,11 +2982,13 @@ class RustyRacerTest < Minitest::Test
   def test_a_fiber_stack_seen_once_is_not_looked_up_again
     # Capybara filters every result set in an Enumerator, left suspended until GC
     # frees it, so a page of finds runs its ops on hundreds of distinct fiber
-    # stacks. Each stack's bounds are looked up once; reading all of
-    # /proc/self/maps for every op on a stack the cache had dropped cost a fifth
-    # of such a find loop. Taking turns on many fibers must read nothing once each
-    # has run an op — rchar counts the bytes this process has read, ours included.
-    skip 'rchar is read from /proc' unless RUBY_PLATFORM.include?('linux')
+    # stacks. Reading all of /proc/self/maps for every op on a stack the cache had
+    # dropped cost a fifth of such a find loop. Taking turns on many fibers must
+    # read no map once each has run an op — rchar counts the bytes this process
+    # has read, ours included. A kernel with PROCMAP_QUERY (6.11+) answers a
+    # lookup through an ioctl, which rchar does not count, so there this guards
+    # only the map read; the cargo tests hold the table to one lookup per stack.
+    skip 'rchar is read from /proc/self/io' unless File.readable?('/proc/self/io')
 
     fibers = Array.new(200) {
       Fiber.new {
