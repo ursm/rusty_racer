@@ -2468,6 +2468,53 @@ class RustyRacerTest < Minitest::Test
     assert_equal 'string', @ctx.call('kind', :sym)
   end
 
+  # Ruby -> JS marshalling DEFINES elements and entries: a page's prototype accessors neither see nor swallow them.
+  def test_marshalled_arguments_bypass_prototype_setters
+    @ctx.eval(<<~JS)
+      globalThis.hits = [];
+      Object.defineProperty(Array.prototype, '0', {set(v) { hits.push(v) }, get() { return 'proto' }, configurable: true});
+      Object.defineProperty(Object.prototype, 'k', {set(v) { hits.push(v) }, configurable: true});
+      function first(a) { return a[0] }
+      function own(o, k) { return Object.hasOwn(o, k) && o[k] }
+      function plain(o) { return Object.getPrototypeOf(o) === Object.prototype }
+    JS
+    assert_equal 41, @ctx.call('first', [41])
+    assert_equal 1, @ctx.call('own', {'k' => 1}, 'k')
+    assert_equal true, @ctx.call('plain', {'__proto__' => {'evil' => true}})
+    assert_equal({'evil' => true}, @ctx.call('own', {'__proto__' => {'evil' => true}}, '__proto__'))
+    @ctx.attach('fromHost', proc { [7, {'k' => 8}] })
+    assert_equal [7, 8], @ctx.eval('const r = fromHost(); [r[0], r[1].k]')
+    assert_equal [], @ctx.eval('hits')
+  end
+
+  def test_marshalled_cyclic_arrays_keep_their_identity
+    @ctx.eval('function echo(x) { return x } function selfAt(a, i) { return a[i] === a }')
+    cyclic = [1]
+    cyclic << cyclic
+    assert_equal true, @ctx.call('selfAt', cyclic, 1)
+    back = @ctx.call('echo', cyclic)
+    assert_same back, back[1]
+    nested = {'list' => [1]}
+    nested['again'] = [nested, nested['list']]
+    back = @ctx.call('echo', nested)
+    assert_same back, back['again'][0]
+    assert_same back['list'], back['again'][1]
+  end
+
+  def test_subclasses_and_conversions_marshal_as_their_built_in
+    string = Class.new(String).new('s')
+    array = Class.new(Array).new([1, 2])
+    hash = Class.new(Hash).new.merge('a' => 1)
+    @ctx.eval('function kinds(...xs) { return xs.map(x => Array.isArray(x) ? "array" : typeof x) } function echo(x) { return x }')
+    assert_equal %w[string array object number], @ctx.call('kinds', string, array, hash, 1r / 2)
+    assert_equal 0.5, @ctx.call('echo', 1r / 2)
+    to_ary = Object.new.tap {|o| o.define_singleton_method(:to_ary) { [1, 2] } }
+    to_hash = Object.new.tap {|o| o.define_singleton_method(:to_hash) { {'x' => 1} } }
+    assert_equal [1, 2], @ctx.call('echo', to_ary)
+    assert_equal({'x' => 1}, @ctx.call('echo', to_hash))
+    assert_raises(TypeError) { @ctx.call('echo', Object.new) }
+  end
+
   def test_to_str_string_like_marshals_by_tag
     # an object delegating via to_str gets the same tag-driven treatment as
     # the String it wraps

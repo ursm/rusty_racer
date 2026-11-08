@@ -2323,7 +2323,7 @@ fn install_host_namespace(
     ];
     for (member, function) in members {
         if let (Some(f), Some(k)) = (function, v8::String::new(scope, member)) {
-            ns.set(scope, k.into(), f.into());
+            ns.create_data_property(scope, k.into(), f.into());
         }
     }
     if let Some(key) = v8::String::new(scope, name) {

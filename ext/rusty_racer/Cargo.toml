@@ -31,3 +31,8 @@ v8 = { version = "150.4.0", features = ["simdutf"] }
 # pthread stack-bounds query, to set V8's stack limit per op relative to the
 # current native thread (in-thread V8 runs on the Ruby thread's stack).
 libc = "0.2"
+
+# `cargo test` links libruby: the crate calls into it, though the marshalling tests
+# that run without a VM never do.
+[dev-dependencies]
+rb-sys = { version = "0.9", features = ["link-ruby"] }

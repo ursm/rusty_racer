@@ -38,3 +38,7 @@ jobs:
           bundler-cache: true
       - name: "Compile + test"
         run: "bundle exec rake test"
+      # The Rust unit tests (marshalling without a Ruby VM): `link-ruby`, a dev-only
+      # rb-sys feature, links the test binary against the Ruby set up above.
+      - name: "cargo test"
+        run: "cargo test --workspace --lib"
