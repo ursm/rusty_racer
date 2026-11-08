@@ -392,6 +392,182 @@ class RustyRacerTest < Minitest::Test
     assert_equal 2**70 + 1, @ctx.call("inc", 2**70)
   end
 
+  # Context#function: what `call(path, ...)` calls, resolved once — its holder kept as `this`.
+  def test_function_handle_calls_with_its_holder_as_this
+    @ctx.eval('globalThis.a = {b: {base: 100, add(x, y) { return this.base + x + y }}}; function pair(x, y) { return [x, y] }')
+    add = @ctx.function('a.b.add')
+    assert_instance_of RustyRacer::Function, add
+    assert_equal 103, add.call(1, 2)
+    assert_equal [1, 'x'], @ctx.function('pair').call(1, 'x')
+    assert_nil add.call_void(1, 2)
+  end
+
+  def test_function_handle_keeps_what_its_path_named_when_resolved
+    @ctx.eval('globalThis.ns = {f() { return "first" }}')
+    f = @ctx.function('ns.f')
+    @ctx.eval('ns.f = () => "second"; delete globalThis.ns')
+    assert_equal 'first', f.call
+  end
+
+  def test_function_handle_call_void_never_reads_the_result
+    @ctx.eval('function hostile() { return new Proxy({}, {ownKeys() { throw new Error("read") }}) }')
+    hostile = @ctx.function('hostile')
+    assert_nil hostile.call_void
+    error = assert_raises(RustyRacer::RuntimeError) { hostile.call }
+    assert_match(/read/, error.message)
+  end
+
+  def test_function_resolution_errors_raise_like_call
+    @ctx.eval('globalThis.n = 1; Object.defineProperty(globalThis, "trap", {get() { throw new TypeError("trapped") }})')
+    assert_raises(RustyRacer::RuntimeError) { @ctx.function('n') }
+    assert_raises(RustyRacer::RuntimeError) { @ctx.function('missing.f') }
+    error = assert_raises(RustyRacer::RuntimeError) { @ctx.function('trap.f') }
+    assert_match(/TypeError: trapped/, error.message)
+  end
+
+  def test_function_handle_maps_a_throw_to_a_runtime_error_with_its_stack
+    @ctx.eval("function fail() { throw new RangeError('bad') }", filename: 'fail.js')
+    error = assert_raises(RustyRacer::RuntimeError) { @ctx.function('fail').call }
+    assert_equal 'RangeError: bad', error.message
+    assert_match(/fail\.js:1/, error.backtrace.first)
+  end
+
+  def test_function_handle_is_dead_once_its_realm_is_reset
+    @ctx.eval('function f() { return 1 }')
+    f = @ctx.function('f')
+    @ctx.reset
+    @ctx.eval('function f() { return 2 }')
+    error = assert_raises(RustyRacer::DisposedError) { f.call }
+    assert_match(/reset or disposed/, error.message)
+    assert_equal 2, @ctx.function('f').call
+  end
+
+  def test_function_handle_is_dead_once_its_realm_or_isolate_is_disposed
+    realm = @iso.create_context
+    realm.eval('function f() { return 1 }')
+    f = realm.function('f')
+    realm.dispose
+    assert_raises(RustyRacer::DisposedError) { f.call }
+    g = @ctx.function('Math.max')
+    @iso.dispose
+    assert_raises(RustyRacer::DisposedError) { g.call(1) }
+    assert_predicate g, :disposed?
+  end
+
+  def test_function_handle_dispose
+    f = @ctx.function('Math.max')
+    refute_predicate f, :disposed?
+    f.dispose
+    f.dispose
+    assert_predicate f, :disposed?
+    assert_raises(RustyRacer::DisposedError) { f.call(1) }
+    assert_equal 3, @ctx.function('Math.max').call(1, 3)
+  end
+
+  def test_function_handle_does_not_keep_a_disposed_realm_alive
+    @iso.low_memory_notification
+    baseline = @iso.heap_statistics[:number_of_native_contexts]
+    handles = Array.new(20) {
+      realm = @iso.create_context
+      realm.eval('globalThis.big = new Array(10000).fill(0).map((_, i) => ({i})); function f() { return big.length }')
+      handle = realm.function('f')
+      realm.dispose
+      handle
+    }
+    @iso.low_memory_notification
+    after = @iso.heap_statistics[:number_of_native_contexts]
+    assert_operator after, :<=, baseline + 3, "live native contexts grew #{baseline} -> #{after} behind #{handles.size} handles"
+  end
+
+  def test_collected_function_handles_are_released_and_teardown_is_quiet
+    @ctx.eval('function f(x) { return x }')
+    1000.times { @ctx.function('f') }
+    GC.start
+    assert_equal 7, @ctx.function('f').call(7)
+    kept = @ctx.function('f')
+    @iso.dispose
+    @iso = nil
+    @ctx = nil
+    GC.start
+    assert_predicate kept, :disposed?
+  end
+
+  # Whether a handle still holds its function, seen through a JS WeakRef after a full GC.
+  def function_held?(iso, ctx)
+    ctx.eval_void('delete globalThis.target')
+    iso.low_memory_notification
+    ctx.eval('globalThis.ref.deref() !== undefined')
+  end
+
+  def test_a_disposed_handle_lets_go_of_its_function
+    @ctx.eval('globalThis.target = {f() {}}; globalThis.ref = new WeakRef(target.f)')
+    f = @ctx.function('target.f')
+    assert function_held?(@iso, @ctx)
+    f.dispose
+    @ctx.eval('1')
+    refute function_held?(@iso, @ctx)
+  end
+
+  def test_a_resolve_terminated_after_it_found_the_function_keeps_nothing
+    iso = RustyRacer::Isolate.new(timeout_ms: 200)
+    ctx = iso.context
+    ctx.eval(<<~JS)
+      globalThis.target = {f() {}};
+      globalThis.ref = new WeakRef(target.f);
+      Object.defineProperty(globalThis, 'spun', {get() { Promise.resolve().then(() => { for (;;) {} }); return target }});
+    JS
+    assert_raises(RustyRacer::ScriptTerminatedError) { ctx.function('spun.f') }
+    refute function_held?(iso, ctx)
+  ensure
+    iso&.dispose
+  end
+
+  def test_function_handle_works_reentrantly_and_drains_microtasks_only_outermost
+    @ctx.eval(<<~JS)
+      function later() { Promise.resolve().then(() => { globalThis.n = (globalThis.n || 0) + 1 }) }
+      function peek() { return typeof globalThis.n }
+    JS
+    later = @ctx.function('later')
+    peek = @ctx.function('peek')
+    @ctx.attach('nested', proc {
+      later.call
+      peek.call
+    })
+    assert_equal 'undefined', @ctx.call('nested')
+    assert_equal 'number', peek.call
+  end
+
+  def test_function_handle_rethrows_through_a_host_fn
+    @ctx.eval("function boom() { throw globalThis.thrown = new RangeError('x') }")
+    boom = @ctx.function('boom')
+    @ctx.attach('viaHost', proc { boom.call })
+    assert_equal true, @ctx.eval('try { viaHost() } catch (e) { e === globalThis.thrown }')
+  end
+
+  def test_function_handle_times_out_and_leaves_the_isolate_usable
+    iso = RustyRacer::Isolate.new(timeout_ms: 100)
+    ctx = iso.context
+    ctx.eval('function spin() { for (;;) {} }')
+    assert_raises(RustyRacer::ScriptTerminatedError) { ctx.function('spin').call }
+    assert_equal 2, ctx.function('Math.max').call(1, 2)
+  ensure
+    iso&.dispose
+  end
+
+  def test_function_handle_is_thread_confined
+    f = @ctx.function('Math.max')
+    error = Thread.new { (f.call(1) rescue $!) }.value # rubocop:disable Style/RescueModifier
+    assert_instance_of RustyRacer::WrongThreadError, error
+    assert_equal 2, f.call(1, 2)
+  end
+
+  def test_function_handle_of_another_realm_runs_there
+    realm = @iso.create_context
+    realm.eval('globalThis.where = "realm"; function whereAmI() { return globalThis.where }')
+    @ctx.eval('globalThis.where = "main"')
+    assert_equal 'realm', realm.function('whereAmI').call
+  end
+
   def test_call_void_runs_without_marshalling_return
     # call_void runs the fn for its side effect but never walks the return,
     # so a huge/cyclic result is fine and the Ruby return is nil.
@@ -2148,6 +2324,95 @@ class RustyRacerTest < Minitest::Test
     assert_raises(RustyRacer::DisposedError) { m.evaluate }
   end
 
+  # A Module or Script whose wrapper is disposed or collected lets go of what the isolate held for it — at the end of
+  # the next op — while what V8 itself still holds (a linked dependency's url, a script's functions) keeps working.
+  # …a dispose from another thread included: it only queues the release.
+  def test_a_disposed_module_lets_go_of_its_record
+    m = @ctx.compile_module('globalThis.ref = new WeakRef(import.meta)')
+    m.instantiate { nil }
+    m.evaluate
+    Thread.new { m.dispose }.join
+    assert_predicate m, :disposed?
+    @ctx.eval('1')
+    @iso.low_memory_notification
+    assert_equal false, @ctx.eval('globalThis.ref.deref() !== undefined')
+  end
+
+  def test_a_kept_module_keeps_its_record
+    m = @ctx.compile_module('globalThis.ref = new WeakRef(import.meta)')
+    m.instantiate { nil }
+    m.evaluate
+    @ctx.eval('1')
+    @iso.low_memory_notification
+    assert_equal true, @ctx.eval('globalThis.ref.deref() !== undefined')
+    assert_equal :evaluated, m.status
+  end
+
+  # Collection, not dispose: run on a throwaway owner thread so no stack slot of the test's keeps a wrapper alive.
+  def test_collected_module_and_script_wrappers_are_released
+    held = Thread.new {
+      iso = RustyRacer::Isolate.new
+      ctx = iso.context
+      make = lambda {
+        m = ctx.compile_module('globalThis.modRef = new WeakRef(import.meta)')
+        m.instantiate { nil }
+        m.evaluate
+        ctx.compile('globalThis.later = () => 42').run
+        nil
+      }
+      make.call
+      4.times { GC.start(full_mark: true, immediate_sweep: true) }
+      ctx.eval('1')
+      iso.low_memory_notification
+      result = ctx.eval('[globalThis.modRef.deref() !== undefined, later()]')
+      iso.dispose
+      result
+    }.value
+    assert_equal [false, 42], held
+  end
+
+  def test_a_collected_dependency_keeps_its_url
+    url = Thread.new {
+      iso = RustyRacer::Isolate.new
+      ctx = iso.context
+      lambda {
+        app = ctx.compile_module("import {url} from './dep.js'; globalThis.readDep = url;", filename: '/app.js')
+        app.instantiate { ctx.compile_module('export const url = () => import.meta.url;', filename: '/dep.js') }
+        app.evaluate
+        nil
+      }.call
+      4.times { GC.start(full_mark: true, immediate_sweep: true) }
+      ctx.eval('1')
+      iso.low_memory_notification
+      ctx.call('readDep').tap { iso.dispose }
+    }.value
+    assert_equal '/dep.js', url
+  end
+
+  def test_a_module_of_a_disposed_realm_another_realm_reaches_keeps_its_url
+    iso = RustyRacer::Isolate.new(host_namespace: 'NS')
+    realm = iso.create_context
+    m = realm.compile_module('globalThis.late = () => import.meta.url;', filename: '/frame.js')
+    m.instantiate { nil }
+    m.evaluate
+    iso.context.eval_void("globalThis.held = NS.contextGlobal(#{realm.id}).late")
+    realm.dispose
+    iso.low_memory_notification
+    assert_equal '/frame.js', iso.context.call('held')
+  ensure
+    iso&.dispose
+  end
+
+  def test_a_dependency_keeps_its_url_after_its_wrapper_goes
+    dep = nil
+    app = @ctx.compile_module("import {url} from './dep.js'; globalThis.readDep = url;", filename: '/app.js')
+    app.instantiate {|_specifier, _referrer| dep = @ctx.compile_module('export const url = () => import.meta.url;', filename: '/dep.js') }
+    dep.dispose
+    app.evaluate
+    @iso.low_memory_notification
+    assert_equal '/dep.js', @ctx.call('readDep')
+  end
+
   def test_call_invokes_global_function
     @ctx.eval("function mul(a, b) { return a * b }")
     assert_equal 6, @ctx.call("mul", 2, 3)
@@ -2466,6 +2731,55 @@ class RustyRacerTest < Minitest::Test
     assert_equal({'k' => 'v'}, @ctx.call('id', {k: :v}))
     @ctx.eval('function kind(x) { return typeof x }')
     assert_equal 'string', @ctx.call('kind', :sym)
+  end
+
+  # Ruby -> JS marshalling DEFINES elements and entries: a page's prototype accessors neither see nor swallow them.
+  def test_marshalled_arguments_bypass_prototype_setters
+    @ctx.eval(<<~JS)
+      globalThis.hits = [];
+      Object.defineProperty(Array.prototype, '0', {set(v) { hits.push(v) }, get() { return 'proto' }, configurable: true});
+      Object.defineProperty(Object.prototype, 'k', {set(v) { hits.push(v) }, configurable: true});
+      function first(a) { return a[0] }
+      function own(o, k) { return Object.hasOwn(o, k) && o[k] }
+      function plain(o) { return Object.getPrototypeOf(o) === Object.prototype }
+    JS
+    assert_equal 41, @ctx.call('first', [41])
+    assert_equal 1, @ctx.call('own', {'k' => 1}, 'k')
+    assert_equal true, @ctx.call('plain', {'__proto__' => {'evil' => true}})
+    assert_equal({'evil' => true}, @ctx.call('own', {'__proto__' => {'evil' => true}}, '__proto__'))
+    @ctx.attach('fromHost', proc { [7, {'k' => 8}] })
+    assert_equal [7, 8], @ctx.eval('const r = fromHost(); [r[0], r[1].k]')
+    assert_equal [], @ctx.eval('hits')
+  end
+
+  def test_marshalled_cyclic_arrays_keep_their_identity
+    @ctx.eval('function echo(x) { return x } function selfAt(a, i) { return a[i] === a }')
+    cyclic = [1]
+    cyclic << cyclic
+    assert_equal true, @ctx.call('selfAt', cyclic, 1)
+    back = @ctx.call('echo', cyclic)
+    assert_same back, back[1]
+    nested = {'list' => [1]}
+    nested['again'] = [nested, nested['list']]
+    back = @ctx.call('echo', nested)
+    assert_same back, back['again'][0]
+    assert_same back['list'], back['again'][1]
+  end
+
+  def test_subclasses_and_conversions_marshal_as_their_built_in
+    string = Class.new(String).new('s')
+    array = Class.new(Array).new([1, 2])
+    hash = Class.new(Hash).new.merge('a' => 1)
+    @ctx.eval('function kinds(...xs) { return xs.map(x => Array.isArray(x) ? "array" : typeof x) } function echo(x) { return x }')
+    assert_equal %w[string array object number], @ctx.call('kinds', string, array, hash, 1r / 2)
+    assert_equal 0.5, @ctx.call('echo', 1r / 2)
+    to_ary = Object.new.tap {|o| o.define_singleton_method(:to_ary) { [1, 2] } }
+    to_hash = Object.new.tap {|o| o.define_singleton_method(:to_hash) { {'x' => 1} } }
+    assert_equal [1, 2], @ctx.call('echo', to_ary)
+    assert_equal({'x' => 1}, @ctx.call('echo', to_hash))
+    duration = Object.new.tap {|o| o.define_singleton_method(:to_f) { 300.0 } }
+    assert_equal 300, @ctx.call('echo', duration)
+    assert_raises(TypeError) { @ctx.call('echo', Object.new) }
   end
 
   def test_to_str_string_like_marshals_by_tag

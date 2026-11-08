@@ -67,6 +67,11 @@ ctx.call("add", 20, 22)                  # => 42
 ctx.call_void("doSideEffect")            # runs it; never marshals the return
 ctx.eval_void("globalThis.app = boot()") # ditto for the completion value
 
+# Resolve a function once and keep it: no path walk or name per call, and its
+# holder stays its `this` (see "Function handles" below).
+add = ctx.function("add")
+add.call(20, 22)                         # => 42
+
 # Ruby callbacks into JS; a raised Ruby exception becomes a JS exception.
 ctx.attach("rubyUpcase", ->(s) { s.upcase })
 ctx.eval("rubyUpcase('hi')")             # => "HI"
@@ -95,6 +100,63 @@ plumbing an object into a global (`globalThis.win = someProxy`) is enough to
 make a plain `#eval` fail after every one of its writes has landed.
 `#eval_primitive` sits between the two: it returns the completion value only
 where it is a primitive, and nil for an object or a symbol, which it never reads.
+
+### Function handles
+
+`Context#function(path)` resolves a dotted path (`"app.router.go"`) the way
+`#call` does — each segment an ordinary property read off the context's
+`globalThis` — once, and returns a `RustyRacer::Function` bound to what it found:
+the function, and the object it was read off as its `this`. `#call(*args)` and
+`#call_void(*args)` then invoke it exactly as `Context#call` / `#call_void` would
+— same argument and result marshalling, same timeout, same errors, and they work
+from inside a host function like any other op — without walking the path or
+making a property name per call. Reassigning or deleting the path afterwards
+does not change what the handle calls.
+
+A handle lives as long as its realm does. Once its context is `reset` or
+`dispose`d (or the isolate is), `#call` raises `RustyRacer::DisposedError`, and
+the handle no longer keeps that realm alive. (`#disposed?` answers for the handle
+and its isolate only: a realm's reset is found by the next call.) `#dispose` lets
+go of one early, and a handle that is simply garbage-collected is released too,
+at the end of the isolate's next operation. A path that leads into *another*
+realm (`frames[0].fn` in an embedder whose realms see each other) holds that
+realm's function for as long as the handle's own realm lives, as any reference
+kept there would.
+
+### Releasing handles
+
+A `Function`, `Script` or `Module` handle is released when it is `#dispose`d —
+from any thread — or garbage-collected, at the end of the isolate's next
+operation, and with its realm's `reset` or `dispose` at the latest. Releasing a
+handle only drops the isolate's hold on what it names: functions a script
+defined keep working, and a module V8 still keeps — linked into a live graph, or
+reached from another realm — keeps its `import.meta.url` and its url as a
+referrer, wrapper or realm or not.
+
+### Marshalling and the page's JavaScript
+
+Values cross by copy, not by reference.
+
+- **Ruby → JS builds new values without running any JavaScript.** An array's
+  elements and an object's entries are *defined* on the new container
+  (`CreateDataProperty`), never assigned, so an accessor a script has put on
+  `Array.prototype[0]` or `Object.prototype.x` neither sees nor swallows them,
+  and a `"__proto__"` key is an own property, as `JSON.parse` makes it. Maps and
+  Sets are filled by V8's original builtins, whatever `Map.prototype.set` is now.
+- **JS → Ruby reads values the way a script would.** An object's own enumerable
+  string keys are listed and each is read with an ordinary `[[Get]]`, so a getter
+  runs; a `Proxy` is read through its `ownKeys`, `getOwnPropertyDescriptor` and
+  `get` traps; an array's holes read through its prototype chain, as `arr[i]`
+  does; a function, a RegExp or any other value with no structural form becomes
+  its `toString()`, which may be the page's. A throw anywhere in that fails the op
+  (see above), and `#call_void` / `#eval_void` skip the read entirely. Map and Set
+  contents, typed arrays and buffers are read without running JavaScript.
+- **A String's encoding tag is its type.** A binary (`ASCII-8BIT`) String crosses
+  as a `Uint8Array`, and a `Uint8Array`, `ArrayBuffer` or `SharedArrayBuffer`
+  comes back as a binary String. Any text encoding crosses as a JS string, and
+  must hold valid characters — invalid UTF-8 raises `EncodingError` rather than
+  turn into U+FFFD — so text read with `File.binread` or off a socket needs its
+  real encoding (`force_encoding`) before it crosses as text.
 
 ES modules (the embedder owns the URL→module registry):
 

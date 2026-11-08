@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 
+use magnus::rb_sys::{AsRawValue, FromRawValue};
 use magnus::value::ReprValue;
 use magnus::{
     Error, ExceptionClass, IntoValue, RArray, RHash, RString, Ruby, TryConvert, Value, prelude::*,
@@ -172,6 +173,13 @@ fn copy_buffer_bytes(data: Option<std::ptr::NonNull<c_void>>, len: usize) -> Vec
     buf
 }
 
+// JS -> JsVal reads a value the way a script would, so it can run the page's
+// JavaScript: an object's own enumerable string keys are listed and each is read
+// with [[Get]] (a getter runs), a Proxy answers through its ownKeys /
+// getOwnPropertyDescriptor / get traps, an array's holes read through its
+// prototype chain (`get_index` is `arr[i]`), and a value with no structural form
+// is its ToString (`stringify`). A throw there is the op's (`marshalled!`). Map and
+// Set contents (`as_array`), typed arrays and buffers are read without any.
 pub(crate) fn js_to_jsval(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) -> JsVal {
     let mut seen = JsSeen::default();
     js_to_jsval_d(scope, value, &mut seen, 0)
@@ -392,18 +400,54 @@ fn unregister_container(seen: &mut JsSeen, obj: v8::Local<v8::Object>, id: u32) 
 // Owned-by-value (not &JsVal): a JsVal::Bytes hands its Vec straight to V8's
 // backing store with no copy of the payload, so a large binary blob crosses
 // Ruby->JS with zero extra allocation.
+//
+// Nothing here runs the page's JavaScript. An array's elements and an object's
+// entries are DEFINED (CreateDataProperty), never assigned: an assignment is
+// [[Set]], which walks the prototype chain, so an accessor a page put on
+// `Array.prototype[0]` or `Object.prototype.x` would take the value — or swallow
+// it — before it reached the new container. The rest makes nothing a page can
+// reach either: a Map and a Set are filled by V8's own builtins (Map::Set calls
+// the realm's original Map.prototype.set, not whatever the page left there), and
+// a Uint8Array, a Date and a BigInt are made outright. A "__proto__" key is an
+// own property like any other (as JSON.parse makes it), not the prototype.
 pub(crate) fn jsval_to_js<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     val: JsVal,
 ) -> v8::Local<'s, v8::Value> {
-    let mut built: HashMap<u32, v8::Local<'s, v8::Value>> = HashMap::new();
-    jsval_to_js_d(scope, val, &mut built)
+    jsval_to_js_d(scope, val, &mut Built::default())
+}
+
+// The containers made so far in one jsval_to_js, by id, for a Ref to resolve to.
+#[derive(Default)]
+struct Built<'s> {
+    values: HashMap<u32, v8::Local<'s, v8::Value>>,
+    // Arrays whose elements are still being made — id -> length. An array is
+    // made from its finished elements in one step (Array::new_with_elements), so
+    // until then it has no object for a Ref to name; a Ref from inside it (a
+    // cycle) makes it early instead (`Built::get`).
+    open_arrays: HashMap<u32, usize>,
+}
+
+impl<'s> Built<'s> {
+    fn get(
+        &mut self,
+        scope: &mut v8::PinScope<'s, '_>,
+        id: u32,
+    ) -> Option<v8::Local<'s, v8::Value>> {
+        if let Some(value) = self.values.get(&id) {
+            return Some(*value);
+        }
+        let length = *self.open_arrays.get(&id)?;
+        let array: v8::Local<v8::Value> = v8::Array::new(scope, length as i32).into();
+        self.values.insert(id, array);
+        Some(array)
+    }
 }
 
 fn jsval_to_js_d<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     val: JsVal,
-    built: &mut HashMap<u32, v8::Local<'s, v8::Value>>,
+    built: &mut Built<'s>,
 ) -> v8::Local<'s, v8::Value> {
     match val {
         JsVal::Undefined => v8::undefined(scope).into(),
@@ -425,7 +469,7 @@ fn jsval_to_js_d<'s>(
                 .map(|a| a.into())
                 .unwrap_or_else(|| v8::undefined(scope).into());
             if let Some(id) = id {
-                built.insert(id, arr);
+                built.values.insert(id, arr);
             }
             arr
         }
@@ -435,32 +479,47 @@ fn jsval_to_js_d<'s>(
         JsVal::Date(ms) => v8::Date::new(scope, ms)
             .map(|d| d.into())
             .unwrap_or_else(|| v8::undefined(scope).into()),
+        // The elements first, then the array made of them — unless one of them
+        // referred back to it, which made it early (`Built::get`): then they are
+        // defined on it one by one.
+        JsVal::Array { id, items } => {
+            built.open_arrays.insert(id, items.len());
+            let elements: Vec<v8::Local<v8::Value>> = items
+                .into_iter()
+                .map(|it| jsval_to_js_d(scope, it, built))
+                .collect();
+            built.open_arrays.remove(&id);
+            if let Some(early) = built.values.get(&id).copied() {
+                let array = v8::Local::<v8::Object>::try_from(early).unwrap();
+                for (i, element) in elements.into_iter().enumerate() {
+                    if let Some(key) = v8::String::new(scope, &i.to_string()) {
+                        array.create_data_property(scope, key.into(), element);
+                    }
+                }
+                early
+            } else {
+                let array = v8::Array::new_with_elements(scope, &elements).into();
+                built.values.insert(id, array);
+                array
+            }
+        }
         // Register the container under its id BEFORE filling it, so a Ref from
         // a descendant (a cycle back to here) resolves to this same object.
-        JsVal::Array { id, items } => {
-            let arr = v8::Array::new(scope, items.len() as i32);
-            built.insert(id, arr.into());
-            for (i, it) in items.into_iter().enumerate() {
-                let v = jsval_to_js_d(scope, it, built);
-                arr.set_index(scope, i as u32, v);
-            }
-            arr.into()
-        }
         JsVal::Obj { id, entries } => {
             let obj = v8::Object::new(scope);
-            built.insert(id, obj.into());
+            built.values.insert(id, obj.into());
             for (k, it) in entries {
                 let Some(key) = v8::String::new(scope, &k) else {
                     continue;
                 };
                 let v = jsval_to_js_d(scope, it, built);
-                obj.set(scope, key.into(), v);
+                obj.create_data_property(scope, key.into(), v);
             }
             obj.into()
         }
         JsVal::Map { id, pairs } => {
             let map = v8::Map::new(scope);
-            built.insert(id, map.into());
+            built.values.insert(id, map.into());
             for (k, v) in pairs {
                 let kk = jsval_to_js_d(scope, k, built);
                 let vv = jsval_to_js_d(scope, v, built);
@@ -470,7 +529,7 @@ fn jsval_to_js_d<'s>(
         }
         JsVal::Set { id, items } => {
             let set = v8::Set::new(scope);
-            built.insert(id, set.into());
+            built.values.insert(id, set.into());
             for it in items {
                 let v = jsval_to_js_d(scope, it, built);
                 set.add(scope, v);
@@ -478,8 +537,7 @@ fn jsval_to_js_d<'s>(
             set.into()
         }
         JsVal::Ref(id) => built
-            .get(&id)
-            .copied()
+            .get(scope, id)
             .unwrap_or_else(|| v8::undefined(scope).into()),
     }
 }
@@ -694,40 +752,26 @@ pub(crate) fn ruby_to_jsval(val: Value) -> Result<JsVal, Error> {
 }
 
 fn ruby_to_jsval_d(val: Value, seen: &mut RbSeen, depth: u32) -> Result<JsVal, Error> {
-    let ruby = Ruby::get().unwrap();
+    let ruby = Ruby::get_with(val);
+    // The built-in types first, each by its type tag alone: no class looked up,
+    // no method called, nothing raised and rescued — a String asked whether it
+    // converts to a Float raises a TypeError to say no, which cost a String
+    // argument over a microsecond. A subclass of a built-in has the same tag, and
+    // goes the same way, as it always did.
     if val.is_nil() {
         return Ok(JsVal::Null);
     }
-    // NB: bool::try_convert is RTEST (truthiness) — it returns Ok(true) for
-    // ANY non-false value — so check the actual true/false singletons by
-    // identity instead, or every Integer/String/Array would marshal as `true`.
-    if val.eql(ruby.qtrue()).unwrap_or(false) {
+    if val.as_raw() == ruby.qtrue().as_raw() {
         return Ok(JsVal::Bool(true));
     }
-    if val.eql(ruby.qfalse()).unwrap_or(false) {
+    if val.as_raw() == ruby.qfalse().as_raw() {
         return Ok(JsVal::Bool(false));
-    }
-    // Ruby Time -> JS Date. Must precede the numeric checks: magnus's
-    // i64/f64 TryConvert coerces a Time via to_i/to_f, so it would otherwise
-    // marshal as a bare epoch number. Time#to_f is epoch seconds; Date wants ms.
-    if let Ok(time_class) = ruby.class_object().const_get::<_, magnus::RClass>("Time")
-        && val.is_kind_of(time_class)
-    {
-        let sec = val.funcall::<_, _, f64>("to_f", ())?;
-        return Ok(JsVal::Date(sec * 1000.0));
     }
     // Integer. A JS Number is an f64, so only integers exactly representable
     // there (|n| <= 2^53) become Int/Number; anything larger (the rest of the
     // i64 range AND true bignums) becomes a BigInt so no precision is lost.
-    // Use a strict Integer type check, NOT magnus::Integer::try_convert, which
-    // coerces a Float / to_int object — that would turn e.g. 1e300 into a BigInt
-    // instead of a Number.
-    if let Ok(int_class) = ruby
-        .class_object()
-        .const_get::<_, magnus::RClass>("Integer")
-        && val.is_kind_of(int_class)
-    {
-        if let Ok(i) = i64::try_convert(val)
+    if let Some(int) = magnus::Integer::from_value(val) {
+        if let Ok(i) = int.to_i64()
             && i.unsigned_abs() <= (1u64 << 53)
         {
             return Ok(JsVal::Int(i));
@@ -740,8 +784,8 @@ fn ruby_to_jsval_d(val: Value, seen: &mut RbSeen, depth: u32) -> Result<JsVal, E
             words: hex_to_words(&hex),
         });
     }
-    if let Ok(n) = f64::try_convert(val) {
-        return Ok(JsVal::Num(n));
+    if let Some(float) = magnus::Float::from_value(val) {
+        return Ok(JsVal::Num(float.to_f64()));
     }
     // Bare Symbol -> JS string (one-way: it comes back as a Ruby String). A
     // binary-encoded symbol surfaces the same curated EncodingError as a text
@@ -779,6 +823,40 @@ fn ruby_to_jsval_d(val: Value, seen: &mut RbSeen, depth: u32) -> Result<JsVal, E
         }
         return string_to_jsval(&ruby, rstr);
     }
+    if let Some(arr) = RArray::from_value(val) {
+        return array_to_jsval(arr, val, seen, depth);
+    }
+    if let Some(hash) = RHash::from_value(val) {
+        // A plain Hash is a JS object. RustyRacer::JSMap, a Hash subclass, is a JS
+        // Map, its arbitrary keys kept as real JS values (NOT string-coerced) — it
+        // is what makes a JS Map round-trip (JS Map -> JSMap -> JS Map) instead of
+        // degrading to an object. Only a Hash of another class asks which it is.
+        let plain = val.class().as_raw() == ruby.class_hash().as_raw();
+        if !plain
+            && let Ok(js_map) = js_map_class(&ruby)
+            && val.is_kind_of(js_map)
+        {
+            return map_to_jsval(hash, val, seen, depth);
+        }
+        return hash_to_jsval(&ruby, hash, val, seen, depth);
+    }
+    // What only a class, or a conversion method, can say.
+    //
+    // Ruby Time -> JS Date. Before the Numeric fallback: magnus's f64 TryConvert
+    // coerces a Time via to_f, so it would otherwise marshal as a bare epoch
+    // number. Time#to_f is epoch seconds; Date wants ms.
+    if let Ok(time_class) = ruby.class_object().const_get::<_, magnus::RClass>("Time")
+        && val.is_kind_of(time_class)
+    {
+        let sec = val.funcall::<_, _, f64>("to_f", ())?;
+        return Ok(JsVal::Date(sec * 1000.0));
+    }
+    // Any other Float-convertible value (a Rational, a BigDecimal, an
+    // ActiveSupport::Duration — whatever rb_num2dbl takes, to_f included) -> its
+    // Float. A probe that raises to say no, but the built-ins are past it by now.
+    if let Ok(n) = f64::try_convert(val) {
+        return Ok(JsVal::Num(n));
+    }
     // A String-like (to_str) gets the same tag-driven treatment, but its result
     // is transient so it is not identity-tracked.
     if val.respond_to("to_str", false).unwrap_or(false) {
@@ -787,7 +865,7 @@ fn ruby_to_jsval_d(val: Value, seen: &mut RbSeen, depth: u32) -> Result<JsVal, E
             return string_to_jsval(&ruby, rstr);
         }
     }
-    // Ruby Set -> JS Set. Before the Array/Hash checks (a Set is neither).
+    // Ruby Set -> JS Set. Before the to_ary/to_hash conversions (a Set is neither).
     if let Ok(set_class) = ruby.class_object().const_get::<_, magnus::RClass>("Set")
         && val.is_kind_of(set_class)
     {
@@ -804,84 +882,95 @@ fn ruby_to_jsval_d(val: Value, seen: &mut RbSeen, depth: u32) -> Result<JsVal, E
         return Ok(JsVal::Set { id, items });
     }
     if let Ok(arr) = RArray::try_convert(val) {
-        let id = match rb_container_id(seen, val, depth)? {
-            RbId::New(id) => id,
-            RbId::Reuse(jv) => return Ok(jv),
-        };
-        let mut items = Vec::with_capacity(arr.len());
-        for i in 0..arr.len() {
-            let el: Value = arr.entry::<Value>(i as isize)?;
-            items.push(ruby_to_jsval_d(el, seen, depth + 1)?);
-        }
-        return Ok(JsVal::Array { id, items });
-    }
-    // RustyRacer::JSMap (a Hash subclass) -> JS Map, preserving arbitrary keys as
-    // real JS values (NOT string-coerced like a plain Hash -> JS Object). Must come
-    // BEFORE the Hash branch, since a JSMap IS-A Hash. This is what makes a JS Map
-    // round-trip (JS Map -> JSMap -> JS Map) instead of degrading to an object.
-    if let Ok(js_map) = js_map_class(&ruby)
-        && val.is_kind_of(js_map)
-    {
-        let id = match rb_container_id(seen, val, depth)? {
-            RbId::New(id) => id,
-            RbId::Reuse(jv) => return Ok(jv),
-        };
-        let hash = RHash::from_value(val).expect("JSMap is a Hash");
-        let pairs = RefCell::new(Vec::new());
-        hash.foreach(|k: Value, v: Value| {
-            pairs.borrow_mut().push((
-                ruby_to_jsval_d(k, seen, depth + 1)?,
-                ruby_to_jsval_d(v, seen, depth + 1)?,
-            ));
-            Ok(magnus::r_hash::ForEach::Continue)
-        })?;
-        return Ok(JsVal::Map {
-            id,
-            pairs: pairs.into_inner(),
-        });
+        return array_to_jsval(arr, val, seen, depth);
     }
     if let Ok(hash) = RHash::try_convert(val) {
-        let id = match rb_container_id(seen, val, depth)? {
-            RbId::New(id) => id,
-            RbId::Reuse(jv) => return Ok(jv),
-        };
-        let entries = RefCell::new(Vec::new());
-        hash.foreach(|k: Value, v: Value| {
-            // String/Symbol keys -> a UTF-8 String; anything else via to_s. A JS
-            // object key has nowhere to put raw bytes, so unlike a binary VALUE
-            // (-> Uint8Array) a binary KEY with invalid UTF-8 RAISES (string_key),
-            // and a to_s returning a non-String is a loud error, not a silent "".
-            let key = match string_key(&ruby, k) {
-                Some(r) => r?,
-                None => {
-                    // A non-String key (Symbol, Integer, ...) -> to_s, then the
-                    // same UTF-8 rule.
-                    let s: Value = k.funcall("to_s", ())?;
-                    match string_key(&ruby, s) {
-                        Some(r) => r?,
-                        None => {
-                            return Err(Error::new(
-                                ruby.exception_type_error(),
-                                "hash key's to_s did not return a String",
-                            ));
-                        }
-                    }
-                }
-            };
-            entries
-                .borrow_mut()
-                .push((key, ruby_to_jsval_d(v, seen, depth + 1)?));
-            Ok(magnus::r_hash::ForEach::Continue)
-        })?;
-        return Ok(JsVal::Obj {
-            id,
-            entries: entries.into_inner(),
-        });
+        return hash_to_jsval(&ruby, hash, val, seen, depth);
     }
     Err(Error::new(
         ruby.exception_type_error(),
         "unsupported type crossing into JS",
     ))
+}
+
+// An Array (or what to_ary made of |val|) -> a JS array; |val| is the identity.
+fn array_to_jsval(arr: RArray, val: Value, seen: &mut RbSeen, depth: u32) -> Result<JsVal, Error> {
+    let id = match rb_container_id(seen, val, depth)? {
+        RbId::New(id) => id,
+        RbId::Reuse(jv) => return Ok(jv),
+    };
+    let mut items = Vec::with_capacity(arr.len());
+    for i in 0..arr.len() {
+        let el: Value = arr.entry::<Value>(i as isize)?;
+        items.push(ruby_to_jsval_d(el, seen, depth + 1)?);
+    }
+    Ok(JsVal::Array { id, items })
+}
+
+// A RustyRacer::JSMap -> a JS Map.
+fn map_to_jsval(hash: RHash, val: Value, seen: &mut RbSeen, depth: u32) -> Result<JsVal, Error> {
+    let id = match rb_container_id(seen, val, depth)? {
+        RbId::New(id) => id,
+        RbId::Reuse(jv) => return Ok(jv),
+    };
+    let pairs = RefCell::new(Vec::new());
+    hash.foreach(|k: Value, v: Value| {
+        pairs.borrow_mut().push((
+            ruby_to_jsval_d(k, seen, depth + 1)?,
+            ruby_to_jsval_d(v, seen, depth + 1)?,
+        ));
+        Ok(magnus::r_hash::ForEach::Continue)
+    })?;
+    Ok(JsVal::Map {
+        id,
+        pairs: pairs.into_inner(),
+    })
+}
+
+// A Hash (or what to_hash made of |val|) -> a JS object with string keys.
+fn hash_to_jsval(
+    ruby: &Ruby,
+    hash: RHash,
+    val: Value,
+    seen: &mut RbSeen,
+    depth: u32,
+) -> Result<JsVal, Error> {
+    let id = match rb_container_id(seen, val, depth)? {
+        RbId::New(id) => id,
+        RbId::Reuse(jv) => return Ok(jv),
+    };
+    let entries = RefCell::new(Vec::new());
+    hash.foreach(|k: Value, v: Value| {
+        // String/Symbol keys -> a UTF-8 String; anything else via to_s. A JS
+        // object key has nowhere to put raw bytes, so unlike a binary VALUE
+        // (-> Uint8Array) a binary KEY with invalid UTF-8 RAISES (string_key),
+        // and a to_s returning a non-String is a loud error, not a silent "".
+        let key = match string_key(ruby, k) {
+            Some(r) => r?,
+            None => {
+                // A non-String key (Symbol, Integer, ...) -> to_s, then the
+                // same UTF-8 rule.
+                let s: Value = k.funcall("to_s", ())?;
+                match string_key(ruby, s) {
+                    Some(r) => r?,
+                    None => {
+                        return Err(Error::new(
+                            ruby.exception_type_error(),
+                            "hash key's to_s did not return a String",
+                        ));
+                    }
+                }
+            }
+        };
+        entries
+            .borrow_mut()
+            .push((key, ruby_to_jsval_d(v, seen, depth + 1)?));
+        Ok(magnus::r_hash::ForEach::Continue)
+    })?;
+    Ok(JsVal::Obj {
+        id,
+        entries: entries.into_inner(),
+    })
 }
 
 enum RbId {
@@ -893,7 +982,9 @@ enum RbId {
 // Reuse(jsval) to emit directly (a Ref to an already-seen object, or a
 // depth-truncated Str). Computes object_id once.
 fn rb_container_id(seen: &mut RbSeen, val: Value, depth: u32) -> Result<RbId, Error> {
-    let oid = val.funcall::<_, _, usize>("object_id", ())?;
+    // rb_obj_id itself rather than a call to #object_id: the same id, without a
+    // method dispatch per container.
+    let oid = usize::try_convert(unsafe { Value::from_raw(rb_sys::rb_obj_id(val.as_raw())) })?;
     if let Some(id) = seen.map.get(&oid) {
         return Ok(RbId::Reuse(JsVal::Ref(*id)));
     }
@@ -909,4 +1000,152 @@ fn rb_container_id(seen: &mut RbSeen, val: Value, depth: u32) -> Result<RbId, Er
     seen.next_id += 1;
     seen.map.insert(oid, id);
     Ok(RbId::New(id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Run |check| in a fresh context of a fresh isolate, after |setup|.
+    fn in_context(setup: &str, check: impl FnOnce(&mut v8::PinScope<'_, '_>)) {
+        crate::init_v8();
+        let isolate = &mut v8::Isolate::new(Default::default());
+        v8::scope!(let scope, isolate);
+        let context = v8::Context::new(scope, Default::default());
+        let scope = &mut v8::ContextScope::new(scope, context);
+        eval(scope, setup);
+        check(scope);
+    }
+
+    fn eval<'s>(scope: &mut v8::PinScope<'s, '_>, source: &str) -> v8::Local<'s, v8::Value> {
+        let code = v8::String::new(scope, source).unwrap();
+        v8::Script::compile(scope, code, None)
+            .unwrap()
+            .run(scope)
+            .unwrap()
+    }
+
+    fn global_set(scope: &mut v8::PinScope<'_, '_>, name: &str, value: v8::Local<v8::Value>) {
+        let key = v8::String::new(scope, name).unwrap();
+        let global = scope.get_current_context().global(scope);
+        global.create_data_property(scope, key.into(), value);
+    }
+
+    fn as_string(scope: &mut v8::PinScope<'_, '_>, source: &str) -> String {
+        let value = eval(scope, source);
+        value.to_rust_string_lossy(scope)
+    }
+
+    const TRAPS: &str = r#"
+        globalThis.hits = [];
+        Object.defineProperty(Array.prototype, '0', {set(v) { hits.unshift(v) }, get() { return 'proto' }});
+        Object.defineProperty(Object.prototype, 'k', {set(v) { hits.unshift(v) }, get() { return 'proto' }});
+    "#;
+
+    #[test]
+    fn arrays_and_objects_are_defined_past_prototype_setters() {
+        in_context(TRAPS, |scope| {
+            let value = jsval_to_js(
+                scope,
+                JsVal::Array {
+                    id: 0,
+                    items: vec![
+                        JsVal::Int(41),
+                        JsVal::Obj {
+                            id: 1,
+                            entries: vec![("k".into(), JsVal::Str("own".into()))],
+                        },
+                    ],
+                },
+            );
+            global_set(scope, "v", value);
+            assert_eq!(
+                as_string(
+                    scope,
+                    "[v[0], v[1].k, Object.hasOwn(v[1], 'k'), hits.length].join()"
+                ),
+                "41,own,true,0"
+            );
+        });
+    }
+
+    #[test]
+    fn a_proto_key_is_an_own_property() {
+        in_context("", |scope| {
+            let value = jsval_to_js(
+                scope,
+                JsVal::Obj {
+                    id: 0,
+                    entries: vec![("__proto__".into(), JsVal::Null)],
+                },
+            );
+            global_set(scope, "v", value);
+            assert_eq!(
+                as_string(
+                    scope,
+                    "[Object.getPrototypeOf(v) === Object.prototype, Object.hasOwn(v, '__proto__')].join()"
+                ),
+                "true,true"
+            );
+        });
+    }
+
+    #[test]
+    fn an_array_referring_to_itself_is_one_array() {
+        in_context(TRAPS, |scope| {
+            // [1, <itself>, [<itself>]]
+            let value = jsval_to_js(
+                scope,
+                JsVal::Array {
+                    id: 0,
+                    items: vec![
+                        JsVal::Int(1),
+                        JsVal::Ref(0),
+                        JsVal::Array {
+                            id: 1,
+                            items: vec![JsVal::Ref(0)],
+                        },
+                    ],
+                },
+            );
+            global_set(scope, "v", value);
+            assert_eq!(
+                as_string(
+                    scope,
+                    "[v.length, v[0], v[1] === v, v[2][0] === v, Array.isArray(v), hits.length].join()"
+                ),
+                "3,1,true,true,true,0"
+            );
+        });
+    }
+
+    #[test]
+    fn maps_and_sets_are_filled_by_the_original_builtins() {
+        in_context(
+            "Map.prototype.set = () => { throw new Error('patched') }; Set.prototype.add = Map.prototype.set;",
+            |scope| {
+                let value = jsval_to_js(
+                    scope,
+                    JsVal::Array {
+                        id: 0,
+                        items: vec![
+                            JsVal::Map {
+                                id: 1,
+                                pairs: vec![(JsVal::Str("a".into()), JsVal::Int(1))],
+                            },
+                            JsVal::Set {
+                                id: 2,
+                                items: vec![JsVal::Int(2)],
+                            },
+                        ],
+                    },
+                );
+                global_set(scope, "v", value);
+                assert_eq!(
+                    as_string(scope, "[v[0].get('a'), v[1].has(2)].join()"),
+                    "1,true"
+                );
+            },
+        );
+    }
 }

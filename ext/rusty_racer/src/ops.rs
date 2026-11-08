@@ -29,14 +29,25 @@ macro_rules! marshalled {
     ($tc:expr, $value:expr) => {{
         let tc = $tc;
         let out = js_to_jsval(tc, $value);
-        let exc = tc.exception();
-        if exc.is_none() {
-            Ok(out)
-        } else if tc.has_terminated() {
-            Err(VmError::Terminated)
+        if tc.has_caught() {
+            Err(caught!(tc))
         } else {
+            Ok(out)
+        }
+    }};
+}
+
+// The failure a TryCatch holds once a JS step came back empty: a termination, or
+// the exception with its stack (and the thrown value kept — `keep_thrown`).
+macro_rules! caught {
+    ($tc:expr) => {{
+        let tc = $tc;
+        if tc.has_terminated() {
+            VmError::Terminated
+        } else {
+            let exc = tc.exception();
             let stack = tc.stack_trace();
-            Err(capture_js_error(tc, exc, stack))
+            capture_js_error(tc, exc, stack)
         }
     }};
 }
@@ -73,6 +84,22 @@ pub(crate) enum Request {
         args: Vec<JsVal>,
         // void = don't marshal the return (fire-and-forget): the called fn may
         // return a huge/cyclic JS object the caller never reads.
+        void: bool,
+        timeout_ms: u64,
+    },
+    // Context#function: resolve the path as Call does, once, and keep the
+    // function and its holder (FunctionReg); replies with the handle's id.
+    ResolveFunction {
+        context_id: i32,
+        path: String,
+        timeout_ms: u64,
+    },
+    // Function#call: invoke a resolved handle as Call invokes what it resolves,
+    // with no path walk and no property name made.
+    CallFunction {
+        context_id: i32,
+        function_id: u64,
+        args: Vec<JsVal>,
         void: bool,
         timeout_ms: u64,
     },
@@ -148,9 +175,6 @@ pub(crate) enum Request {
     ModuleGraphAsync {
         module_id: i32,
     },
-    DisposeModule {
-        module_id: i32,
-    },
     // Classic <script> primitives (V8 ScriptCompiler::CompileUnboundScript): an
     // unbound script, compiled in a context, runnable repeatedly, with the same
     // bytecode-cache options as modules. Addressed by id like a module.
@@ -168,9 +192,6 @@ pub(crate) enum Request {
         script_id: i32,
         timeout_ms: u64,
         void: bool,
-    },
-    DisposeScript {
-        script_id: i32,
     },
     // Serialize a bytecode cache from a compiled handle's CURRENT compile state
     // (Script#create_code_cache / Module#create_code_cache). Called after run/
@@ -269,67 +290,80 @@ pub(crate) fn run_source(
             Completion::Primitive => marshalled!(tc, value),
             Completion::Void => Ok(JsVal::Undefined),
         },
-        None if tc.has_terminated() => Err(VmError::Terminated),
-        None => {
-            let exc = tc.exception();
-            let stack = tc.stack_trace();
-            Err(capture_js_error(tc, exc, stack))
-        }
+        None => Err(caught!(tc)),
     }
 }
 
-// Resolve a dotted property path on globalThis to a function and invoke it via
-// v8::Function::call, with the property's holder as `this` (so `a.b.f` gets the
-// right receiver). Args/result marshal through the ref-preserving paths.
+// Resolve a dotted property path on the current realm's globalThis to a
+// function and the holder it was read off — its `this`, so `a.b.f` gets the right
+// receiver. Each segment is an ordinary [[Get]], so a getter or Proxy trap on the
+// path runs; when one throws, the error is Err(None): the caller's TryCatch holds
+// it (`caught!`).
+fn resolve_function<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    path: &str,
+) -> Result<(v8::Local<'s, v8::Function>, v8::Local<'s, v8::Value>), Option<VmError>> {
+    let global = scope.get_current_context().global(scope);
+    let mut holder: v8::Local<v8::Value> = global.into();
+    let mut target: v8::Local<v8::Value> = global.into();
+    for part in path.split('.') {
+        let Some(obj) = target.to_object(scope) else {
+            // The holder of `part` (a preceding segment) was null/undefined, so
+            // there's nothing to read `part` from — name the holder, not `part`.
+            return Err(Some(VmError::Runtime(format!(
+                "`{path}`: cannot read `{part}` (a preceding path segment is not an object)"
+            ))));
+        };
+        let Some(key) = v8::String::new(scope, part) else {
+            return Err(Some(VmError::Runtime("property name too large".into())));
+        };
+        let Some(next) = obj.get(scope, key.into()) else {
+            return Err(None);
+        };
+        holder = target;
+        target = next;
+    }
+    match v8::Local::<v8::Function>::try_from(target) {
+        Ok(function) => Ok((function, holder)),
+        Err(_) => Err(Some(VmError::Runtime(format!(
+            "`{path}` is not a function"
+        )))),
+    }
+}
+
+// Context#call: resolve |name| (above), then call what it names.
 fn call_function(
     scope: &mut v8::PinScope<'_, '_>,
     name: &str,
     args: Vec<JsVal>,
     void: bool,
 ) -> Result<JsVal, VmError> {
-    v8::tc_scope!(let tc, scope);
-    let context = tc.get_current_context();
-    let global = context.global(tc);
-    let mut recv: v8::Local<v8::Value> = global.into();
-    let mut target: v8::Local<v8::Value> = global.into();
-    for part in name.split('.') {
-        let Some(obj) = target.to_object(tc) else {
-            // The holder of `part` (a preceding segment) was null/undefined, so
-            // there's nothing to read `part` from — name the holder, not `part`.
-            return Err(VmError::Runtime(format!(
-                "`{name}`: cannot read `{part}` (a preceding path segment is not an object)"
-            )));
-        };
-        let Some(key) = v8::String::new(tc, part) else {
-            return Err(VmError::Runtime("property name too large".into()));
-        };
-        let Some(next) = obj.get(tc, key.into()) else {
-            if tc.has_terminated() {
-                return Err(VmError::Terminated);
-            }
-            let msg = tc
-                .exception()
-                .map(|e| e.to_rust_string_lossy(tc))
-                .unwrap_or_else(|| format!("cannot read `{part}` of `{name}`"));
-            return Err(VmError::Runtime(msg));
-        };
-        recv = target;
-        target = next;
-    }
-    let Ok(func) = v8::Local::<v8::Function>::try_from(target) else {
-        return Err(VmError::Runtime(format!("`{name}` is not a function")));
+    let (function, receiver) = {
+        v8::tc_scope!(let tc, scope);
+        match resolve_function(tc, name) {
+            Ok(resolved) => resolved,
+            Err(failure) => return Err(failure.unwrap_or_else(|| caught!(tc))),
+        }
     };
+    call_resolved(scope, function, receiver, args, void)
+}
+
+// Invoke |function| via v8::Function::call with |receiver| as `this`.
+// Args/result marshal through the ref-preserving paths.
+fn call_resolved(
+    scope: &mut v8::PinScope<'_, '_>,
+    function: v8::Local<v8::Function>,
+    receiver: v8::Local<v8::Value>,
+    args: Vec<JsVal>,
+    void: bool,
+) -> Result<JsVal, VmError> {
+    v8::tc_scope!(let tc, scope);
     let argv: Vec<v8::Local<v8::Value>> = args.into_iter().map(|a| jsval_to_js(tc, a)).collect();
-    match func.call(tc, recv, &argv) {
+    match function.call(tc, receiver, &argv) {
         // void: skip marshalling the return so a huge/cyclic result is never walked.
         Some(_) if void => Ok(JsVal::Undefined),
         Some(value) => marshalled!(tc, value),
-        None if tc.has_terminated() => Err(VmError::Terminated),
-        None => {
-            let exc = tc.exception();
-            let stack = tc.stack_trace();
-            Err(capture_js_error(tc, exc, stack))
-        }
+        None => Err(caught!(tc)),
     }
 }
 
@@ -413,6 +447,7 @@ pub(crate) fn service_request(
     // (the graveyard repoint inside) requires that.
     if outermost {
         flush_retiring(scope);
+        forget_released_handles(scope);
     }
     reply
 }
@@ -423,6 +458,8 @@ fn request_realm(state: &IsolateState, request: &Request) -> Option<i32> {
     match request {
         Request::Eval { context_id, .. }
         | Request::Call { context_id, .. }
+        | Request::ResolveFunction { context_id, .. }
+        | Request::CallFunction { context_id, .. }
         | Request::Attach { context_id, .. }
         | Request::AttachMany { context_id, .. }
         | Request::CompileModule { context_id, .. }
@@ -441,8 +478,6 @@ fn request_realm(state: &IsolateState, request: &Request) -> Option<i32> {
         | Request::DisposeContext { .. }
         | Request::ModuleStatus { .. }
         | Request::ModuleGraphAsync { .. }
-        | Request::DisposeModule { .. }
-        | Request::DisposeScript { .. }
         | Request::ScriptCodeCache { .. }
         | Request::ModuleCodeCache { .. }
         | Request::HeapStatistics
@@ -476,6 +511,26 @@ fn dispatch_one(
             void,
             timeout_ms,
         } => op_call(scope, context_id, name, args, void, timeout_ms, outermost),
+        Request::ResolveFunction {
+            context_id,
+            path,
+            timeout_ms,
+        } => op_resolve_function(scope, context_id, path, timeout_ms, outermost),
+        Request::CallFunction {
+            context_id,
+            function_id,
+            args,
+            void,
+            timeout_ms,
+        } => op_call_function(
+            scope,
+            context_id,
+            function_id,
+            args,
+            void,
+            timeout_ms,
+            outermost,
+        ),
         Request::DrainMicrotasks { timeout_ms } => op_drain_microtasks(scope, timeout_ms),
         Request::Attach {
             context_id,
@@ -516,7 +571,6 @@ fn dispatch_one(
         Request::ModuleNamespace { module_id } => op_module_namespace(scope, module_id),
         Request::ModuleStatus { module_id } => op_module_status(scope, module_id),
         Request::ModuleGraphAsync { module_id } => op_module_graph_async(scope, module_id),
-        Request::DisposeModule { module_id } => op_dispose_module(scope, module_id),
         Request::CompileScript {
             context_id,
             source,
@@ -538,7 +592,6 @@ fn dispatch_one(
             timeout_ms,
             void,
         } => op_run_script(scope, script_id, timeout_ms, void, outermost),
-        Request::DisposeScript { script_id } => op_dispose_script(scope, script_id),
         // Serialize the script's CURRENT compile state. The stored handle is
         // the UnboundScript, which V8 fills in with inner-function bytecode as
         // run() lazily compiles them — so calling this after run() captures
@@ -669,6 +722,132 @@ fn op_call(
                 Err(VmError::Runtime("realm disposed or unknown".into())),
             ),
         }
+    });
+    VmReply::Done(outcome)
+}
+
+fn op_resolve_function(
+    scope: &mut v8::PinScope<'_, '_, ()>,
+    context_id: i32,
+    path: String,
+    timeout_ms: u64,
+    outermost: bool,
+) -> VmReply {
+    // The id this resolve registered, for a terminate after it (in the drain, or
+    // the watchdog's verdict over the bracket) to take back: a failed resolve hands
+    // Ruby no wrapper, so nothing else would ever release it.
+    let mut registered = None;
+    let outcome = run_js_bracketed(
+        scope,
+        outermost,
+        timeout_ms,
+        "function",
+        |scope, outermost| {
+            let Some(ctx) = context_for(istate!(scope), context_id) else {
+                return (false, Err(VmError::Disposed(REALM_GONE.into())));
+            };
+            let context = v8::Local::new(scope, &ctx);
+            let scope = &mut v8::ContextScope::new(scope, context);
+            let resolved = {
+                v8::tc_scope!(let tc, scope);
+                match resolve_function(tc, &path) {
+                    Ok((function, receiver)) => {
+                        Ok((v8::Global::new(tc, function), v8::Global::new(tc, receiver)))
+                    }
+                    Err(failure) => Err(failure.unwrap_or_else(|| caught!(tc))),
+                }
+            };
+            let out = resolved.map(|(function, receiver)| {
+                let functions = &mut istate!(scope).functions;
+                let id = functions.next_id;
+                functions.next_id += 1;
+                functions.by_id.insert(
+                    id,
+                    FunctionEntry {
+                        function,
+                        receiver,
+                        context_id,
+                    },
+                );
+                registered = Some(id);
+                JsVal::Int(id as i64)
+            });
+            auto_drain(scope, outermost);
+            (true, out)
+        },
+    );
+    if let (Err(_), Some(id)) = (&outcome, registered) {
+        istate!(scope).functions.by_id.remove(&id);
+    }
+    VmReply::Done(outcome)
+}
+
+// What a call or a resolve of a handle whose realm is gone raises.
+const REALM_GONE: &str = "function's realm was reset or disposed";
+
+// Remove the handles whose Ruby wrappers were disposed or collected
+// (Core.released) from their registries: a wrapper could not drop its Globals
+// itself. At the outermost request boundary, and only when one was released — a
+// flag read, not a lock, on every other op.
+fn forget_released_handles(scope: &mut v8::PinScope<'_, '_, ()>) {
+    let core = istate!(scope).core_ptr;
+    if core.is_null() {
+        return;
+    }
+    let core = unsafe { &*core };
+    if !core.handles_released.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    let released = std::mem::take(&mut *core.released.lock().unwrap());
+    let state = istate!(scope);
+    for handle in released {
+        match handle {
+            Released::Function(id) => {
+                state.functions.by_id.remove(&id);
+            }
+            Released::Module(id) => {
+                state.modules.by_id.remove(&id);
+            }
+            Released::Script(id) => {
+                state.scripts.by_id.remove(&id);
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn op_call_function(
+    scope: &mut v8::PinScope<'_, '_, ()>,
+    context_id: i32,
+    function_id: u64,
+    args: Vec<JsVal>,
+    void: bool,
+    timeout_ms: u64,
+    outermost: bool,
+) -> VmReply {
+    let outcome = run_js_bracketed(scope, outermost, timeout_ms, "call", |scope, outermost| {
+        let Some(ctx) = context_for(istate!(scope), context_id) else {
+            return (false, Err(VmError::Disposed(REALM_GONE.into())));
+        };
+        let context = v8::Local::new(scope, &ctx);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        // Locals straight off the registry's Globals: a shared borrow of the slot
+        // beside the shared one Local::new takes, so nothing is cloned per call.
+        let target = scope
+            .get_slot::<IsolateState>()
+            .and_then(|state| state.functions.by_id.get(&function_id))
+            .map(|entry| {
+                (
+                    v8::Local::new(scope, &entry.function),
+                    v8::Local::new(scope, &entry.receiver),
+                )
+            });
+        let Some((function, receiver)) = target else {
+            return (false, Err(VmError::Disposed(REALM_GONE.into())));
+        };
+        let out = call_resolved(scope, function, receiver, args, void);
+        auto_drain(scope, outermost);
+        (true, out)
     });
     VmReply::Done(outcome)
 }
@@ -939,13 +1118,13 @@ fn op_compile_module(
                             };
                             let hash = module.get_identity_hash().get();
                             let g = v8::Global::new(tc, module);
+                            let weak = v8::Weak::new(tc, module);
                             let id = {
                                 let m = &mut istate!(tc).modules;
                                 let id = m.next_id;
                                 m.next_id += 1;
-                                m.by_id
-                                    .insert(id, (g.clone(), filename.clone(), context_id));
-                                m.by_hash.entry(hash).or_default().push((g, id));
+                                m.by_id.insert(id, (g, context_id));
+                                m.add_url(hash, weak, filename.clone());
                                 id
                             };
                             Ok(Compiled {
@@ -1130,12 +1309,7 @@ fn op_evaluate_module(
                                             _ => Ok(JsVal::Undefined),
                                         }
                                     }
-                                    None if tc.has_terminated() => Err(VmError::Terminated),
-                                    None => {
-                                        let exc = tc.exception();
-                                        let stack = tc.stack_trace();
-                                        Err(capture_js_error(tc, exc, stack))
-                                    }
+                                    None => Err(caught!(tc)),
                                 }
                             }
                             _ => Err(VmError::Runtime(
@@ -1265,15 +1439,6 @@ fn op_module_graph_async(scope: &mut v8::PinScope<'_, '_, ()>, module_id: i32) -
     VmReply::Done(outcome)
 }
 
-fn op_dispose_module(scope: &mut v8::PinScope<'_, '_, ()>, module_id: i32) -> VmReply {
-    let m = &mut istate!(scope).modules;
-    m.by_id.remove(&module_id);
-    for bucket in m.by_hash.values_mut() {
-        bucket.retain(|(_, id)| *id != module_id);
-    }
-    VmReply::Done(Ok(JsVal::Undefined))
-}
-
 #[allow(clippy::too_many_arguments)]
 fn op_compile_script(
     scope: &mut v8::PinScope<'_, '_, ()>,
@@ -1375,12 +1540,7 @@ fn op_run_script(
                             match script.run(tc) {
                                 Some(_) if void => Ok(JsVal::Undefined),
                                 Some(value) => marshalled!(tc, value),
-                                None if tc.has_terminated() => Err(VmError::Terminated),
-                                None => {
-                                    let exc = tc.exception();
-                                    let stack = tc.stack_trace();
-                                    Err(capture_js_error(tc, exc, stack))
-                                }
+                                None => Err(caught!(tc)),
                             }
                         };
                         auto_drain(scope, outermost);
@@ -1391,11 +1551,6 @@ fn op_run_script(
         },
     );
     VmReply::Done(outcome)
-}
-
-fn op_dispose_script(scope: &mut v8::PinScope<'_, '_, ()>, script_id: i32) -> VmReply {
-    istate!(scope).scripts.by_id.remove(&script_id);
-    VmReply::Done(Ok(JsVal::Undefined))
 }
 
 fn op_script_code_cache(scope: &mut v8::PinScope<'_, '_, ()>, script_id: i32) -> VmReply {
