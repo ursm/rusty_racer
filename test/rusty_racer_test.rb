@@ -596,6 +596,112 @@ class RustyRacerTest < Minitest::Test
     assert_equal 42, @ctx.eval('Ns.const()') # dotted path creates the namespace
   end
 
+  # The host object: `@` paths, HOST_OBJECT, host_namespace: '@…'. A page's script — anything the realm runs but the
+  # bindings it is handed to — finds none of it.
+  GLOBAL_KEYS = 'Reflect.ownKeys(globalThis).map(String).sort().join()'
+
+  def test_attach_into_the_host_object_puts_nothing_on_the_global
+    before = @ctx.eval(GLOBAL_KEYS)
+    @ctx.attach('@add', proc {|a, b| a + b })
+    @ctx.attach_many(
+      '@net.fetch' => proc {|url| "got #{url}" },
+      '@net.close' => proc { :closed }
+    )
+    assert_equal before, @ctx.eval(GLOBAL_KEYS)
+    assert_equal 'undefinedundefined', @ctx.eval('typeof add + typeof net')
+    @ctx.eval(<<~JS)
+      globalThis.takeHost = (host) => {
+        delete globalThis.takeHost;
+        globalThis.viaHost = (path, ...args) => path.split('.').reduce((o, k) => o[k], host)(...args);
+      };
+    JS
+    @ctx.call('takeHost', RustyRacer::HOST_OBJECT)
+    assert_equal 7, @ctx.eval('viaHost("add", 3, 4)')
+    assert_equal 'got /x', @ctx.eval('viaHost("net.fetch", "/x")')
+    assert_equal 'closed', @ctx.eval('viaHost("net.close")')
+  end
+
+  def test_the_host_object_and_its_branches_have_no_prototype_and_run_no_setter_of_a_page
+    @ctx.eval(<<~JS)
+      globalThis.hits = [];
+      Object.defineProperty(Object.prototype, 'net', {set(v) { hits.push('net') }, get() { hits.push('get net') }, configurable: true});
+      Object.defineProperty(Object.prototype, 'fetch', {set(v) { hits.push('fetch') }, configurable: true});
+    JS
+    @ctx.attach('@net.fetch', proc { 1 })
+    @ctx.eval('globalThis.inspect = (h) => [Object.getPrototypeOf(h), Object.getPrototypeOf(h.net), Object.hasOwn(h.net, "fetch")]')
+    assert_equal [nil, nil, true], @ctx.call('inspect', RustyRacer::HOST_OBJECT)
+    assert_empty @ctx.eval('hits')
+  end
+
+  def test_function_and_call_resolve_an_at_path_from_the_host_object
+    @ctx.attach('@hostAdd', proc {|a, b| a + b })
+    @ctx.eval('globalThis.hostAdd = () => "the page\'s"')
+    @ctx.eval('globalThis.install = (h) => { h.steps = {base: 100, query(x) { return this.base + x }} }')
+    @ctx.call('install', RustyRacer::HOST_OBJECT)
+    query = @ctx.function('@steps.query')
+    assert_equal 101, query.call(1)
+    assert_equal 102, @ctx.call('@steps.query', 2)
+    assert_nil @ctx.call_void('@steps.query', 3)
+    assert_equal 5, @ctx.call('@hostAdd', 2, 3)
+    assert_equal "the page's", @ctx.call('hostAdd')
+    # (…a name the host object lacks ends there: no prototype to read it off)
+    @ctx.eval('Object.defineProperty(Object.prototype, "missing", {get() { throw new Error("ran a getter of the page") }})')
+    e = assert_raises(RustyRacer::RuntimeError) { @ctx.function('@missing') }
+    assert_includes e.message, '`@missing` is not a function'
+  end
+
+  def test_host_object_is_per_realm_and_made_anew_by_a_reset
+    @ctx.attach('@who', proc { 'main' })
+    realm = @iso.create_context
+    realm.attach('@who', proc { 'frame' })
+    assert_equal 'main', @ctx.call('@who')
+    assert_equal 'frame', realm.call('@who')
+    @ctx.reset
+    e = assert_raises(RustyRacer::RuntimeError) { @ctx.call('@who') }
+    assert_includes e.message, 'not a function'
+    assert_equal 'frame', realm.call('@who')
+  end
+
+  def test_host_object_crosses_inside_values_and_out_of_a_host_function
+    @ctx.attach('@tag', proc { 'tagged' })
+    @ctx.attach('hostOf', proc { [RustyRacer::HOST_OBJECT] })
+    @ctx.eval('globalThis.first = (list) => list[0].tag()')
+    assert_equal 'tagged', @ctx.call('first', [RustyRacer::HOST_OBJECT])
+    assert_equal 'tagged', @ctx.eval('hostOf()[0].tag()')
+  end
+
+  def test_host_object_stands_for_itself_alone
+    assert_predicate RustyRacer::HOST_OBJECT, :frozen?
+    assert_raises(TypeError) { RustyRacer::HostObject.new }
+  end
+
+  def test_host_namespace_on_the_host_object
+    iso = RustyRacer::Isolate.new(host_namespace: '@MiniRacer')
+    ctx = iso.context
+    assert_equal 'undefined', ctx.eval('typeof MiniRacer')
+    ctx.eval('globalThis.nsOf = (h) => [Object.getPrototypeOf(h.MiniRacer), typeof h.MiniRacer.drainMicrotasks, h.MiniRacer.contextOf(globalThis)]')
+    assert_equal [nil, 'function', 0], ctx.call('nsOf', RustyRacer::HOST_OBJECT)
+    realm = iso.create_context
+    realm.eval('globalThis.nsOf = (h) => h.MiniRacer.contextOf(globalThis)')
+    assert_equal realm.id, realm.call('nsOf', RustyRacer::HOST_OBJECT)
+    ctx.reset
+    assert_equal 'undefined', ctx.eval('typeof MiniRacer')
+    assert_equal 0, ctx.call('@MiniRacer.contextOf', RustyRacer::HOST_OBJECT)
+    assert_raises(ArgumentError) { RustyRacer::Isolate.new(host_namespace: '@') }
+  ensure
+    iso&.dispose
+  end
+
+  def test_evaluate_reports_to_a_function_of_the_host_object
+    @ctx.eval('globalThis.reported = []')
+    @ctx.eval('globalThis.install = (h) => { h.report = (e) => reported.push(e.message) }')
+    @ctx.call('install', RustyRacer::HOST_OBJECT)
+    m = @ctx.compile_module('throw new Error("boom");', filename: '/m.js')
+    m.instantiate { nil }
+    assert_nil m.evaluate(report: '@report')
+    assert_equal ['boom'], @ctx.eval('reported')
+  end
+
   def test_host_callback_args_survive_gc_during_marshalling
     # When JS calls an attached proc, each arg is marshalled into fresh Ruby
     # objects one after another. An earlier arg must stay GC-rooted while a later

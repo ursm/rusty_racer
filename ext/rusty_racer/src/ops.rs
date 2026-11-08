@@ -157,9 +157,9 @@ pub(crate) enum Request {
     EvaluateModule {
         module_id: i32,
         timeout_ms: u64,
-        // The name of a function on the module's context's global that reports its evaluation's rejection — HTML "run
-        // a module script": upon rejection, report the exception — now or as a top-level-await module settles; none:
-        // the rejection is the op's error, as far as the drain gets.
+        // The name of a function on the module's context's global (an `@name`: on its host object) that reports its
+        // evaluation's rejection — HTML "run a module script": upon rejection, report the exception — now or as a
+        // top-level-await module settles; none: the rejection is the op's error, as far as the drain gets.
         report: Option<String>,
     },
     ModuleNamespace {
@@ -294,19 +294,19 @@ pub(crate) fn run_source(
     }
 }
 
-// Resolve a dotted property path on the current realm's globalThis to a
-// function and the holder it was read off — its `this`, so `a.b.f` gets the right
-// receiver. Each segment is an ordinary [[Get]], so a getter or Proxy trap on the
-// path runs; when one throws, the error is Err(None): the caller's TryCatch holds
-// it (`caught!`).
+// Resolve a dotted property path on the current realm's globalThis — or, for an
+// `@` path, on its host object (`host_object`) — to a function and the holder it
+// was read off — its `this`, so `a.b.f` gets the right receiver. Each segment is
+// an ordinary [[Get]], so a getter or Proxy trap on the path runs; when one
+// throws, the error is Err(None): the caller's TryCatch holds it (`caught!`).
 fn resolve_function<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     path: &str,
 ) -> Result<(v8::Local<'s, v8::Function>, v8::Local<'s, v8::Value>), Option<VmError>> {
-    let global = scope.get_current_context().global(scope);
-    let mut holder: v8::Local<v8::Value> = global.into();
-    let mut target: v8::Local<v8::Value> = global.into();
-    for part in path.split('.') {
+    let (root, rest, _) = path_root(scope, path);
+    let mut holder: v8::Local<v8::Value> = root.into();
+    let mut target: v8::Local<v8::Value> = root.into();
+    for part in rest.split('.') {
         let Some(obj) = target.to_object(scope) else {
             // The holder of `part` (a preceding segment) was null/undefined, so
             // there's nothing to read `part` from — name the holder, not `part`.
@@ -883,8 +883,8 @@ fn op_attach(
     timeout_ms: u64,
     outermost: bool,
 ) -> VmReply {
-    // attach_at_path writes onto globalThis (and walks a dotted
-    // path), which can fire a user-defined accessor or Proxy trap —
+    // attach_at_path writes onto globalThis or the host object (and walks
+    // a dotted path), which can fire a user-defined accessor or Proxy trap —
     // arbitrary JS. So it goes through the same bracket as Eval: a
     // host fn the trap calls routes back, and a looping trap is
     // time-capped.
@@ -908,7 +908,7 @@ fn op_attach(
                         // under a namespace object, creating missing
                         // intermediates, so host fns needn't pollute the
                         // bare global.
-                        Some(function) => attach_at_path(scope, context, &name, function),
+                        Some(function) => attach_at_path(scope, &name, function),
                         None => Err(VmError::Runtime("failed to build function".into())),
                     };
                     auto_drain(scope, outermost);
@@ -955,7 +955,7 @@ fn op_attach_many(
                             .data(external.into())
                             .build(scope)
                         {
-                            Some(function) => attach_at_path(scope, context, name, function),
+                            Some(function) => attach_at_path(scope, name, function),
                             None => Err(VmError::Runtime(format!(
                                 "failed to build function for `{name}`"
                             ))),
@@ -1272,7 +1272,7 @@ fn op_evaluate_module(
                                 did_eval = true;
                                 v8::tc_scope!(let tc, scope);
                                 let reporter =
-                                    report.as_deref().and_then(|name| global_function(tc, name));
+                                    report.as_deref().and_then(|name| named_function(tc, name));
                                 match module.evaluate(tc) {
                                     // A synchronous top-level throw yields a
                                     // *rejected* promise (not None); a pending
@@ -1339,14 +1339,15 @@ fn op_evaluate_module(
     VmReply::Done(outcome)
 }
 
-// The function the current context's global has under `name`, or None.
-fn global_function<'s>(
+// The function the current context's global has under `name` — or its host
+// object, under the name an `@name` follows `@` with — or None.
+fn named_function<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     name: &str,
 ) -> Option<v8::Local<'s, v8::Function>> {
+    let (holder, name, _) = path_root(scope, name);
     let key = v8::String::new(scope, name)?;
-    let global = scope.get_current_context().global(scope);
-    v8::Local::<v8::Function>::try_from(global.get(scope, key.into())?).ok()
+    v8::Local::<v8::Function>::try_from(holder.get(scope, key.into())?).ok()
 }
 
 // get_module_namespace and is_graph_async both CHECK-abort (a release check, so

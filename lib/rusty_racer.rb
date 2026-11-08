@@ -91,10 +91,15 @@ module RustyRacer
     # the microtask queue when the outermost eval/call/run/evaluate completes
     # (the standard embedder contract); :explicit drains only on
     # #perform_microtask_checkpoint.
+    # host_namespace names the object every realm gets rusty_racer's own
+    # functions in (drainMicrotasks, contextGlobal, contextOf, ...): a property
+    # of the global (`'MiniRacer'`), or, as `'@MiniRacer'`, of the realm's host
+    # object, which no script of a page's can reach (see HOST_OBJECT).
     def self.new(host_namespace: nil, snapshot: nil, timeout_ms: 0, memory_limit: 0, microtasks: :auto)
       unless %i[auto explicit].include?(microtasks)
         raise ArgumentError, "microtasks must be :auto or :explicit, got #{microtasks.inspect}"
       end
+      raise ArgumentError, 'host_namespace: "@" names no property of the host object' if host_namespace == '@'
 
       _new(host_namespace, snapshot, timeout_ms, memory_limit, microtasks == :explicit)
     end
@@ -115,6 +120,20 @@ module RustyRacer
       _set_dynamic_import_resolver(resolver)
     end
   end
+
+  # HOST_OBJECT (defined natively): an argument that crosses into JS as the
+  # realm's HOST OBJECT — an object with no prototype that no global holds, which
+  # the host and the realm's own bindings share and no other script can reach.
+  # Every path the host names (Context#attach / #attach_many / #call /
+  # #call_void / #function, Module#evaluate's report:, Isolate.new's
+  # host_namespace:) starts from it when it begins with `@`:
+  #
+  #   ctx.attach('@fetch', ->(url) { ... })          # host.fetch, no global
+  #   ctx.call('installBindings', RustyRacer::HOST_OBJECT)
+  #   step = ctx.function('@steps.query')             # host.steps.query
+  #
+  # Each realm has its own, made as it is first used; a reset makes the realm,
+  # and so its host object, anew.
 
   # A v8::Context (realm) handed out by an Isolate: where JS actually runs.
   class Context
@@ -180,7 +199,7 @@ module RustyRacer
 
     # Evaluate the instantiated module. Its evaluation's rejection — a top-level throw, a top-level await's — raises
     # (RustyRacer::RuntimeError, as far as the drain after it settles), or, `report:` naming a function of its context's
-    # global, is that function's to report: called with the rejection's reason — a top-level throw's before this
+    # global (an `@name`: of its host object, HOST_OBJECT), is that function's to report: called with the rejection's reason — a top-level throw's before this
     # returns, a top-level await's as it settles — and nothing raised (HTML "run a module script": upon rejection,
     # report the exception).
     def evaluate(report: nil)

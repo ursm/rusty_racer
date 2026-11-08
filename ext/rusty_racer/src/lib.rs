@@ -2269,6 +2269,61 @@ pub fn set_realm_init_hook(hook: RealmInitHook) {
     let _ = REALM_INIT_HOOK.set(hook);
 }
 
+// The HOST OBJECT of the realm |scope| has entered: an object of the realm's,
+// with no prototype, that no property of any global holds — the realm's global
+// keeps it under a private key, which no script can name — so the host and the
+// realm's own bindings share it and a page's script neither reads, calls nor
+// replaces what it holds. A path that begins `@` starts from it rather than from
+// the global: `attach('@x.y', proc)` puts a host function there,
+// `Context#function('@x.y')` / `#call('@x.y')` find one there, `host_namespace:
+// '@NS'` installs the namespace there, `evaluate(report: '@r')` reports to one
+// there; and `RustyRacer::HOST_OBJECT`, as an argument crossing into JS, is this
+// object — how the bindings are handed it, where an embedder's realm init hook
+// (which calls this) does not hand it over itself. Made as it is first asked
+// for, so a realm that never uses it carries none.
+//
+// The private key lives with the global, so the object goes with its realm: a
+// reset or a disposal needs nothing of it, and no context slot is used (see
+// id_of_context for why realms keep none).
+pub fn host_object<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Object> {
+    let global = scope.get_current_context().global(scope);
+    let key = host_object_key(scope);
+    if let Some(held) = global.get_private(scope, key)
+        && let Ok(object) = v8::Local::<v8::Object>::try_from(held)
+    {
+        return object;
+    }
+    let object = null_prototype_object(scope);
+    global.set_private(scope, key, object.into());
+    object
+}
+
+// The private key a global holds its host object under. An API private, so it
+// is one key per isolate whoever asks, and needs no state of the binding's.
+fn host_object_key<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Private> {
+    let name = v8::String::new(scope, "rusty_racer:host_object").expect("a short string");
+    v8::Private::for_api(scope, Some(name))
+}
+
+// An object of the current realm with no prototype: a read of a name it lacks
+// ends there, never in an Object.prototype a page may have put a getter on.
+fn null_prototype_object<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Object> {
+    let null = v8::null(scope).into();
+    v8::Object::with_prototype_and_properties(scope, null, &[], &[])
+}
+
+// Where a path starts, and the rest of it: `@a.b` is the host object's `a.b`, any
+// other path the global's.
+pub(crate) fn path_root<'s, 'p>(
+    scope: &mut v8::PinScope<'s, '_>,
+    path: &'p str,
+) -> (v8::Local<'s, v8::Object>, &'p str, bool) {
+    match path.strip_prefix('@') {
+        Some(rest) => (host_object(scope), rest, true),
+        None => (scope.get_current_context().global(scope), path, false),
+    }
+}
+
 fn new_realm(
     scope: &mut v8::PinScope<'_, '_, ()>,
     context_id: i32,
@@ -2373,9 +2428,11 @@ fn flush_retiring(scope: &mut v8::PinScope<'_, '_, ()>) {
     drop(retiring);
 }
 
-// Inject globalThis.<name> = { drainMicrotasks } into a context. Re-run on
-// reset_realm so the fresh realm keeps the namespace. Takes a scope (not the
-// isolate) so service_request can call it from nested servicing too.
+// Inject globalThis.<name> = { drainMicrotasks, ... } into a context — or, for
+// an `@name`, put it on the realm's host object instead, with no prototype, where
+// only the host and the realm's bindings reach it. Re-run on reset_realm so the
+// fresh realm keeps the namespace. Takes a scope (not the isolate) so
+// service_request can call it from nested servicing too.
 fn install_host_namespace(
     scope: &mut v8::PinScope<'_, '_, ()>,
     ctx: &v8::Global<v8::Context>,
@@ -2384,7 +2441,12 @@ fn install_host_namespace(
     v8::scope!(let scope, &mut *scope);
     let context = v8::Local::new(scope, ctx);
     let scope = &mut v8::ContextScope::new(scope, context);
-    let ns = v8::Object::new(scope);
+    let (holder, name, hidden) = path_root(scope, name);
+    let ns = if hidden {
+        null_prototype_object(scope)
+    } else {
+        v8::Object::new(scope)
+    };
     let members: [(&str, Option<v8::Local<v8::Function>>); 9] = [
         (
             "drainMicrotasks",
@@ -2408,27 +2470,39 @@ fn install_host_namespace(
         }
     }
     if let Some(key) = v8::String::new(scope, name) {
-        let global = context.global(scope);
-        global.create_data_property(scope, key.into(), ns.into());
+        holder.create_data_property(scope, key.into(), ns.into());
     }
 }
 
 // Set |function| at the dotted property path |name| on the global, creating
 // intermediate plain objects as needed — so attach("MiniRacer.foo", ...) lands
 // under the namespace whether or not globalThis.MiniRacer already exists, while
-// a bare "foo" still attaches on the global.
+// a bare "foo" still attaches on the global. An `@` path lands on the realm's
+// host object instead, its intermediates made with no prototype and every
+// property DEFINED there: nothing a page's script left on a prototype runs.
 fn attach_at_path(
     scope: &mut v8::PinScope<'_, '_>,
-    context: v8::Local<v8::Context>,
     name: &str,
     function: v8::Local<v8::Function>,
 ) -> Result<JsVal, VmError> {
-    let mut parts: Vec<&str> = name.split('.').collect();
+    let (mut holder, path, hidden) = path_root(scope, name);
+    let mut parts: Vec<&str> = path.split('.').collect();
     let leaf = parts
         .pop()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| VmError::Runtime(format!("invalid attach name `{name}`")))?;
-    let mut holder = context.global(scope);
+    // Make a property of |holder|: defined on the host object's side, assigned on
+    // the global's (as attach always has, so an accessor there still sees it).
+    let put = |scope: &mut v8::PinScope<'_, '_>,
+               holder: v8::Local<v8::Object>,
+               key: v8::Local<v8::String>,
+               value: v8::Local<v8::Value>| {
+        if hidden {
+            holder.create_data_property(scope, key.into(), value)
+        } else {
+            holder.set(scope, key.into(), value)
+        }
+    };
     for part in parts {
         if part.is_empty() {
             return Err(VmError::Runtime(format!("invalid attach name `{name}`")));
@@ -2445,8 +2519,12 @@ fn attach_at_path(
                 )));
             }
             _ => {
-                let obj = v8::Object::new(scope);
-                if holder.set(scope, key.into(), obj.into()) != Some(true) {
+                let obj = if hidden {
+                    null_prototype_object(scope)
+                } else {
+                    v8::Object::new(scope)
+                };
+                if put(scope, holder, key, obj.into()) != Some(true) {
                     return Err(VmError::Runtime(format!(
                         "`{name}`: cannot create `{part}`"
                     )));
@@ -2457,7 +2535,7 @@ fn attach_at_path(
     }
     let key =
         v8::String::new(scope, leaf).ok_or_else(|| VmError::Runtime("name too large".into()))?;
-    if holder.set(scope, key.into(), function.into()) != Some(true) {
+    if put(scope, holder, key, function.into()) != Some(true) {
         return Err(VmError::Runtime(format!(
             "`{name}`: target is not writable/extensible"
         )));
@@ -4346,6 +4424,8 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
 // same surface.
 pub fn install_classes(ruby: &Ruby) -> Result<(), Error> {
     let module = ruby.define_module("RustyRacer")?;
+    // The argument that crosses into JS as the realm's host object (host_object).
+    module.const_set("HOST_OBJECT", ruby.get_inner(&marshal::HOST_OBJECT))?;
 
     // The isolate (VM) + its isolate-level ops; hands out Contexts.
     let isolate = module.define_class("Isolate", ruby.class_object())?;
