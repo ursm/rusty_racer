@@ -1027,6 +1027,9 @@ struct V8State {
     retiring: Vec<(v8::Global<v8::Context>, v8::UniqueRef<v8::MicrotaskQueue>)>,
     next_context_id: i32,
     host_namespace: Option<String>,
+    // The private key every realm's global holds its host object under
+    // (host_object_key), once something has asked for one.
+    host_key: Option<v8::Global<v8::Private>>,
     // One security token shared by every realm of this isolate: the
     // embedder's frames are same-origin, so cross-context access (e.g.
     // NS.contextGlobal) must pass V8's access checks, which compare the
@@ -1998,6 +2001,30 @@ fn context_global(
     }
 }
 
+// NS.hostObjectOf(id) -> the host object of context |id| (host_object), made
+// there if it has none yet — for one realm's bindings to reach another's, as
+// contextGlobal reaches its global. Only on a namespace that is itself on the
+// host object (`host_namespace: '@…'`): a namespace on the global would hand
+// every realm's host object to any script. Throws on an unknown/disposed id.
+fn host_object_of(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(id) = args.get(0).int32_value(scope) else {
+        throw_js_error(scope, "hostObjectOf expects a context id");
+        return;
+    };
+    match context_for(istate!(scope), id) {
+        Some(g) => {
+            let context = v8::Local::new(scope, &g);
+            let scope = &mut v8::ContextScope::new(scope, context);
+            rv.set(host_object(scope).into());
+        }
+        None => throw_js_error(scope, &format!("unknown context {id}")),
+    }
+}
+
 // NS.contextOf(value) -> the id of the context |value| was created in, or
 // undefined for primitives and for objects whose context is no longer a live
 // realm (e.g. it was reset away). Lets the embedder attribute a function or
@@ -2286,23 +2313,42 @@ pub fn set_realm_init_hook(hook: RealmInitHook) {
 // reset or a disposal needs nothing of it, and no context slot is used (see
 // id_of_context for why realms keep none).
 pub fn host_object<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Object> {
-    let global = scope.get_current_context().global(scope);
-    let key = host_object_key(scope);
-    if let Some(held) = global.get_private(scope, key)
-        && let Ok(object) = v8::Local::<v8::Object>::try_from(held)
-    {
+    if let Some(object) = existing_host_object(scope) {
         return object;
     }
     let object = null_prototype_object(scope);
+    let global = scope.get_current_context().global(scope);
+    let key = host_object_key(scope);
     global.set_private(scope, key, object.into());
     object
 }
 
-// The private key a global holds its host object under. An API private, so it
-// is one key per isolate whoever asks, and needs no state of the binding's.
+// The current realm's host object if it has made one yet, without making it.
+pub(crate) fn existing_host_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let global = scope.get_current_context().global(scope);
+    let key = host_object_key(scope);
+    v8::Local::<v8::Object>::try_from(global.get_private(scope, key)?).ok()
+}
+
+// The private key a global holds its host object under: an API private, so it
+// is one key per isolate whoever asks — the binding's own isolates keep it
+// (V8State::host_key) rather than looking it up by name at every use.
 fn host_object_key<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Private> {
+    let kept = scope
+        .get_slot::<IsolateState>()
+        .and_then(|state| state.realms.host_key.clone());
+    if let Some(key) = kept {
+        return v8::Local::new(scope, &key);
+    }
     let name = v8::String::new(scope, "rusty_racer:host_object").expect("a short string");
-    v8::Private::for_api(scope, Some(name))
+    let key = v8::Private::for_api(scope, Some(name));
+    let kept = v8::Global::new(scope, key);
+    if let Some(state) = scope.get_slot_mut::<IsolateState>() {
+        state.realms.host_key = Some(kept);
+    }
+    key
 }
 
 // An object of the current realm with no prototype: a read of a name it lacks
@@ -2322,6 +2368,23 @@ pub(crate) fn path_root<'s, 'p>(
         Some(rest) => (host_object(scope), rest, true),
         None => (scope.get_current_context().global(scope), path, false),
     }
+}
+
+// One segment of a path read off |holder|: an ordinary [[Get]] on the global's
+// side; on the host object's (|hidden|), its OWN property alone — undefined
+// where it has none, so no prototype of an object along the way (Object's, a
+// function's) is ever consulted, and a getter a page put there neither sees
+// the walk nor hands it an object of the page's. None when the read threw.
+pub(crate) fn path_segment<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    holder: v8::Local<v8::Object>,
+    key: v8::Local<v8::String>,
+    hidden: bool,
+) -> Option<v8::Local<'s, v8::Value>> {
+    if hidden && !holder.has_own_property(scope, key.into())? {
+        return Some(v8::undefined(scope).into());
+    }
+    holder.get(scope, key.into())
 }
 
 fn new_realm(
@@ -2430,7 +2493,8 @@ fn flush_retiring(scope: &mut v8::PinScope<'_, '_, ()>) {
 
 // Inject globalThis.<name> = { drainMicrotasks, ... } into a context — or, for
 // an `@name`, put it on the realm's host object instead, with no prototype, where
-// only the host and the realm's bindings reach it. Re-run on reset_realm so the
+// only the host and the realm's bindings reach it, and with one member more
+// there: hostObjectOf(id), another realm's host object. Re-run on reset_realm so the
 // fresh realm keeps the namespace. Takes a scope (not the isolate) so
 // service_request can call it from nested servicing too.
 fn install_host_namespace(
@@ -2464,7 +2528,12 @@ fn install_host_namespace(
         ("shareIn", v8::Function::new(scope, share_in)),
         ("transferDrop", v8::Function::new(scope, transfer_drop)),
     ];
-    for (member, function) in members {
+    let hidden_members: &[(&str, Option<v8::Local<v8::Function>>)] = if hidden {
+        &[("hostObjectOf", v8::Function::new(scope, host_object_of))]
+    } else {
+        &[]
+    };
+    for (member, function) in members.into_iter().chain(hidden_members.iter().copied()) {
         if let (Some(f), Some(k)) = (function, v8::String::new(scope, member)) {
             ns.create_data_property(scope, k.into(), f.into());
         }
@@ -2478,8 +2547,9 @@ fn install_host_namespace(
 // intermediate plain objects as needed — so attach("MiniRacer.foo", ...) lands
 // under the namespace whether or not globalThis.MiniRacer already exists, while
 // a bare "foo" still attaches on the global. An `@` path lands on the realm's
-// host object instead, its intermediates made with no prototype and every
-// property DEFINED there: nothing a page's script left on a prototype runs.
+// host object instead: walked through own properties alone (path_segment), its
+// missing intermediates made with no prototype, and every property DEFINED
+// there — nothing a page's script left on a prototype runs or is written to.
 fn attach_at_path(
     scope: &mut v8::PinScope<'_, '_>,
     name: &str,
@@ -2509,7 +2579,7 @@ fn attach_at_path(
         }
         let key = v8::String::new(scope, part)
             .ok_or_else(|| VmError::Runtime("name too large".into()))?;
-        holder = match holder.get(scope, key.into()) {
+        holder = match path_segment(scope, holder, key, hidden) {
             Some(v) if v.is_object() => v8::Local::<v8::Object>::try_from(v).unwrap(),
             // Don't clobber an existing non-object (e.g. a primitive global that
             // collides with the namespace name) — fail loudly instead.

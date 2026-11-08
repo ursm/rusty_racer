@@ -132,8 +132,12 @@ module RustyRacer
   #   ctx.call('installBindings', RustyRacer::HOST_OBJECT)
   #   step = ctx.function('@steps.query')             # host.steps.query
   #
-  # Each realm has its own, made as it is first used; a reset makes the realm,
-  # and so its host object, anew.
+  # An `@` path walks own properties alone. HOST_OBJECT is the host object of
+  # the realm the operation runs in (a Context's, a Function handle's, a host
+  # function's own, for its result), and that object crosses back as
+  # HOST_OBJECT. Each realm has its own, made as it is first used; a reset makes
+  # the realm, and so its host object, anew. Hand it to the bindings before any
+  # script of a page's runs, by a name they delete as they take it.
 
   # A v8::Context (realm) handed out by an Isolate: where JS actually runs.
   class Context
@@ -199,9 +203,9 @@ module RustyRacer
 
     # Evaluate the instantiated module. Its evaluation's rejection — a top-level throw, a top-level await's — raises
     # (RustyRacer::RuntimeError, as far as the drain after it settles), or, `report:` naming a function of its context's
-    # global (an `@name`: of its host object, HOST_OBJECT), is that function's to report: called with the rejection's reason — a top-level throw's before this
-    # returns, a top-level await's as it settles — and nothing raised (HTML "run a module script": upon rejection,
-    # report the exception).
+    # global (an `@` path: on its host object, HOST_OBJECT), is that function's to report: called with the rejection's
+    # reason — a top-level throw's before this returns, a top-level await's as it settles — and nothing raised (HTML
+    # "run a module script": upon rejection, report the exception).
     def evaluate(report: nil)
       _evaluate(report&.to_s)
     end

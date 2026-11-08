@@ -650,6 +650,44 @@ class RustyRacerTest < Minitest::Test
     assert_includes e.message, '`@missing` is not a function'
   end
 
+  def test_an_at_path_walks_own_properties_alone
+    @ctx.eval(<<~JS)
+      globalThis.hits = [];
+      const theirs = {secret: () => 'page fn'};
+      for (const proto of [Object.prototype, Function.prototype]) {
+        Object.defineProperty(proto, 'util', {get() { hits.push('get util'); return theirs }, configurable: true});
+        Object.defineProperty(proto, 'missing', {get() { hits.push('get missing'); return () => 'page fn' }, configurable: true});
+      }
+      globalThis.install = (h) => { h.steps = {}; };
+      globalThis.leaked = () => typeof theirs.inner;
+    JS
+    @ctx.call('install', RustyRacer::HOST_OBJECT)
+    @ctx.attach('@steps.util.inner', proc { 'host fn' })
+    @ctx.attach('@hf', proc { 'hf' })
+    @ctx.attach('@hf.util.inner', proc { 'host fn' })
+    assert_equal 'undefined', @ctx.call('leaked')
+    assert_equal 'host fn', @ctx.call('@steps.util.inner')
+    assert_equal 'host fn', @ctx.call('@hf.util.inner')
+    assert_raises(RustyRacer::RuntimeError) { @ctx.call('@steps.missing') }
+    assert_raises(RustyRacer::RuntimeError) { @ctx.function('@hf.missing') }
+    m = @ctx.compile_module('throw new Error("boom");', filename: '/m.js')
+    m.instantiate { nil }
+    assert_raises(RustyRacer::RuntimeError) { m.evaluate(report: '@steps.missing') }
+    assert_empty @ctx.eval('hits')
+  end
+
+  def test_host_object_crosses_back_as_itself
+    @ctx.attach('@f', proc { 1 })
+    @ctx.eval('globalThis.id = (x) => x; globalThis.wrap = (h) => [h, {h}]')
+    assert_same RustyRacer::HOST_OBJECT, @ctx.call('id', RustyRacer::HOST_OBJECT)
+    assert_equal [RustyRacer::HOST_OBJECT, {'h' => RustyRacer::HOST_OBJECT}], @ctx.call('wrap', RustyRacer::HOST_OBJECT)
+    assert_equal 'RustyRacer::HOST_OBJECT', RustyRacer::HOST_OBJECT.inspect
+    # (…and a frame realm's, in its own)
+    realm = @iso.create_context
+    realm.eval('globalThis.id = (x) => x')
+    assert_same RustyRacer::HOST_OBJECT, realm.call('id', RustyRacer::HOST_OBJECT)
+  end
+
   def test_host_object_is_per_realm_and_made_anew_by_a_reset
     @ctx.attach('@who', proc { 'main' })
     realm = @iso.create_context
@@ -687,6 +725,11 @@ class RustyRacerTest < Minitest::Test
     ctx.reset
     assert_equal 'undefined', ctx.eval('typeof MiniRacer')
     assert_equal 0, ctx.call('@MiniRacer.contextOf', RustyRacer::HOST_OBJECT)
+    # (…and one realm's bindings reach another's host object through it — a namespace on the global has no such member)
+    realm.attach('@who', proc { 'frame' })
+    ctx.eval("globalThis.ask = (h) => h.MiniRacer.hostObjectOf(#{realm.id}).who()")
+    assert_equal 'frame', ctx.call('ask', RustyRacer::HOST_OBJECT)
+    assert_equal 'undefined', RustyRacer::Isolate.new(host_namespace: 'Visible').context.eval('typeof Visible.hostObjectOf')
     assert_raises(ArgumentError) { RustyRacer::Isolate.new(host_namespace: '@') }
   ensure
     iso&.dispose
@@ -694,11 +737,11 @@ class RustyRacerTest < Minitest::Test
 
   def test_evaluate_reports_to_a_function_of_the_host_object
     @ctx.eval('globalThis.reported = []')
-    @ctx.eval('globalThis.install = (h) => { h.report = (e) => reported.push(e.message) }')
+    @ctx.eval('globalThis.install = (h) => { h.errors = {report: (e) => reported.push(e.message)} }')
     @ctx.call('install', RustyRacer::HOST_OBJECT)
     m = @ctx.compile_module('throw new Error("boom");', filename: '/m.js')
     m.instantiate { nil }
-    assert_nil m.evaluate(report: '@report')
+    assert_nil m.evaluate(report: '@errors.report')
     assert_equal ['boom'], @ctx.eval('reported')
   end
 

@@ -157,7 +157,7 @@ pub(crate) enum Request {
     EvaluateModule {
         module_id: i32,
         timeout_ms: u64,
-        // The name of a function on the module's context's global (an `@name`: on its host object) that reports its
+        // The name of a function on the module's context's global (an `@` path: on its host object) that reports its
         // evaluation's rejection — HTML "run a module script": upon rejection, report the exception — now or as a
         // top-level-await module settles; none: the rejection is the op's error, as far as the drain gets.
         report: Option<String>,
@@ -297,13 +297,14 @@ pub(crate) fn run_source(
 // Resolve a dotted property path on the current realm's globalThis — or, for an
 // `@` path, on its host object (`host_object`) — to a function and the holder it
 // was read off — its `this`, so `a.b.f` gets the right receiver. Each segment is
-// an ordinary [[Get]], so a getter or Proxy trap on the path runs; when one
-// throws, the error is Err(None): the caller's TryCatch holds it (`caught!`).
+// an ordinary [[Get]] (an `@` path's of an own property alone: path_segment), so
+// a getter or Proxy trap on the path runs; when one throws, the error is
+// Err(None): the caller's TryCatch holds it (`caught!`).
 fn resolve_function<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     path: &str,
 ) -> Result<(v8::Local<'s, v8::Function>, v8::Local<'s, v8::Value>), Option<VmError>> {
-    let (root, rest, _) = path_root(scope, path);
+    let (root, rest, hidden) = path_root(scope, path);
     let mut holder: v8::Local<v8::Value> = root.into();
     let mut target: v8::Local<v8::Value> = root.into();
     for part in rest.split('.') {
@@ -317,7 +318,7 @@ fn resolve_function<'s>(
         let Some(key) = v8::String::new(scope, part) else {
             return Err(Some(VmError::Runtime("property name too large".into())));
         };
-        let Some(next) = obj.get(scope, key.into()) else {
+        let Some(next) = path_segment(scope, obj, key, hidden) else {
             return Err(None);
         };
         holder = target;
@@ -1339,15 +1340,21 @@ fn op_evaluate_module(
     VmReply::Done(outcome)
 }
 
-// The function the current context's global has under `name` — or its host
-// object, under the name an `@name` follows `@` with — or None.
+// The function the current context's global has under `name` (one property,
+// dots and all, as it always was) — or, for an `@` path, the one the path names
+// on its host object, as `Context#function` finds it — or None.
 fn named_function<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     name: &str,
 ) -> Option<v8::Local<'s, v8::Function>> {
-    let (holder, name, _) = path_root(scope, name);
+    if name.starts_with('@') {
+        return resolve_function(scope, name)
+            .ok()
+            .map(|(function, _)| function);
+    }
     let key = v8::String::new(scope, name)?;
-    v8::Local::<v8::Function>::try_from(holder.get(scope, key.into())?).ok()
+    let global = scope.get_current_context().global(scope);
+    v8::Local::<v8::Function>::try_from(global.get(scope, key.into())?).ok()
 }
 
 // get_module_namespace and is_graph_async both CHECK-abort (a release check, so
