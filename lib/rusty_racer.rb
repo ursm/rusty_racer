@@ -104,20 +104,36 @@ module RustyRacer
       _new(host_namespace, snapshot, timeout_ms, memory_limit, microtasks == :explicit)
     end
 
-    # ->(specifier, referrer_url, context) { Module } for JS import(). |context|
-    # is the realm import() actually fired in (the Context, not just its id), so
-    # an import() from an extra realm resolves/compiles in THAT realm rather than
-    # the main one — return e.g. context.compile_module(src, filename: specifier).
-    # The block may return a merely compiled Module: linking and evaluation are
-    # the binding's job (V8's host contract), and static imports met while linking
-    # resolve through this same block (also with the realm as the 3rd arg).
-    # (Module#instantiate's own resolve block keeps its 2-arg form.)
+    # ->(import) { ... } for JS import(): handed each import()'s
+    # RustyRacer::DynamicImport — the specifier, its import attributes, the
+    # referring script's name and host-defined value, the realm it was called in
+    # — which the handler settles now or later (a fetch begun now, settled on a
+    # later task): #resolve with a Module, #reject / #reject_with with a value.
+    # Until then the import()'s promise is pending. A handler that raises
+    # rejects it with an Error of its message, unless it settled it first; nil
+    # clears it, an import() then rejected.
     # The native side keeps the proc alive itself (in the isolate's roots array,
     # marked by its wrappers), so it is NOT held in an ivar here: that second
-    # reference would outlive `dispose`, which exists to drop whatever the resolver
+    # reference would outlive `dispose`, which exists to drop whatever the handler
     # captured the moment the isolate can no longer call it.
+    def dynamic_import_handler=(handler)
+      _set_dynamic_import_handler(handler)
+    end
+
+    # ->(specifier, referrer_url, context) { Module } for JS import(), answered at
+    # once: the dynamic_import_handler that resolves each import() with the
+    # Module the resolver returns — linked through the resolver too (a static
+    # import met while linking it asks it, with the same realm), and evaluated —
+    # or rejects it where the resolver returns nil. nil clears it.
     def dynamic_import_resolver=(resolver)
-      _set_dynamic_import_resolver(resolver)
+      self.dynamic_import_handler = resolver && lambda do |import|
+        context = import.context
+        mod = resolver.call(import.specifier, import.referrer.to_s, context)
+        # (…raised: the import rejected with an Error of the realm's own, natively)
+        raise Error, "import() was not resolved to a module (#{import.specifier.inspect})" unless mod
+
+        import.resolve(mod) {|specifier, referrer| resolver.call(specifier, referrer, context) }
+      end
     end
   end
 
@@ -168,8 +184,12 @@ module RustyRacer
     # Compile a classic <script>; returns a RustyRacer::Script to #run.
     # cached_data:/produce_cache: are the bytecode cache (see #compile_module).
     # eager: (see #compile_module).
-    def compile(source, filename: '<compile>', cached_data: nil, produce_cache: false, eager: false)
-      _compile(source, filename, cached_data, produce_cache, eager)
+    # host_defined: a primitive (Integer, Float, String, true, false) its
+    # ScriptOrigin carries, which an import() it makes is handed
+    # (DynamicImport#host_defined) — how a host tells one referring script from
+    # another of the same name.
+    def compile(source, filename: '<compile>', cached_data: nil, produce_cache: false, eager: false, host_defined: nil)
+      _compile(source, filename, cached_data, produce_cache, eager, host_defined)
     end
 
     # Compile an ES module; returns a RustyRacer::Module to instantiate/evaluate.
@@ -186,14 +206,45 @@ module RustyRacer
     # inner functions, so eager: alone doesn't change the cache yet — it's a
     # forward-looking, semantically-correct switch. For a cache that DOES carry
     # inner functions, run the script/module and call #create_code_cache.
-    def compile_module(source, filename: '<compile_module>', cached_data: nil, produce_cache: false, eager: false)
-      _compile_module(source, filename, cached_data, produce_cache, eager)
+    #
+    # host_defined: (see #compile) — handed to an import() the module makes, and
+    # to its realm's import-meta handler (NS.setImportMetaHandler).
+    def compile_module(source, filename: '<compile_module>', cached_data: nil, produce_cache: false, eager: false, host_defined: nil)
+      _compile_module(source, filename, cached_data, produce_cache, eager, host_defined)
+    end
+
+    # A synthetic module (V8 CreateSyntheticModule) exporting `default` alone,
+    # under `filename` — what HTML makes of a JSON, CSS or text module script —
+    # its value one of:
+    #
+    #   synthetic_module('text', filename: '/a.txt')            # a Ruby value, marshalled
+    #   synthetic_module(json: '{"a":1}', filename: '/a.json')  # %JSON.parse% of a JSON text (ECMA-262 JSON modules)
+    #   synthetic_module(call: ['@makeSheet', css], filename: '/a.css')
+    #                                                           # what the function at a path (as #call names one) returns
+    #
+    # A JSON text that is none raises RustyRacer::ParseError, as a module's
+    # SyntaxError does; a function that throws, RustyRacer::RuntimeError.
+    # Linked and evaluated as any module is; it has no requests.
+    def synthetic_module(*value, filename: '<synthetic_module>', json: nil, call: nil)
+      given = [!value.empty?, !json.nil?, !call.nil?].count(true)
+      raise ArgumentError, 'synthetic_module takes one of a value, json: or call:' unless given == 1 && value.size <= 1
+
+      if json
+        _synthetic_module(filename, 1, json, [])
+      elsif call
+        path, *args = call
+        _synthetic_module(filename, 2, path, args)
+      else
+        _synthetic_module(filename, 0, value.first, [])
+      end
     end
   end
 
   class Module
-    # instantiate { |specifier, referrer_url| dependency_module } — the block
-    # resolves each import to an already-compiled Module. Returns self.
+    # instantiate { |specifier, referrer_url, attributes| dependency_module } —
+    # the block resolves each import to an already-compiled Module; attributes
+    # is the request's import attributes, {'type' => 'json'} (a request with
+    # none: one frozen empty Hash). Returns self.
     def instantiate(&block)
       raise ArgumentError, 'instantiate requires a resolver block' unless block
 
@@ -210,10 +261,39 @@ module RustyRacer
       _evaluate(report&.to_s)
     end
 
+    # #requests -> [[specifier, attributes], ...]: what the module imports (V8
+    # GetModuleRequests), in source order, each with its import attributes —
+    # the requests linking it asks its resolve block for, one by one.
+
     # The V8 module status: :uninstantiated, :instantiating, :instantiated,
     # :evaluating, :evaluated or :errored.
     def status
       _status.to_sym
     end
+  end
+
+  # An import() waiting for its host — handed to Isolate#dynamic_import_handler.
+  # #specifier, #attributes ({'type' => 'json'}), #referrer (the name of the
+  # script that called import(), or nil), #host_defined (that script's
+  # host_defined:, or nil) and #context (the realm it was called in, whose
+  # modules it is settled with) say what was asked; #resolve, #reject and
+  # #reject_with settle it — now, inside the handler, or on a later task — each
+  # answering whether it was still waiting (false once settled, or once its
+  # realm was reset or disposed). Let go of unsettled, its promise is let go of
+  # too, pending.
+  class DynamicImport
+    # resolve(module) { |specifier, referrer_url, attributes| dependency } —
+    # fulfil the import() with `module`'s namespace once it is evaluated:
+    # linked first, where it is not yet, by the block (as Module#instantiate's
+    # is), then evaluated (its top-level await awaited). A link or evaluation
+    # error — a block that raised included — rejects the import() with it.
+    def resolve(mod, &block)
+      _resolve(mod, block)
+    end
+
+    # #reject(value): reject the import() with `value`, marshalled into its realm.
+    # #reject_with(path, *args): reject it with what the function at `path` (as
+    # Context#call names one, in its realm) returns — `'@steps.typeError'`, say,
+    # for an error of the host's own making — or with what it throws.
   end
 end

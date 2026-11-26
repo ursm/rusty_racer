@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **The host answers `import()`, now or later.** `Isolate#dynamic_import_handler=`
+  takes a proc handed a `RustyRacer::DynamicImport` per `import()` — its
+  `specifier`, `attributes` (the `with` options' import attributes),
+  `referrer`, `host_defined` and `context` — whose promise waits until the host
+  settles it, inside the handler or on any later turn: `#resolve(module)` links
+  the module (by the block it is given, as `Module#instantiate`'s) and evaluates
+  it, `#reject(value)` rejects with a marshalled value, and
+  `#reject_with(path, *args)` with what a function of the realm makes — an error
+  of the host's own kind, from an `@` path no page reaches. Each answers whether
+  the import was still waiting; one whose realm was reset or disposed is not.
+- **Import attributes** reach the resolve block of `Module#instantiate` (a third
+  argument, `{"type" => "json"}`), and `Module#requests` lists a module's
+  requests with theirs without linking it.
+- **Synthetic modules:** `Context#synthetic_module(value)`, `(json: text)` —
+  ECMA-262's JSON module, parsed by the realm's own `JSON.parse` whatever a page
+  made of the global — and `(call: [path, *args])` make a module exporting
+  `default` alone.
+- **`host_defined:`** on `Context#compile` and `#compile_module`: a primitive the
+  script's origin carries, handed to the `import()`s it makes
+  (`DynamicImport#host_defined`) and to its realm's import-meta handler.
+- **`NS.setImportMetaHandler(fn)`**: the realm's `fn(meta, url, hostDefined)`
+  fills a module's `import.meta` beyond `url` as it is first read —
+  `import.meta.resolve`, for one.
+
+### Changed
+
+- `Isolate#dynamic_import_resolver=` is a `dynamic_import_handler` that resolves
+  each `import()` at once. A resolver that returns `nil` rejects the import with
+  an `Error` naming its specifier, an import made outside any named script hands
+  it `""` as its referrer, and `nil` clears it. An `import()` called by a
+  function of a realm reset or disposed since rejects, rather than resolving in
+  the realm that took its id.
+- A two-parameter lambda as a resolve block is still handed two arguments, one
+  with an optional or rest parameter as many as it takes.
+
 ## 0.2.8
 
 ### Added

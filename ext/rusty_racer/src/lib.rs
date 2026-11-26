@@ -31,7 +31,7 @@
 // OUTERMOST op cancels a stale terminate so it can't poison the next op, while a
 // nested op's cancel never erases a termination aimed at the suspended outer JS.
 //
-// Attached procs and the dynamic-import resolver are kept alive by the ISOLATE'S
+// Attached procs and the dynamic-import handler are kept alive by the ISOLATE'S
 // OWN ROOTS ARRAY (Core.roots), which every wrapper marks — never by a GC root.
 // A root would be a leak: a host fn closes over its embedder's world, and that
 // world reaches back to this isolate's wrappers, so rooting the proc roots the
@@ -72,7 +72,9 @@ use magnus::{
 mod marshal;
 use marshal::{JsVal, js_to_jsval, jsval_to_js, jsval_to_ruby, ruby_to_jsval};
 mod ops;
-use ops::{Compiled, Completion, Request, VmReply, run_source, service_request};
+use ops::{
+    Compiled, Completion, Request, Settle, SyntheticExport, VmReply, run_source, service_request,
+};
 mod stack;
 use stack::{STACK_DEBUG, StackScope, current_real_isolate, discover_scan_start_field};
 mod watchdog;
@@ -85,16 +87,16 @@ use watchdog::{
 // and PINS it (GC.compact must not move it: the copies living in Rust are
 // invisible to the compactor and would go stale).
 //
-// Only for a proc the isolate holds TRANSIENTLY — today just the instantiate
-// resolver, parked in the slot for the length of one InstantiateModule op and
-// restored after it. Anything held for the isolate's LIFE goes in the roots
+// Only for a proc the isolate holds TRANSIENTLY — today just the resolve block
+// of Module#instantiate or DynamicImport#resolve, parked in the slot for the
+// length of one InstantiateModule / SettleImport op and restored after it. Anything held for the isolate's LIFE goes in the roots
 // array instead (see the module header): a lasting root is a lasting leak.
 //
 // SAFETY of the manual Send: the !Send contents (and BoxValue's drop, which
 // calls rb_gc_unregister_address) only run under the GVL. Two conventions
 // keep that true — breaking either is silent UB, so don't:
-//   - Arc<Core> lives ONLY in the five TypedData wrappers (Isolate, Context,
-//     Module, Script, Function). Never clone it into the V8/watchdog threads, or the
+//   - Arc<Core> lives ONLY in the six TypedData wrappers (Isolate, Context,
+//     Module, Script, Function, DynamicImport). Never clone it into the V8/watchdog threads, or the
 //     last drop could run off a Ruby thread.
 //   - the wrappers must not set free_immediately: their dfree (and so Core's
 //     drop) has to run outside the GC sweep, where Ruby APIs are forbidden.
@@ -259,12 +261,31 @@ impl ProcTable {
 // long as a wrapper of it is reachable, in one place the GC can be shown without
 // taking any Rust lock (a mark that had to lock `procs` could deadlock against
 // the thread whose allocation triggered the GC while holding it). Slot 0 is the
-// dynamic-import resolver; the attached host fns follow, one per proc slot.
-const ROOT_IMPORT_RESOLVER: isize = 0;
+// dynamic-import handler; the attached host fns follow, one per proc slot.
+const ROOT_IMPORT_HANDLER: isize = 0;
 const ROOT_FIRST_PROC: isize = 1;
 fn proc_root_index(index: usize) -> isize {
     ROOT_FIRST_PROC + index as isize
 }
+
+// Import attributes as a Ruby Hash (String => String), in source order — none,
+// the one frozen empty Hash (NO_ATTRIBUTES): what almost every request has,
+// handed to a resolve block per import edge, made once.
+fn attributes_hash(ruby: &Ruby, attributes: &[(String, String)]) -> Result<RHash, Error> {
+    if attributes.is_empty() {
+        return Ok(ruby.get_inner(&NO_ATTRIBUTES));
+    }
+    let hash = ruby.hash_new();
+    for (key, value) in attributes {
+        hash.aset(key.as_str(), value.as_str())?;
+    }
+    Ok(hash)
+}
+static NO_ATTRIBUTES: magnus::value::Lazy<RHash> = magnus::value::Lazy::new(|ruby| {
+    let hash = ruby.hash_new();
+    hash.freeze();
+    hash
+});
 
 // Look up a RustyRacer::<name> exception class at raise time. The classes are
 // defined in lib/rusty_racer.rb (loaded after this extension), so they exist
@@ -712,7 +733,12 @@ fn reject_with_error(
 
 // A ScriptOrigin naming the script |filename|, so stack traces and parse-error
 // locations report a meaningful resource name instead of being anonymous.
-fn script_origin<'s>(scope: &v8::PinScope<'s, '_>, filename: &str) -> v8::ScriptOrigin<'s> {
+// |host_defined| its host-defined options (`host_defined_options`).
+fn script_origin<'s>(
+    scope: &v8::PinScope<'s, '_>,
+    filename: &str,
+    host_defined: Option<v8::Local<'s, v8::Data>>,
+) -> v8::ScriptOrigin<'s> {
     let name = v8::String::new(scope, filename).unwrap_or_else(|| v8::String::empty(scope));
     v8::ScriptOrigin::new(
         scope,
@@ -725,7 +751,7 @@ fn script_origin<'s>(scope: &v8::PinScope<'s, '_>, filename: &str) -> v8::Script
         false,
         false,
         /*is_module*/ false,
-        None,
+        host_defined,
     )
 }
 
@@ -874,7 +900,11 @@ fn take_thrown<'s>(
 // owning the url->Module registry and the resolve policy (ModuleReg is only the
 // binding's id and url bookkeeping).
 // ---------------------------------------------------------------------------
-fn module_origin<'s>(scope: &v8::PinScope<'s, '_>, url: &str) -> v8::ScriptOrigin<'s> {
+fn module_origin<'s>(
+    scope: &v8::PinScope<'s, '_>,
+    url: &str,
+    host_defined: Option<v8::Local<'s, v8::Data>>,
+) -> v8::ScriptOrigin<'s> {
     let name = v8::String::new(scope, url).unwrap();
     v8::ScriptOrigin::new(
         scope,
@@ -887,8 +917,28 @@ fn module_origin<'s>(scope: &v8::PinScope<'s, '_>, url: &str) -> v8::ScriptOrigi
         false,
         false,
         /*is_module*/ true,
-        None,
+        host_defined,
     )
+}
+
+// File a module V8 made (compiled, or synthetic) under a new id of the realm
+// |context_id|'s — what a Module wrapper addresses — and index its |origin| by
+// its identity (ModuleReg.urls).
+pub(crate) fn register_module(
+    scope: &mut v8::PinScope<'_, '_>,
+    module: v8::Local<v8::Module>,
+    context_id: i32,
+    origin: ModuleOrigin,
+) -> i32 {
+    let hash = module.get_identity_hash().get();
+    let g = v8::Global::new(scope, module);
+    let weak = v8::Weak::new(scope, module);
+    let m = &mut istate!(scope).modules;
+    let id = m.next_id;
+    m.next_id += 1;
+    m.by_id.insert(id, (g, context_id));
+    m.add_url(hash, weak, origin);
+    id
 }
 
 // Registry for the thin compile_module/instantiate API.
@@ -899,13 +949,14 @@ struct ModuleReg {
     // was compiled in. Strong, and gone once the wrapper is disposed or collected
     // (Core.released).
     by_id: HashMap<i32, (v8::Global<v8::Module>, i32)>,
-    // identity hash -> (module, url): a Local<Module> V8 hands a callback
-    // (import.meta, a referrer being linked) back to the url it was compiled
-    // with. WEAK, so a module V8 still keeps — a dependency linked into a live
-    // graph, a function of a disposed realm's module another realm holds —
-    // answers whether its wrapper (or its realm) is still around or not, and
-    // one V8 collected is pruned instead of pinned (`add_url`).
-    urls: HashMap<i32, Vec<(v8::Weak<v8::Module>, String)>>,
+    // identity hash -> (module, what it was compiled with): a Local<Module> V8
+    // hands a callback (import.meta, a referrer being linked) back to the url
+    // it was compiled with, and the host-defined value it was given. WEAK, so a
+    // module V8 still keeps — a dependency linked into a live graph, a function
+    // of a disposed realm's module another realm holds — answers whether its
+    // wrapper (or its realm) is still around or not, and one V8 collected is
+    // pruned instead of pinned (`add_url`).
+    urls: HashMap<i32, Vec<(v8::Weak<v8::Module>, ModuleOrigin)>>,
     // `add_url`'s amortization: entries added since the last prune, and the
     // entries that prune left.
     added_since_prune: usize,
@@ -918,7 +969,7 @@ impl ModuleReg {
     // as many have been added since the last prune as it left — a scan
     // amortized O(1) per compile, keeping the index within about twice the
     // modules alive.
-    fn add_url(&mut self, hash: i32, module: v8::Weak<v8::Module>, url: String) {
+    fn add_url(&mut self, hash: i32, module: v8::Weak<v8::Module>, origin: ModuleOrigin) {
         if self.added_since_prune > self.kept_at_prune {
             self.urls.retain(|_, bucket| {
                 bucket.retain(|(module, _)| !module.is_empty());
@@ -928,8 +979,18 @@ impl ModuleReg {
             self.added_since_prune = 0;
         }
         self.added_since_prune += 1;
-        self.urls.entry(hash).or_default().push((module, url));
+        self.urls.entry(hash).or_default().push((module, origin));
     }
+}
+
+// What a module was compiled with, as a callback about it hands it on: its url
+// (the filename), and the host-defined value (`host_defined:`) its ScriptOrigin
+// carries, a primitive — V8 itself hands that to the dynamic-import hook of an
+// import() the module makes, but to no hook about the module itself.
+#[derive(Clone)]
+pub(crate) struct ModuleOrigin {
+    pub(crate) url: String,
+    pub(crate) host_defined: Option<v8::Global<v8::Value>>,
 }
 
 // Classic compiled scripts: id -> (unbound script, owning context id). An
@@ -955,6 +1016,60 @@ struct ScriptReg {
 // realm it was resolved in, so it holds that other realm's function until this
 // one is reset or the handle is released — as any reference this realm keeps
 // to it would.
+// The import() promises waiting for their host (DynamicImport): id -> the
+// promise's resolver and the realm the import() fired in, whose module it is
+// to settle with. An entry leaves as its import is settled, as its realm is
+// reset or disposed (no script of it is left to see the promise), or as its
+// DynamicImport wrapper is let go of unsettled (nothing can settle it any more:
+// the promise stays pending, as a fetch no one answers does). Ids are never
+// reused, so a stale id can only miss.
+#[derive(Default)]
+struct ImportReg {
+    by_id: HashMap<u64, (v8::Global<v8::PromiseResolver>, i32)>,
+    next_id: u64,
+}
+
+// A synthetic module's default export, until its evaluation steps set it
+// (synthetic_evaluation_steps): by the module's identity hash, the module
+// (weak: one never evaluated, then collected, is pruned) and the value, and the
+// realm both belong to.
+type KeptExport = (v8::Weak<v8::Module>, v8::Global<v8::Value>, i32);
+#[derive(Default)]
+pub(crate) struct SyntheticExports {
+    pub(crate) by_hash: HashMap<i32, Vec<KeptExport>>,
+    // `add`'s amortization, as ModuleReg::add_url's: entries added since the last
+    // prune, and the entries that prune left.
+    added_since_prune: usize,
+    kept_at_prune: usize,
+}
+
+impl SyntheticExports {
+    // Keep |value| for |module| of realm |cid|, first letting go of the values of
+    // modules collected unevaluated once as many were added since the last prune
+    // as it left.
+    pub(crate) fn add(
+        &mut self,
+        hash: i32,
+        module: v8::Weak<v8::Module>,
+        value: v8::Global<v8::Value>,
+        cid: i32,
+    ) {
+        if self.added_since_prune > self.kept_at_prune {
+            self.by_hash.retain(|_, exports| {
+                exports.retain(|(module, _, _)| !module.is_empty());
+                !exports.is_empty()
+            });
+            self.kept_at_prune = self.by_hash.values().map(Vec::len).sum();
+            self.added_since_prune = 0;
+        }
+        self.added_since_prune += 1;
+        self.by_hash
+            .entry(hash)
+            .or_default()
+            .push((module, value, cid));
+    }
+}
+
 #[derive(Default)]
 struct FunctionReg {
     by_id: HashMap<u64, FunctionEntry>,
@@ -972,6 +1087,7 @@ enum Released {
     Function(u64),
     Module(i32),
     Script(i32),
+    Import(u64),
 }
 
 // The V8 thread's realm registry: the main context (id 0, swappable by reset),
@@ -1062,14 +1178,20 @@ struct IsolateState {
     modules: ModuleReg,
     scripts: ScriptReg,
     functions: FunctionReg,
+    imports: ImportReg,
+    synthetic: SyntheticExports,
     active_realms: Vec<i32>,
     instantiating: bool,
+    // Set while a dynamic import's module is linked (finish_dynamic_import), so
+    // resolve_imported turns a raising block into the import's rejection rather
+    // than stashing it for a Ruby frame to re-raise.
+    settling_import: bool,
     watchdog_fired: bool,
     auto_microtasks: bool,
     draining: bool,
     // Back-pointer to the owning Core, so a V8 callback (host fn / module
     // resolver) — which holds only a scope — can reach Core.procs and
-    // Core.dynamic_import_resolver. Set once, after the Arc<Core> is built;
+    // Core.dynamic_import_handler. Set once, after the Arc<Core> is built;
     // valid for the whole isolate life (Core outlives the slot — the slot is
     // dropped during isolate disposal, which a live wrapper triggers). Null
     // only in the brief window before it is wired up.
@@ -1116,8 +1238,11 @@ impl IsolateState {
             modules: ModuleReg::default(),
             scripts: ScriptReg::default(),
             functions: FunctionReg::default(),
+            imports: ImportReg::default(),
+            synthetic: SyntheticExports::default(),
             active_realms: Vec::new(),
             instantiating: false,
+            settling_import: false,
             watchdog_fired: false,
             auto_microtasks,
             draining: false,
@@ -1287,6 +1412,11 @@ fn drop_context_artifacts(state: &mut IsolateState, context_id: i32) {
         .functions
         .by_id
         .retain(|_, entry| entry.context_id != context_id);
+    // Its import() promises are no script's to see any more.
+    state.imports.by_id.retain(|_, (_, cid)| *cid != context_id);
+    for exports in state.synthetic.by_hash.values_mut() {
+        exports.retain(|(_, _, cid)| *cid != context_id);
+    }
     // A promise-reject recorder created in this context is unusable now.
     if state
         .realms
@@ -1310,11 +1440,14 @@ fn script_handle(
         .map(|(g, cid)| (g.clone(), *cid))
 }
 
-// A compiled module's url (the filename it was compiled with), by identity in
-// the weak url index (ModuleReg.urls) — for as long as V8 keeps the module. Used
-// to give a referrer its url for the resolve round-trip and to fill
-// import.meta.url.
-fn module_url(scope: &mut v8::PinScope<'_, '_>, module: v8::Local<v8::Module>) -> Option<String> {
+// What a compiled module was compiled with (its url — the filename — and its
+// host-defined value), by identity in the weak url index (ModuleReg.urls) — for
+// as long as V8 keeps the module. Used to give a referrer its url for the
+// resolve round-trip and to fill import.meta.
+fn origin_of_module(
+    scope: &mut v8::PinScope<'_, '_>,
+    module: v8::Local<v8::Module>,
+) -> Option<ModuleOrigin> {
     let hash = module.get_identity_hash().get();
     // A shared borrow of the slot beside the shared one to_local takes.
     scope
@@ -1324,42 +1457,113 @@ fn module_url(scope: &mut v8::PinScope<'_, '_>, module: v8::Local<v8::Module>) -
         .get(&hash)?
         .iter()
         .find(|(weak, _)| weak.to_local(scope) == Some(module))
-        .map(|(_, url)| url.clone())
+        .map(|(_, origin)| origin.clone())
+}
+
+fn module_url(scope: &mut v8::PinScope<'_, '_>, module: v8::Local<v8::Module>) -> Option<String> {
+    origin_of_module(scope, module).map(|origin| origin.url)
+}
+
+// The host-defined options a ScriptOrigin carries for `host_defined:` — a
+// PrimitiveArray holding the value alone — or None for none. A value that is
+// no primitive is refused before it gets here (`host_defined_arg`).
+pub(crate) fn host_defined_options<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: Option<&JsVal>,
+) -> Option<v8::Local<'s, v8::Data>> {
+    let value = marshal::jsval_to_js(scope, value?.clone());
+    let primitive = v8::Local::<v8::Primitive>::try_from(value).ok()?;
+    let options = v8::PrimitiveArray::new(scope, 1);
+    options.set(scope, 0, primitive);
+    Some(options.into())
+}
+
+// …and back: the value the host-defined options V8 hands a hook hold — their
+// first element, as any embedder that sets a PrimitiveArray of its own
+// (rather than through `host_defined:`) puts it there — or None.
+fn host_defined_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    options: v8::Local<'s, v8::Data>,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let options = v8::Local::<v8::FixedArray>::try_from(options).ok()?;
+    let first = options.get(scope, 0)?;
+    v8::Local::<v8::Value>::try_from(first).ok()
+}
+
+// The import attributes V8 hands a hook, as (key, value) pairs: `stride` 3 for
+// a module request's (key, value, source offset), 2 for a dynamic import's.
+fn import_attributes_of(
+    scope: &mut v8::PinScope<'_, '_>,
+    attributes: v8::Local<v8::FixedArray>,
+    stride: usize,
+) -> Vec<(String, String)> {
+    let mut pairs = Vec::with_capacity(attributes.length() / stride);
+    for at in (0..attributes.length()).step_by(stride) {
+        let text = |scope: &mut v8::PinScope<'_, '_>, i: usize| {
+            attributes
+                .get(scope, i)
+                .and_then(|d| v8::Local::<v8::Value>::try_from(d).ok())
+                .map(|v| v.to_rust_string_lossy(scope))
+        };
+        if let (Some(key), Some(value)) = (text(scope, at), text(scope, at + 1)) {
+            pairs.push((key, value));
+        }
+    }
+    pairs
 }
 
 // V8 calls this the first time a module reads import.meta. Fills in
-// import.meta.url with the module's compile-time url (filename); other
-// properties are left to the module system / embedder.
+// import.meta.url with the module's compile-time url (filename), then hands the
+// object to its realm's import-meta handler (NS.setImportMetaHandler), if it has
+// one, as `handler(meta, url, hostDefined)` — HTML's
+// HostGetImportMetaProperties, whose `resolve` only the host can make. What the
+// handler throws is dropped: there is no script of the page's to throw it at.
 unsafe extern "C" fn import_meta_cb(
     context: v8::Local<v8::Context>,
     module: v8::Local<v8::Module>,
     meta: v8::Local<v8::Object>,
 ) {
     v8::callback_scope!(unsafe scope, context);
-    let Some(url) = module_url(scope, module) else {
+    let Some(origin) = origin_of_module(scope, module) else {
         return;
     };
-    if let (Some(key), Some(val)) = (v8::String::new(scope, "url"), v8::String::new(scope, &url)) {
-        meta.create_data_property(scope, key.into(), val.into());
+    let Some(url) = v8::String::new(scope, &origin.url) else {
+        return;
+    };
+    if let Some(key) = v8::String::new(scope, "url") {
+        meta.create_data_property(scope, key.into(), url.into());
     }
+    let global = context.global(scope);
+    let key = import_meta_key(scope);
+    let Some(handler) = global
+        .get_private(scope, key)
+        .and_then(|h| v8::Local::<v8::Function>::try_from(h).ok())
+    else {
+        return;
+    };
+    let host_defined: v8::Local<v8::Value> = match origin.host_defined {
+        Some(value) => v8::Local::new(scope, value),
+        None => v8::undefined(scope).into(),
+    };
+    v8::tc_scope!(let tc, scope);
+    let receiver = v8::undefined(tc).into();
+    handler.call(tc, receiver, &[meta.into(), url.into(), host_defined]);
 }
 
-// V8 calls this per import edge during InstantiateModule (and while
-// finish_dynamic_import links a dynamically-imported module). Maps the referrer
-// to its url and calls the Ruby resolver INLINE (reacquiring the GVL): the
-// static instantiate block parked in the slot for this op, or — when none is
-// parked (a dynamic import's auto-link) — the Context's dynamic_import_resolver.
+// V8 calls this per import edge during InstantiateModule (and while a dynamic
+// import is settled with a module to link — DynamicImport#resolve). Maps the
+// referrer to its url and calls the Ruby resolve block parked in the slot for
+// the op INLINE (reacquiring the GVL), with the request's import attributes.
 fn resolve_imported<'s>(
     context: v8::Local<'s, v8::Context>,
     specifier: v8::Local<'s, v8::String>,
-    _import_attributes: v8::Local<'s, v8::FixedArray>,
+    import_attributes: v8::Local<'s, v8::FixedArray>,
     referrer: v8::Local<'s, v8::Module>,
 ) -> Option<v8::Local<'s, v8::Module>> {
     v8::callback_scope!(unsafe scope, context);
     let spec = specifier.to_rust_string_lossy(scope);
     let ref_url = module_url(scope, referrer)?;
-    // The realm being linked (this callback's own context). Computed up front so
-    // it both rides along to the dynamic_import_resolver AND backs the
+    // The realm being linked (this callback's own context), for the
     // foreign-context check below; for a real module context it is always Some.
     let here = id_of_context(scope, context);
     let core_ptr = istate!(scope).core_ptr;
@@ -1367,51 +1571,45 @@ fn resolve_imported<'s>(
         return None;
     }
     let core = unsafe { &*core_ptr };
-    // The static instantiate block parked for THIS op (Some) vs a dynamic
-    // import's auto-link (None -> dynamic_import_resolver, with the initiating
-    // realm so it can resolve per-realm).
-    let instantiate = istate!(scope).instantiate_resolve.as_ref().map(|r| r.get());
-    let mut dynamic_err = None;
-    let dep_id = match instantiate {
-        Some(resolve) => {
-            // The error conversion happens INSIDE with_gvl: error_to_exception
-            // calls into Ruby (so it can allocate, so it can GC) and BoxValue::new
-            // registers a GC root — neither is safe with the GVL released.
-            match with_gvl(core, RubyCall::Resolver(&spec), || {
-                resolve_module_via_ruby(core, resolve, &spec, &ref_url, None)
-                    .map_err(|e| error_to_exception(&e).map(BoxValue::new))
-            }) {
-                Ok(id) => id,
-                // Stash the resolver's own raised exception (GC-rooted) so the
-                // InstantiateModule op can re-raise it with its original class
-                // instead of a generic "failed to link".
-                Err(exc) => {
-                    istate!(scope).instantiate_resolve_err = exc;
-                    None
-                }
+    let attributes = import_attributes_of(scope, import_attributes, 3);
+    let resolve = istate!(scope).instantiate_resolve.as_ref().map(|r| r.get());
+    // Linking for a dynamic import (DynamicImport#resolve) has no Ruby frame to
+    // re-raise a raising block into — the failure becomes the import()'s
+    // rejection — so the block's own message travels out as the JS error.
+    let settling = istate!(scope).settling_import;
+    let mut failure = None;
+    let dep_id = match resolve {
+        Some(resolve) if settling => match with_gvl(core, RubyCall::Resolver(&spec), || {
+            // Rendering the message reads the Ruby exception, so it stays
+            // inside with_gvl.
+            resolve_module_via_ruby(core, resolve, &spec, &ref_url, &attributes)
+                .map_err(|e| e.to_string())
+        }) {
+            Ok(id) => id,
+            Err(why) => {
+                failure = Some(why);
+                None
             }
-        }
-        None => {
-            match core.dynamic_import_resolver() {
-                Some(p) => match with_gvl(core, RubyCall::Resolver(&spec), || {
-                    resolve_module_via_ruby(core, p, &spec, &ref_url, Some(here.unwrap_or(0)))
-                        // Rendering the message reads the Ruby exception, so it too
-                        // stays inside with_gvl.
-                        .map_err(|e| e.to_string())
-                }) {
-                    Ok(id) => id,
-                    // Unlike the static branch there is no Ruby frame waiting to
-                    // re-raise into — this failure becomes the import()'s promise
-                    // rejection — so the resolver's own message has to travel out
-                    // as the JS error or it is lost.
-                    Err(why) => {
-                        dynamic_err = Some(why);
-                        None
-                    }
-                },
-                None => None,
+        },
+        // The error conversion happens INSIDE with_gvl: error_to_exception
+        // calls into Ruby (so it can allocate, so it can GC) and BoxValue::new
+        // registers a GC root — neither is safe with the GVL released.
+        Some(resolve) => match with_gvl(core, RubyCall::Resolver(&spec), || {
+            resolve_module_via_ruby(core, resolve, &spec, &ref_url, &attributes)
+                .map_err(|e| error_to_exception(&e).map(BoxValue::new))
+        }) {
+            Ok(id) => id,
+            // Stash the resolver's own raised exception (GC-rooted) so the
+            // InstantiateModule op can re-raise it with its original class
+            // instead of a generic "failed to link".
+            Err(exc) => {
+                istate!(scope).instantiate_resolve_err = exc;
+                None
             }
-        }
+        },
+        // No block: a module handed to DynamicImport#resolve unlinked, with
+        // nothing to link its imports by.
+        None => None,
     };
     // From here on, every exit that isn't a module throws first. V8 has no
     // channel for "why" — it just sees an empty return, installs no error of its
@@ -1420,9 +1618,8 @@ fn resolve_imported<'s>(
     // where it came from, which is the single most common module wiring mistake.
     // (The two bails above stay silent: both are broken internal state, not
     // anything the caller did.) The one path that must also stay silent is a
-    // STATIC resolver that raised — its own Ruby exception is already stashed
-    // for instantiate_module to re-raise, and ours would mask it. The dynamic
-    // branch has no such frame, so it carries its message in dynamic_err.
+    // block that raised for Module#instantiate — its own Ruby exception is
+    // already stashed for instantiate_module to re-raise, and ours would mask it.
     let raised = istate!(scope).instantiate_resolve_err.is_some();
     let fail = |scope: &mut v8::PinScope<'_, '_>, message: String| {
         if !raised {
@@ -1432,7 +1629,7 @@ fn resolve_imported<'s>(
     };
     let import = format!("{spec:?} imported from {ref_url}");
     let Some(dep_id) = dep_id else {
-        return match dynamic_err {
+        return match failure {
             Some(why) => fail(scope, format!("{why} (resolving {import})")),
             None => fail(
                 scope,
@@ -1440,10 +1637,8 @@ fn resolve_imported<'s>(
             ),
         };
     };
-    // The dep must live in the context actually being linked — the auto-link of
-    // a dynamic import runs in whatever realm import() fired in, which kAuto can
-    // detach from the request that started it. A foreign-context module would
-    // V8-CHECK-abort.
+    // The dep must live in the context actually being linked; a foreign-context
+    // module would V8-CHECK-abort.
     let found = istate!(scope)
         .modules
         .by_id
@@ -1474,70 +1669,119 @@ fn resolve_imported<'s>(
     Some(v8::Local::new(scope, &g))
 }
 
-// V8 calls this for a JS `import(specifier)`. Returns a Promise fulfilled with
-// the resolved module's namespace (or rejected). Calls the Context's
-// dynamic_import_resolver INLINE (reacquiring the GVL). The resolver may return
-// a merely COMPILED module: per V8's host contract, link + evaluate happen here
-// (finish_dynamic_import).
+// V8 calls this for a JS `import(specifier, options)`. Returns a promise the
+// HOST settles — now or on a later task — through the RustyRacer::DynamicImport
+// handed to the Isolate's dynamic_import_handler (called INLINE, reacquiring the
+// GVL): with a module (DynamicImport#resolve), which per V8's host contract is
+// linked and evaluated here (finish_dynamic_import), or with a rejection value.
+// The promise waits in ImportReg until then; a handler that raises rejects it
+// with its message, unless it settled it first.
 fn dynamic_import_cb<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    _host_defined_options: v8::Local<'s, v8::Data>,
+    host_defined_options: v8::Local<'s, v8::Data>,
     resource_name: v8::Local<'s, v8::Value>,
     specifier: v8::Local<'s, v8::String>,
-    _import_attributes: v8::Local<'s, v8::FixedArray>,
+    import_attributes: v8::Local<'s, v8::FixedArray>,
 ) -> Option<v8::Local<'s, v8::Promise>> {
     let resolver = v8::PromiseResolver::new(scope)?;
     let promise = resolver.get_promise(scope);
-    let reject = |scope: &mut v8::PinScope<'s, '_>, msg: &str| {
-        reject_with_error(scope, resolver, msg);
-    };
-    let spec = specifier.to_rust_string_lossy(scope);
-    let referrer = resource_name.to_rust_string_lossy(scope);
-    // The realm import() fired in — handed to the resolver as a Context so it can
-    // resolve/compile the module in the right realm (e.g. an iframe's), not the
-    // main one.
-    let initiating = id_of_context(scope, scope.get_current_context()).unwrap_or(0);
     let core_ptr = istate!(scope).core_ptr;
-    if core_ptr.is_null() {
-        reject(scope, "dynamic import has no owner");
+    let core = (!core_ptr.is_null()).then(|| unsafe { &*core_ptr });
+    let Some((core, handler)) = core.and_then(|core| Some((core, core.dynamic_import_handler()?)))
+    else {
+        reject_with_error(
+            scope,
+            resolver,
+            "import() is not supported: no dynamic_import_handler",
+        );
         return Some(promise);
-    }
-    let core = unsafe { &*core_ptr };
-    let id = match core.dynamic_import_resolver() {
-        // A raising resolver only fails the import() (it rejects generically);
-        // it must NOT abort the surrounding eval, so swallow the Err here.
-        Some(p) => with_gvl(core, RubyCall::Resolver(&spec), || {
-            resolve_module_via_ruby(core, p, &spec, &referrer, Some(initiating))
-        })
-        .unwrap_or(None),
-        None => None,
     };
-    match id {
-        Some(id) => {
-            // The resolved module must live in the context import() ACTUALLY
-            // ran in — a foreign-context module would V8-CHECK-abort. Use the
-            // scope's current context, not the request's: under kAuto a
-            // microtask queued by realm B can run import() during the drain at
-            // the end of realm A's request, so the running realm is the truth.
-            let current = scope.get_current_context();
-            let here = id_of_context(scope, current);
-            let g = istate!(scope)
-                .modules
-                .by_id
-                .get(&id)
-                .filter(|(_, cid)| Some(*cid) == here)
-                .map(|(g, _)| g.clone());
-            match g {
-                Some(g) => {
-                    let module = v8::Local::new(scope, &g);
-                    finish_dynamic_import(scope, module, resolver);
-                }
-                None => reject(scope, "resolved module not found"),
-            }
+    let specifier = specifier.to_rust_string_lossy(scope);
+    // The script import() was called from, by the name it was compiled under
+    // (none: e.g. a function made by `new Function` of no script's).
+    let referrer = resource_name
+        .is_string()
+        .then(|| resource_name.to_rust_string_lossy(scope));
+    let attributes = import_attributes_of(scope, import_attributes, 2);
+    let host_defined = host_defined_value(scope, host_defined_options)
+        .map(|value| marshal::js_to_jsval(scope, value));
+    // The realm import() fired in — whose module the promise is to settle with,
+    // and whose Context the handler is handed. Under kAuto a microtask queued by
+    // realm B can run import() during the drain at the end of realm A's request,
+    // so the running realm is the truth, not the request's.
+    // (…a function of a realm reset or disposed since — another realm holds it — imports nothing: no realm is its)
+    let current = scope.get_current_context();
+    let Some(context_id) = id_of_context(scope, current) else {
+        reject_with_error(scope, resolver, "import() of a realm that is gone");
+        return Some(promise);
+    };
+    let kept = v8::Global::new(scope, resolver);
+    let id = {
+        let imports = &mut istate!(scope).imports;
+        imports.next_id += 1;
+        imports.by_id.insert(imports.next_id, (kept, context_id));
+        imports.next_id
+    };
+    let raised = with_gvl(core, RubyCall::Resolver(&specifier), || {
+        let Some(core) = core.me.upgrade() else {
+            return Some("the isolate is gone".to_owned());
+        };
+        let import = DynamicImport {
+            core,
+            id,
+            context_id,
+            specifier: specifier.clone(),
+            referrer,
+            attributes,
+            host_defined,
+            settled: AtomicBool::new(false),
+        };
+        handler
+            .call::<_, Value>((import,))
+            .err()
+            .map(|e| e.to_string())
+    });
+    if let Some(why) = raised {
+        let pending = istate!(scope).imports.by_id.remove(&id);
+        if let Some((resolver, _)) = pending {
+            let resolver = v8::Local::new(scope, resolver);
+            reject_with_error(scope, resolver, &why);
         }
-        None => reject(scope, "import() was not resolved to a module"),
     }
     Some(promise)
+}
+
+// V8 calls this as a synthetic module (op_create_synthetic_module) evaluates:
+// its `default` export set to the value kept for it, which it then lets go of.
+// Returns a fulfilled promise, as a module's evaluation does.
+fn synthetic_evaluation_steps<'s>(
+    context: v8::Local<'s, v8::Context>,
+    module: v8::Local<'s, v8::Module>,
+) -> Option<v8::Local<'s, v8::Value>> {
+    v8::callback_scope!(unsafe scope, context);
+    let hash = module.get_identity_hash().get();
+    let at = scope
+        .get_slot::<IsolateState>()?
+        .synthetic
+        .by_hash
+        .get(&hash)?
+        .iter()
+        .position(|(weak, _, _)| weak.to_local(scope) == Some(module));
+    let kept = at.and_then(|at| {
+        let exports = istate!(scope).synthetic.by_hash.get_mut(&hash)?;
+        let (_, value, _) = exports.remove(at);
+        Some(value)
+    });
+    let value: v8::Local<v8::Value> = match kept {
+        Some(value) => v8::Local::new(scope, value),
+        None => v8::undefined(scope).into(),
+    };
+    let name = v8::String::new(scope, "default")?;
+    module.set_synthetic_module_export(scope, name, value)?;
+    let resolver = v8::PromiseResolver::new(scope)?;
+    let undefined = v8::undefined(scope).into();
+    resolver.resolve(scope, undefined);
+    Some(resolver.get_promise(scope).into())
 }
 
 // The on-fulfilled handler for finish_dynamic_import's native then: ignores
@@ -1552,16 +1796,15 @@ fn dyn_import_namespace_cb(
     rv.set(args.data());
 }
 
-// Complete a dynamic import with the module the resolver named. V8's
+// Complete a dynamic import with the module the host settled it with. V8's
 // HostImportModuleDynamicallyCallback contract makes load -> link -> evaluate
-// the HOST's responsibility, so a freshly compiled (unevaluated) module is
-// linked and evaluated right here; static imports met while linking resolve
-// through the same dynamic_import_resolver (pump's ResolveModule fallback).
+// the HOST's responsibility, so a merely compiled module is linked (by the
+// block DynamicImport#resolve parked) and evaluated right here.
 // The import() promise is settled FROM the evaluation promise, which handles
 // sync completion, a thrown error, and top-level await uniformly — and since
 // V8's Module::Evaluate is idempotent (an Evaluated module returns its
-// existing top-level promise), the registry-hit case costs nothing extra.
-fn finish_dynamic_import(
+// existing top-level promise), a module evaluated already costs nothing extra.
+pub(crate) fn finish_dynamic_import(
     scope: &mut v8::PinScope<'_, '_>,
     module: v8::Local<v8::Module>,
     resolver: v8::Local<v8::PromiseResolver>,
@@ -1578,8 +1821,12 @@ fn finish_dynamic_import(
             );
             return;
         }
+        // (…a block that raises failing the import: resolve_imported's `settling_import` — set for the link alone, not
+        // for the evaluation after it, whose own Module#instantiate re-raises as it always does)
         istate!(tc).instantiating = true;
+        istate!(tc).settling_import = true;
         let linked = module.instantiate_module(tc, resolve_imported);
+        istate!(tc).settling_import = false;
         istate!(tc).instantiating = false;
         if linked != Some(true) {
             // A watchdog/terminate that landed during linking must escalate to
@@ -1763,7 +2010,7 @@ struct Core {
     // each `run`.
     depth: std::sync::atomic::AtomicU32,
     // Everything this isolate keeps alive on the Ruby side — the attached host fns
-    // and the dynamic-import resolver — in one Array the wrappers MARK (and pin).
+    // and the dynamic-import handler — in one Array the wrappers MARK (and pin).
     // See the module header for why these must not be GC roots; ROOT_* for the
     // layout. Read on the V8 side without the GVL (the import hooks), which is
     // sound because the entries are pinned and nothing here allocates or raises.
@@ -1862,7 +2109,25 @@ struct JsFunction {
     disposed: AtomicBool,
 }
 
-// The five wrappers that hold an Arc<Core> all mark the isolate's roots, because any
+// An import() waiting for its host (dynamic_import_cb), handed to the
+// Isolate's dynamic_import_handler: what was asked — the specifier, the import
+// attributes, the referring script's name and host-defined value — and in
+// which realm, until #resolve / #reject / #reject_with settles it (ImportReg
+// keeps the promise). Let go of unsettled, the promise is let go of too.
+#[derive(TypedData)]
+#[magnus(class = "RustyRacer::DynamicImport", mark)]
+struct DynamicImport {
+    core: Arc<Core>,
+    id: u64,
+    context_id: i32,
+    specifier: String,
+    referrer: Option<String>,
+    attributes: Vec<(String, String)>,
+    host_defined: Option<JsVal>,
+    settled: AtomicBool,
+}
+
+// The six wrappers that hold an Arc<Core> all mark the isolate's roots, because any
 // one of them may be the last one reachable: Ruby code is free to keep only the
 // Context a `Isolate#context` handed it, or only a Module, and the host fns must
 // stay callable through it. Marking the same array five times costs nothing (the GC
@@ -1881,6 +2146,7 @@ marks_core_roots!(Context);
 marks_core_roots!(JsModule);
 marks_core_roots!(Script);
 marks_core_roots!(JsFunction);
+marks_core_roots!(DynamicImport);
 
 // Set true once V8 is initialized; Platform.set_flags! refuses after that
 // (flags must be set before V8::initialize), like mini_racer's
@@ -2065,6 +2331,30 @@ fn set_promise_reject_handler(
             istate!(scope).realms.promise_reject_handler = None;
         }
     }
+}
+
+// NS.setImportMetaHandler(fn | null): register (or clear) the realm's handler
+// import_meta_cb hands each of its modules' import.meta to, as it is first
+// read — the realm whose namespace is called, whose global keeps it under a
+// private key (import_meta_key), so it goes with the realm, a reset's included,
+// and a realm init hook may set it before the realm is filed.
+fn set_import_meta_handler(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let global = scope.get_current_context().global(scope);
+    let key = import_meta_key(scope);
+    match v8::Local::<v8::Function>::try_from(args.get(0)) {
+        Ok(f) => global.set_private(scope, key, f.into()),
+        Err(_) => global.delete_private(scope, key),
+    };
+}
+
+// The private key a realm's global keeps its import-meta handler under.
+fn import_meta_key<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Private> {
+    let name = v8::String::new(scope, "rusty_racer:import_meta_handler").expect("a short string");
+    v8::Private::for_api(scope, Some(name))
 }
 
 // NS.transferOut(arrayBufferOrView) -> a positive integer token, or 0 when the
@@ -2511,7 +2801,7 @@ fn install_host_namespace(
     } else {
         v8::Object::new(scope)
     };
-    let members: [(&str, Option<v8::Local<v8::Function>>); 9] = [
+    let members: [(&str, Option<v8::Local<v8::Function>>); 10] = [
         (
             "drainMicrotasks",
             v8::Function::new(scope, drain_microtasks),
@@ -2521,6 +2811,10 @@ fn install_host_namespace(
         (
             "setPromiseRejectHandler",
             v8::Function::new(scope, set_promise_reject_handler),
+        ),
+        (
+            "setImportMetaHandler",
+            v8::Function::new(scope, set_import_meta_handler),
         ),
         ("transferOut", v8::Function::new(scope, transfer_out)),
         ("transferIn", v8::Function::new(scope, transfer_in)),
@@ -2722,7 +3016,7 @@ impl Isolate {
         // :auto/:explicit distinction lives in auto_microtasks (read by
         // auto_drain).
         isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
-        // JS import() routes here; rejects unless a dynamic_import_resolver is set.
+        // JS import() routes here; rejects unless a dynamic_import_handler is set.
         isolate.set_host_import_module_dynamically_callback(dynamic_import_cb);
         // Fills import.meta.url (the module's compile-time filename) on first access.
         isolate.set_host_initialize_import_meta_object_callback(import_meta_cb);
@@ -2775,7 +3069,7 @@ impl Isolate {
         // owner check.
         use magnus::rb_sys::{AsRawValue, FromRawValue};
         let owner_thread = unsafe { Value::from_raw(rb_sys::rb_thread_current()) };
-        // The roots array (see ROOT_IMPORT_RESOLVER): created empty, grown by the
+        // The roots array (see ROOT_IMPORT_HANDLER): created empty, grown by the
         // first attach. Nothing roots it — the wrappers mark it, so it lives
         // exactly as long as this isolate is reachable from Ruby.
         let roots = ruby.ary_new();
@@ -3094,7 +3388,7 @@ impl Core {
             .clone()
     }
 
-    // ── the roots array (see the module header + ROOT_IMPORT_RESOLVER) ──────
+    // ── the roots array (see the module header + ROOT_IMPORT_HANDLER) ──────
     // Keep `val` alive for as long as this isolate is reachable from Ruby. On a
     // Ruby thread with the GVL: storing can grow the Array, which allocates.
     fn root_store<T: magnus::IntoValue>(
@@ -3469,6 +3763,7 @@ impl Core {
         cached_data: Option<Vec<u8>>,
         produce_cache: bool,
         eager: bool,
+        host_defined: Option<JsVal>,
     ) -> Result<Compiled, Error> {
         let reply = self.run(
             ruby,
@@ -3479,6 +3774,7 @@ impl Core {
                 cached_data,
                 produce_cache,
                 eager,
+                host_defined,
             },
         )?;
         match reply {
@@ -3569,6 +3865,109 @@ impl Core {
         self.reply_value(ruby, reply)
     }
 
+    // [[specifier, attributes], …], each request's attributes a Hash (attributes_hash).
+    fn module_requests(&self, ruby: &Ruby, module_id: i32) -> Result<Value, Error> {
+        let JsVal::Array { items, .. } =
+            (match self.run(ruby, Request::ModuleRequests { module_id })? {
+                VmReply::Done(Ok(value)) => value,
+                VmReply::Done(Err(e)) => return Err(vm_err(ruby, e)),
+                _ => {
+                    return Err(Error::new(
+                        err_class(ruby, "InternalError"),
+                        "internal: unexpected requests reply",
+                    ));
+                }
+            })
+        else {
+            return Err(Error::new(
+                err_class(ruby, "InternalError"),
+                "internal: unexpected requests reply",
+            ));
+        };
+        let requests = ruby.ary_new_capa(items.len());
+        for item in items {
+            let JsVal::Array { items: pair, .. } = item else {
+                continue;
+            };
+            let (Some(JsVal::Str(specifier)), Some(JsVal::Obj { entries, .. })) =
+                (pair.first(), pair.get(1))
+            else {
+                continue;
+            };
+            let attributes: Vec<(String, String)> = entries
+                .iter()
+                .filter_map(|(key, value)| match value {
+                    JsVal::Str(value) => Some((key.clone(), value.clone())),
+                    _ => None,
+                })
+                .collect();
+            requests.push(ruby.ary_new_from_values(&[
+                ruby.str_new(specifier).as_value(),
+                attributes_hash(ruby, &attributes)?.as_value(),
+            ]))?;
+        }
+        Ok(requests.as_value())
+    }
+
+    // A synthetic module of the realm's (Request::CreateSyntheticModule): its id.
+    fn synthetic_module(
+        &self,
+        ruby: &Ruby,
+        context_id: i32,
+        filename: String,
+        export: SyntheticExport,
+    ) -> Result<i32, Error> {
+        let reply = self.run(
+            ruby,
+            Request::CreateSyntheticModule {
+                context_id,
+                filename,
+                export,
+                timeout_ms: self.default_timeout_ms,
+            },
+        )?;
+        match reply {
+            VmReply::Done(Ok(JsVal::Int(id))) => Ok(id as i32),
+            VmReply::Done(Err(e)) => Err(vm_err(ruby, e)),
+            _ => Err(Error::new(
+                err_class(ruby, "InternalError"),
+                "internal: unexpected synthetic module reply",
+            )),
+        }
+    }
+
+    // Settle the waiting import() |import_id| (Request::SettleImport): whether it
+    // was still waiting. A module is linked by |resolve| (parked as
+    // instantiate_module parks its block, the outer op's put back after).
+    fn settle_import(
+        &self,
+        ruby: &Ruby,
+        import_id: u64,
+        settle: Settle,
+        resolve: Option<Proc>,
+    ) -> Result<bool, Error> {
+        self.ensure_owner_and_live(ruby)?;
+        let parked = resolve.map(|p| RootedProc(BoxValue::new(p)));
+        let (saved_resolve, saved_err) = self.swap_instantiate(parked, None);
+        let reply = self.run(
+            ruby,
+            Request::SettleImport {
+                import_id,
+                settle,
+                timeout_ms: self.default_timeout_ms,
+            },
+        );
+        self.swap_instantiate(saved_resolve, saved_err);
+        match reply? {
+            VmReply::Done(Ok(JsVal::Bool(settled))) => Ok(settled),
+            VmReply::Done(Err(e)) => Err(vm_err(ruby, e)),
+            _ => Err(Error::new(
+                err_class(ruby, "InternalError"),
+                "internal: unexpected import reply",
+            )),
+        }
+    }
+
     // Classic script: compile, run, dispose.
     #[allow(clippy::too_many_arguments)]
     fn compile_script(
@@ -3580,6 +3979,7 @@ impl Core {
         cached_data: Option<Vec<u8>>,
         produce_cache: bool,
         eager: bool,
+        host_defined: Option<JsVal>,
     ) -> Result<Compiled, Error> {
         let reply = self.run(
             ruby,
@@ -3590,6 +3990,7 @@ impl Core {
                 cached_data,
                 produce_cache,
                 eager,
+                host_defined,
             },
         )?;
         match reply {
@@ -3630,15 +4031,16 @@ impl Core {
     // Owner-thread only, like every other writer of the roots array (`attach`,
     // `attach_many`, `dispose`): the store can REALLOC the array's element storage, and
     // the import hooks read that storage with the GVL released.
-    fn set_dynamic_import_resolver(&self, ruby: &Ruby, proc: Proc) -> Result<(), Error> {
+    // (…nil clearing it: an import() rejected then)
+    fn set_dynamic_import_handler(&self, ruby: &Ruby, proc: Option<Proc>) -> Result<(), Error> {
         self.ensure_owner_and_live(ruby)?;
-        self.root_store(ruby, ROOT_IMPORT_RESOLVER, proc)
+        self.root_store(ruby, ROOT_IMPORT_HANDLER, proc)
     }
 
-    // The resolver, or None if none was set. Read on the V8 side without the GVL —
+    // The handler, or None if none was set. Read on the V8 side without the GVL —
     // see root_proc.
-    fn dynamic_import_resolver(&self) -> Option<Proc> {
-        self.root_proc(ROOT_IMPORT_RESOLVER)
+    fn dynamic_import_handler(&self) -> Option<Proc> {
+        self.root_proc(ROOT_IMPORT_HANDLER)
     }
 
     // Terminate whatever is running. IsolateHandle is Send + refcounted —
@@ -3858,9 +4260,14 @@ impl Isolate {
     fn pump_message_loop(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
         rb_self.core.pump_message_loop(ruby)
     }
-    // dynamic_import_resolver = ->(specifier, referrer_url) { module } for import().
-    fn set_dynamic_import_resolver(ruby: &Ruby, rb_self: &Self, proc: Proc) -> Result<(), Error> {
-        rb_self.core.set_dynamic_import_resolver(ruby, proc)
+    // dynamic_import_handler = ->(import) { ... } for import(): handed each one's
+    // RustyRacer::DynamicImport.
+    fn set_dynamic_import_handler(
+        ruby: &Ruby,
+        rb_self: &Self,
+        proc: Option<Proc>,
+    ) -> Result<(), Error> {
+        rb_self.core.set_dynamic_import_handler(ruby, proc)
     }
     fn dispose(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
         rb_self.core.dispose(ruby)
@@ -3954,6 +4361,7 @@ impl Context {
         rb_self.check_live(ruby)?;
         rb_self.core.reset(ruby, rb_self.id)
     }
+    #[allow(clippy::too_many_arguments)]
     fn compile_module(
         ruby: &Ruby,
         rb_self: &Self,
@@ -3962,9 +4370,11 @@ impl Context {
         cached_data: Option<magnus::RString>,
         produce_cache: bool,
         eager: bool,
+        host_defined: Value,
     ) -> Result<JsModule, Error> {
         rb_self.check_live(ruby)?;
         let cache_in = binary_bytes(ruby, cached_data)?;
+        let host_defined = host_defined_arg(ruby, host_defined)?;
         let cm = rb_self.core.compile_module(
             ruby,
             rb_self.id,
@@ -3973,17 +4383,57 @@ impl Context {
             cache_in,
             produce_cache,
             eager,
+            host_defined,
         )?;
-        Ok(JsModule {
-            core: rb_self.core.clone(),
-            module_id: cm.id,
+        Ok(rb_self.module(cm.id, cm.cached_data, cm.cache_rejected))
+    }
+    fn module(
+        &self,
+        module_id: i32,
+        cached_data: Option<Vec<u8>>,
+        cache_rejected: bool,
+    ) -> JsModule {
+        JsModule {
+            core: self.core.clone(),
+            module_id,
             disposed: AtomicBool::new(false),
-            cached_data: cm.cached_data,
-            cache_rejected: cm.cache_rejected,
-        })
+            cached_data,
+            cache_rejected,
+        }
+    }
+    // _synthetic_module(filename, kind, payload, args): a module exporting
+    // `default` alone — kind 0: payload marshalled; 1: payload a JSON text,
+    // %JSON.parse%d; 2: payload a function path, called with args.
+    fn synthetic_module(
+        ruby: &Ruby,
+        rb_self: &Self,
+        filename: String,
+        kind: u8,
+        payload: Value,
+        args: RArray,
+    ) -> Result<JsModule, Error> {
+        rb_self.check_live(ruby)?;
+        let export = match kind {
+            0 => SyntheticExport::Value(ruby_to_jsval(payload)?),
+            1 => SyntheticExport::Json(String::try_convert(payload)?),
+            _ => SyntheticExport::Call {
+                path: String::try_convert(payload)?,
+                args: {
+                    let args: Vec<Value> = (0..args.len())
+                        .map(|i| args.entry::<Value>(i as isize))
+                        .collect::<Result<_, _>>()?;
+                    js_args(&args)?
+                },
+            },
+        };
+        let id = rb_self
+            .core
+            .synthetic_module(ruby, rb_self.id, filename, export)?;
+        Ok(rb_self.module(id, None, false))
     }
     // compile(source, filename:, cached_data:, produce_cache:, eager:) -> Script:
     // a classic <script>. Same cache semantics as compile_module.
+    #[allow(clippy::too_many_arguments)]
     fn compile(
         ruby: &Ruby,
         rb_self: &Self,
@@ -3992,9 +4442,11 @@ impl Context {
         cached_data: Option<magnus::RString>,
         produce_cache: bool,
         eager: bool,
+        host_defined: Value,
     ) -> Result<Script, Error> {
         rb_self.check_live(ruby)?;
         let cache_in = binary_bytes(ruby, cached_data)?;
+        let host_defined = host_defined_arg(ruby, host_defined)?;
         let cs = rb_self.core.compile_script(
             ruby,
             rb_self.id,
@@ -4003,6 +4455,7 @@ impl Context {
             cache_in,
             produce_cache,
             eager,
+            host_defined,
         )?;
         Ok(Script {
             core: rb_self.core.clone(),
@@ -4140,6 +4593,13 @@ impl JsModule {
     fn graph_async(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
         rb_self.check_live(ruby)?;
         rb_self.core.module_graph_async(ruby, rb_self.module_id)
+    }
+    // [[specifier, attributes], …]: the module's requests (V8 GetModuleRequests),
+    // each with its import attributes as a Hash, in source order — what linking
+    // it will ask its resolve block for. A synthetic module has none.
+    fn requests(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
+        rb_self.check_live(ruby)?;
+        rb_self.core.module_requests(ruby, rb_self.module_id)
     }
     // The bytecode cache produced at compile (produce_cache: true), as a binary
     // String, or nil. Persist it cross-process and pass back via cached_data:.
@@ -4432,38 +4892,78 @@ fn js_runtime_error(ruby: &Ruby, message: String, backtrace: Vec<String>) -> Err
     }
 }
 
-// instantiate's resolve block returns a RustyRacer::Module (or nil for a
-// genuinely-unresolved import); pull its module_id so the V8 thread can look up
-// the V8 module. Verifies the module belongs to THIS Context (core identity),
-// since module ids are per-V8-thread and a foreign id would alias a local one.
-// A raised block propagates as Err (not silently swallowed into "not found").
+// A `host_defined:` argument: nil for none, else a primitive — an Integer, a
+// Float, a String, true or false — that a ScriptOrigin can carry.
+fn host_defined_arg(ruby: &Ruby, value: Value) -> Result<Option<JsVal>, Error> {
+    if value.is_nil() {
+        return Ok(None);
+    }
+    match ruby_to_jsval(value)? {
+        v @ (JsVal::Bool(_)
+        | JsVal::Int(_)
+        | JsVal::Num(_)
+        | JsVal::Str(_)
+        | JsVal::BigInt { .. }) => Ok(Some(v)),
+        _ => Err(Error::new(
+            ruby.exception_arg_error(),
+            "host_defined: must be nil, an Integer, a Float, a String, true or false",
+        )),
+    }
+}
+
+// A resolve block returns a RustyRacer::Module (or nil for a genuinely-
+// unresolved import); pull its module_id so the V8 side can look up the V8
+// module. Verifies the module belongs to THIS isolate (core identity), since
+// module ids are per-isolate and a foreign id would alias a local one. A
+// raised block propagates as Err (not silently swallowed into "not found").
+// The block is handed (specifier, referrer_url, attributes) — a lambda of two
+// parameters the first two alone, as it always was.
 fn resolve_module_via_ruby(
     core: &Core,
     resolve: Proc,
     specifier: &str,
     referrer_url: &str,
-    // Some(realm id) for the dynamic_import_resolver: it then receives the
-    // initiating realm as a 3rd Context arg so it can resolve per-realm. None for
-    // the static instantiate block, whose (specifier, referrer_url) contract is
-    // unchanged.
-    initiating_context: Option<i32>,
+    attributes: &[(String, String)],
 ) -> Result<Option<i32>, Error> {
     let ruby = Ruby::get().unwrap();
-    let ret: Value = match core.me.upgrade().zip(initiating_context) {
-        Some((core_arc, id)) => {
-            let ctx = Context {
-                core: core_arc,
-                id,
-                disposed: AtomicBool::new(false),
-            };
-            resolve.call((specifier, referrer_url, ctx))?
-        }
-        None => resolve.call((specifier, referrer_url))?,
+    let ret: Value = if !takes_three(resolve)? {
+        resolve.call((specifier, referrer_url))?
+    } else {
+        resolve.call((specifier, referrer_url, attributes_hash(&ruby, attributes)?))?
     };
-    if ret.is_nil() {
+    module_id_of(&ruby, core, ret)
+}
+
+// Whether a resolve block takes a third argument: any proc does (it drops what it
+// has no parameter for); a lambda one with a rest parameter, or three in all.
+fn takes_three(resolve: Proc) -> Result<bool, Error> {
+    if !resolve.is_lambda() {
+        return Ok(true);
+    }
+    let arity = resolve.arity();
+    if arity >= 0 {
+        return Ok(arity >= 3);
+    }
+    let parameters: RArray = resolve.funcall("parameters", ())?;
+    let mut count = 0;
+    for parameter in parameters.into_iter() {
+        let kind: magnus::Symbol = RArray::try_convert(parameter)?.entry(0)?;
+        match kind.name()?.as_ref() {
+            "rest" => return Ok(true),
+            "req" | "opt" => count += 1,
+            _ => {}
+        }
+    }
+    Ok(count >= 3)
+}
+
+// The id of the RustyRacer::Module |value| — None for nil, or a disposed one —
+// of the isolate |core|.
+fn module_id_of(ruby: &Ruby, core: &Core, value: Value) -> Result<Option<i32>, Error> {
+    if value.is_nil() {
         return Ok(None); // legitimately unresolved
     }
-    let obj = magnus::typed_data::Obj::<JsModule>::try_convert(ret).map_err(|_| {
+    let obj = magnus::typed_data::Obj::<JsModule>::try_convert(value).map_err(|_| {
         Error::new(
             ruby.exception_type_error(),
             "module resolver must return a RustyRacer::Module or nil",
@@ -4471,7 +4971,7 @@ fn resolve_module_via_ruby(
     })?;
     if !std::ptr::eq(Arc::as_ptr(&obj.core), core as *const Core) {
         return Err(Error::new(
-            err_class(&ruby, "Error"),
+            err_class(ruby, "Error"),
             "module resolver returned a Module from a different Context",
         ));
     }
@@ -4479,6 +4979,91 @@ fn resolve_module_via_ruby(
         return Ok(None);
     }
     Ok(Some(obj.module_id))
+}
+
+impl DynamicImport {
+    fn specifier(&self) -> String {
+        self.specifier.clone()
+    }
+    // The name of the script import() was called from (its filename), or nil.
+    fn referrer(&self) -> Option<String> {
+        self.referrer.clone()
+    }
+    // {key => value} of its `with` options' import attributes.
+    fn attributes(ruby: &Ruby, rb_self: &Self) -> Result<RHash, Error> {
+        attributes_hash(ruby, &rb_self.attributes)
+    }
+    // The `host_defined:` value of the script import() was called from, or nil.
+    fn host_defined(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
+        match &rb_self.host_defined {
+            Some(value) => marshal::jsval_to_ruby(ruby, value),
+            None => Ok(ruby.qnil().as_value()),
+        }
+    }
+    // The realm import() was called in: a module it is resolved with is of it.
+    fn context(&self) -> Context {
+        Context {
+            core: self.core.clone(),
+            id: self.context_id,
+            disposed: AtomicBool::new(false),
+        }
+    }
+    fn is_settled(&self) -> bool {
+        self.settled.load(Ordering::SeqCst)
+    }
+    fn settle(&self, ruby: &Ruby, settle: Settle, resolve: Option<Proc>) -> Result<bool, Error> {
+        if self.settled.load(Ordering::SeqCst) || self.core.is_disposed() {
+            return Ok(false);
+        }
+        // (…settled once the op has run, whatever it raised — a terminated evaluation's — as the registry let go of it)
+        self.core.ensure_owner_and_live(ruby)?;
+        let settled = self.core.settle_import(ruby, self.id, settle, resolve);
+        self.settled.store(true, Ordering::SeqCst);
+        settled
+    }
+    // _resolve(module, block): settle it with |module| — linked by |block| where
+    // it is not yet (as Module#instantiate's), and evaluated — the promise then
+    // fulfilled with its namespace, or rejected with what failed.
+    fn resolve(
+        ruby: &Ruby,
+        rb_self: &Self,
+        module: Value,
+        block: Option<Proc>,
+    ) -> Result<bool, Error> {
+        let Some(module_id) = module_id_of(ruby, &rb_self.core, module)? else {
+            return Err(Error::new(
+                ruby.exception_arg_error(),
+                "resolve needs a RustyRacer::Module that is not disposed",
+            ));
+        };
+        rb_self.settle(ruby, Settle::Module(module_id), block)
+    }
+    // reject(value): rejected with |value|, marshalled into its realm.
+    fn reject(ruby: &Ruby, rb_self: &Self, value: Value) -> Result<bool, Error> {
+        let value = ruby_to_jsval(value)?;
+        rb_self.settle(ruby, Settle::Reject(value), None)
+    }
+    // reject_with(path, *args): rejected with what the function at |path| (as
+    // Context#call names one, in its realm) returns — or throws.
+    fn reject_with(ruby: &Ruby, rb_self: &Self, args: &[Value]) -> Result<bool, Error> {
+        let Some((path, args)) = args.split_first() else {
+            return Err(Error::new(
+                ruby.exception_arg_error(),
+                "reject_with needs a function path",
+            ));
+        };
+        let path = String::try_convert(*path)?;
+        let args = js_args(args)?;
+        rb_self.settle(ruby, Settle::RejectWith { path, args }, None)
+    }
+}
+
+impl Drop for DynamicImport {
+    fn drop(&mut self) {
+        if !self.settled.swap(true, Ordering::SeqCst) {
+            self.core.release(Released::Import(self.id));
+        }
+    }
 }
 
 #[magnus::init]
@@ -4510,8 +5095,8 @@ pub fn install_classes(ruby: &Ruby) -> Result<(), Error> {
     )?;
     // lib keeps the proc in an ivar (GC liveness) and calls this primitive.
     isolate.define_method(
-        "_set_dynamic_import_resolver",
-        method!(Isolate::set_dynamic_import_resolver, 1),
+        "_set_dynamic_import_handler",
+        method!(Isolate::set_dynamic_import_handler, 1),
     )?;
     isolate.define_method("heap_statistics", method!(Isolate::heap_statistics, 0))?;
     isolate.define_method(
@@ -4535,8 +5120,9 @@ pub fn install_classes(ruby: &Ruby) -> Result<(), Error> {
     context.define_method("reset", method!(Context::reset, 0))?;
     context.define_method("id", method!(Context::id, 0))?;
     // keyword-arg wrappers Context#compile_module / #compile (source, ...) in lib.
-    context.define_method("_compile_module", method!(Context::compile_module, 5))?;
-    context.define_method("_compile", method!(Context::compile, 5))?;
+    context.define_method("_compile_module", method!(Context::compile_module, 6))?;
+    context.define_method("_compile", method!(Context::compile, 6))?;
+    context.define_method("_synthetic_module", method!(Context::synthetic_module, 4))?;
     context.define_method("dispose", method!(Context::dispose, 0))?;
     context.define_method("disposed?", method!(Context::disposed, 0))?;
 
@@ -4551,6 +5137,16 @@ pub fn install_classes(ruby: &Ruby) -> Result<(), Error> {
     script.define_method("disposed?", method!(Script::disposed, 0))?;
 
     // A resolved function: Context#function -> #call / #call_void.
+    let import = module.define_class("DynamicImport", ruby.class_object())?;
+    import.define_method("specifier", method!(DynamicImport::specifier, 0))?;
+    import.define_method("referrer", method!(DynamicImport::referrer, 0))?;
+    import.define_method("attributes", method!(DynamicImport::attributes, 0))?;
+    import.define_method("host_defined", method!(DynamicImport::host_defined, 0))?;
+    import.define_method("context", method!(DynamicImport::context, 0))?;
+    import.define_method("settled?", method!(DynamicImport::is_settled, 0))?;
+    import.define_method("_resolve", method!(DynamicImport::resolve, 2))?;
+    import.define_method("reject", method!(DynamicImport::reject, 1))?;
+    import.define_method("reject_with", method!(DynamicImport::reject_with, -1))?;
     let function = module.define_class("Function", ruby.class_object())?;
     function.define_method("call", method!(JsFunction::call, -1))?;
     function.define_method("call_void", method!(JsFunction::call_void, -1))?;
@@ -4572,6 +5168,7 @@ pub fn install_classes(ruby: &Ruby) -> Result<(), Error> {
     jsmodule.define_method("namespace", method!(JsModule::namespace, 0))?;
     jsmodule.define_method("_status", method!(JsModule::status, 0))?;
     jsmodule.define_method("graph_async?", method!(JsModule::graph_async, 0))?;
+    jsmodule.define_method("requests", method!(JsModule::requests, 0))?;
     jsmodule.define_method("cached_data", method!(JsModule::cached_data, 0))?;
     jsmodule.define_method("cache_rejected?", method!(JsModule::cache_rejected, 0))?;
     jsmodule.define_method("create_code_cache", method!(JsModule::create_code_cache, 0))?;

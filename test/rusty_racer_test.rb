@@ -2213,6 +2213,273 @@ class RustyRacerTest < Minitest::Test
     assert_match(/import|not|resolved/i, @ctx.eval("globalThis.ERR"))
   end
 
+  # ── the host's own import(): DynamicImport ──
+
+  # The host settles an import() on a later turn: the promise is pending until
+  # it does, and fulfils with the namespace of the module it resolved it with.
+  def test_dynamic_import_handler_settles_later
+    pending = []
+    @iso.dynamic_import_handler = ->(import) { pending << import }
+    @ctx.eval('globalThis.OUT = "pending"; import("/later.js").then(m => { OUT = m.v }, e => { OUT = String(e) });')
+    @iso.perform_microtask_checkpoint
+    assert_equal 'pending', @ctx.eval('OUT')
+    import = pending.fetch(0)
+    assert_equal '/later.js', import.specifier
+    assert_equal({}, import.attributes)
+    assert_equal 0, import.context.id
+    refute import.settled?
+    assert import.resolve(@ctx.compile_module('export const v = 7;', filename: '/later.js'))
+    assert import.settled?
+    @iso.perform_microtask_checkpoint
+    assert_equal 7, @ctx.eval('OUT')
+    refute import.resolve(@ctx.compile_module('export const v = 8;', filename: '/later.js')), 'settled twice'
+  end
+
+  # An import()'s `with` attributes are the handler's, and a module request's are
+  # the resolve block's (its third argument) — and Module#requests reads them
+  # without linking.
+  def test_import_attributes_reach_the_handler_and_the_resolve_block
+    seen = nil
+    @iso.dynamic_import_handler = ->(import) { seen = import.attributes; import.reject('no') }
+    @ctx.eval('import("/d.json", { with: { type: "json" } }).catch(() => {});')
+    assert_equal({'type' => 'json'}, seen)
+
+    app = @ctx.compile_module('import a from "/a.json" with { type: "json" }; import "/b.js"; export default a;', filename: '/app.js')
+    assert_equal [['/a.json', {'type' => 'json'}], ['/b.js', {}]], app.requests
+    asked = []
+    app.instantiate do |specifier, _referrer, attributes|
+      asked << [specifier, attributes]
+      specifier == '/a.json' ? @ctx.synthetic_module(json: '{"x": 1}', filename: specifier) : @ctx.compile_module('', filename: specifier)
+    end
+    assert_equal [['/a.json', {'type' => 'json'}], ['/b.js', {}]], asked
+    app.evaluate
+    assert_equal({'x' => 1}, app.namespace['default'])
+  end
+
+  # A two-parameter lambda as a resolve block is handed what it always was.
+  def test_a_two_parameter_lambda_resolve_block_still_resolves
+    app = @ctx.compile_module('import {x} from "/dep.js"; export const v = x;', filename: '/app.js')
+    app.instantiate(&->(_specifier, _referrer) { @ctx.compile_module('export const x = 3;', filename: '/dep.js') })
+    app.evaluate
+    assert_equal 3, app.namespace['v']
+  end
+
+  # The host rejects an import() with a value of its own: a marshalled one, or
+  # what a function at a path makes — `@` paths on the host object, where a
+  # page replacing `TypeError` changes nothing.
+  def test_dynamic_import_rejects_with_the_hosts_value
+    iso = RustyRacer::Isolate.new(host_namespace: '@NS')
+    ctx = iso.context
+    ctx.eval_void(<<~JS)
+      globalThis.OUT = [];
+      globalThis.note = (p) => p.then(() => OUT.push('ok'), e => OUT.push(e === 42 || e === undefined ? e ?? 'undefined' : e.constructor.name + ':' + e.message));
+    JS
+    ctx.call_void('Object.defineProperty', RustyRacer::HOST_OBJECT, 'TypeError', {value: nil})
+    ctx.eval_void('const T = TypeError; globalThis.TypeError = function Fake() {}; void 0')
+    imports = []
+    iso.dynamic_import_handler = ->(import) { imports << import }
+    ctx.eval_void('note(import("/a.js")); note(import("/b.js")); note(import("/c.js"));')
+    a, b, c = imports
+    assert a.reject(42)
+    assert b.reject_with('SyntaxError', 'bad module')
+    assert c.reject_with('@NS.contextOf', 1)
+    iso.perform_microtask_checkpoint
+    assert_equal 42, ctx.eval('OUT[0]')
+    assert_equal 'SyntaxError:bad module', ctx.eval('OUT[1]')
+    assert_equal 'undefined', ctx.eval('OUT[2]')
+  end
+
+  # A handler that raises rejects the import() with its message.
+  def test_dynamic_import_handler_that_raises_rejects
+    @iso.dynamic_import_handler = ->(_import) { raise 'not here' }
+    @ctx.eval_void('globalThis.OUT = null; import("/x.js").catch(e => { OUT = String(e) });')
+    @iso.perform_microtask_checkpoint
+    assert_includes @ctx.eval('OUT'), 'not here'
+  end
+
+  # A link error (an export none has) rejects the import(), the module's own
+  # SyntaxError; a block that raises, an Error of its message.
+  def test_dynamic_import_resolve_link_failures_reject
+    imports = []
+    @iso.dynamic_import_handler = ->(import) { imports << import }
+    @ctx.eval_void('globalThis.OUT = []; for (const s of ["/a.js", "/b.js"]) import(s).catch(e => OUT.push(e.constructor.name + ":" + e.message));')
+    a, b = imports
+    a.resolve(@ctx.compile_module('import {nope} from "/dep.js";', filename: '/a.js')) { @ctx.compile_module('', filename: '/dep.js') }
+    b.resolve(@ctx.compile_module('import "/dep.js";', filename: '/b.js')) { raise 'no dep here' }
+    @iso.perform_microtask_checkpoint
+    out = @ctx.eval('OUT')
+    assert_match(/\ASyntaxError:.*nope/, out[0])
+    assert_match(/no dep here/, out[1])
+  end
+
+  # An import() a realm made is let go of with the realm: settling it then is no
+  # longer possible.
+  def test_dynamic_import_of_a_reset_realm_settles_nothing
+    pending = []
+    @iso.dynamic_import_handler = ->(import) { pending << import }
+    @ctx.eval_void('import("/m.js")')
+    @ctx.reset
+    refute pending[0].reject(1)
+  end
+
+  # The host-defined value a script or module was compiled with is handed to the
+  # import() it makes — two of one name told apart.
+  def test_host_defined_value_reaches_the_dynamic_import
+    seen = []
+    @iso.dynamic_import_handler = ->(import) { seen << [import.referrer, import.host_defined]; import.reject(0) }
+    @ctx.compile('import("/x.js").catch(() => {})', filename: '/page.html', host_defined: 1).run
+    @ctx.compile('import("/x.js").catch(() => {})', filename: '/page.html', host_defined: 2).run
+    m = @ctx.compile_module('import("/x.js").catch(() => {});', filename: '/page.html', host_defined: 'inline-3')
+    m.instantiate { nil }
+    m.evaluate
+    @ctx.eval_void('import("/x.js").catch(() => {})')
+    assert_equal [['/page.html', 1], ['/page.html', 2], ['/page.html', 'inline-3'], ['<eval>', nil]], seen
+    assert_raises(ArgumentError) { @ctx.compile('1', host_defined: {}) }
+  end
+
+  # A synthetic module exports `default` alone: a Ruby value, the value
+  # %JSON.parse% makes of a JSON text, or what a function returns.
+  def test_synthetic_modules
+    @ctx.eval_void('globalThis.JSON = { parse() { return "replaced" } }; globalThis.make = (t) => ({ made: t });')
+    text = @ctx.synthetic_module('hi', filename: '/t.txt')
+    json = @ctx.synthetic_module(json: '{"__proto__": 1, "a": [1, 2]}', filename: '/j.json')
+    made = @ctx.synthetic_module(call: ['make', 'x'], filename: '/c.css')
+    app = @ctx.compile_module(<<~JS, filename: '/app.js')
+      import t from "/t.txt" with { type: "text" };
+      import j from "/j.json" with { type: "json" };
+      import c from "/c.css" with { type: "css" };
+      export const out = [t, Object.hasOwn(j, "__proto__"), j.a, c.made];
+    JS
+    deps = {'/t.txt' => text, '/j.json' => json, '/c.css' => made}
+    assert_equal [], json.requests
+    app.instantiate {|specifier| deps.fetch(specifier) }
+    app.evaluate
+    assert_equal ['hi', true, [1, 2], 'x'], app.namespace['out']
+    e = assert_raises(RustyRacer::ParseError) { @ctx.synthetic_module(json: '{', filename: '/bad.json') }
+    assert_match(/SyntaxError/, e.message)
+    assert_raises(RustyRacer::RuntimeError) { @ctx.synthetic_module(call: ['nope.fn'], filename: '/x') }
+    assert_raises(ArgumentError) { @ctx.synthetic_module(1, json: '1', filename: '/x') }
+  end
+
+  # A function of a realm reset since, called from another realm, imports nothing: no realm is its — not the
+  # main realm that took its id.
+  def test_dynamic_import_of_a_retired_realm_rejects
+    iso = RustyRacer::Isolate.new(host_namespace: 'NS')
+    ctx = iso.context
+    frame = iso.create_context
+    iso.dynamic_import_resolver = ->(spec, _ref, c) { c.compile_module('export const v = "new";', filename: spec) }
+    ctx.eval_void('globalThis.imp = () => import("/m.js")')
+    frame.eval_void("globalThis.held = NS.contextGlobal(0).imp; globalThis.OUT = null;")
+    ctx.reset
+    frame.eval_void('held().then((m) => { OUT = m.v }, (e) => { OUT = "rejected:" + e.message })')
+    iso.perform_microtask_checkpoint
+    assert_match(/\Arejected:.*gone/, frame.eval('OUT'))
+  end
+
+  # A Module#instantiate the evaluation of an import()ed module runs re-raises its block's own exception, as
+  # anywhere else: only the import's own link is the import's to fail.
+  def test_instantiate_inside_an_imported_modules_evaluation_reraises_its_block
+    my_error = Class.new(StandardError)
+    raised = nil
+    @ctx.attach('inner', lambda {
+      m = @ctx.compile_module('import "/dep.js";', filename: '/inner.js')
+      begin
+        m.instantiate { raise my_error, 'boom' }
+      rescue StandardError => e
+        raised = e.class
+      end
+      nil
+    })
+    @iso.dynamic_import_handler = ->(import) { import.resolve(@ctx.compile_module('inner();', filename: '/m.js')) }
+    @ctx.eval_void('import("/m.js")')
+    assert_equal my_error, raised
+  end
+
+  # The resolver's own rejection is made natively, whatever a page made of Error.
+  def test_dynamic_import_resolver_rejects_whatever_the_page_made_of_error
+    @iso.dynamic_import_resolver = ->(_spec, _ref, _ctx) { nil }
+    @ctx.eval_void('const E = Error; globalThis.Error = function Fake() {}; globalThis.OUT = null; import("/x.js").catch((e) => { OUT = (e instanceof E) + ":" + e.message })')
+    @iso.perform_microtask_checkpoint
+    assert_match(/\Atrue:import\(\) was not resolved/, @ctx.eval('OUT'))
+  end
+
+  # A lambda that takes an optional second parameter is handed two arguments; one with three or a rest, three.
+  def test_resolve_block_lambdas_by_their_parameters
+    dep = ->(spec) { @ctx.compile_module('export const x = 3;', filename: spec) }
+    seen = []
+    [->(s, r = nil) { seen << [s, r]; dep.(s) }, ->(s, *rest) { seen << rest.size; dep.(s) }, ->(s, _r, a) { seen << a; dep.(s) }].each_with_index do |block, i|
+      app = @ctx.compile_module('import {x} from "/dep.js"; export const v = x;', filename: "/app#{i}.js")
+      app.instantiate(&block)
+    end
+    assert_equal [['/dep.js', '/app0.js'], 2, {}], seen
+  end
+
+  # A synthetic module whose function queued microtasks has them drained, as any op's at the outermost.
+  def test_synthetic_module_call_drains_microtasks
+    @ctx.eval_void('globalThis.X = 0; globalThis.make = () => { Promise.resolve().then(() => { X = 1 }); return 1; }')
+    @ctx.synthetic_module(call: ['make'], filename: '/s')
+    assert_equal 1, @ctx.eval('X')
+  end
+
+  # An import settled by a settle that raised — its evaluation terminated — is settled: no other settle takes it.
+  def test_a_settle_that_raised_still_settled_the_import
+    iso = RustyRacer::Isolate.new(timeout_ms: 200)
+    ctx = iso.context
+    pending = []
+    iso.dynamic_import_handler = ->(import) { pending << import }
+    ctx.eval_void('import("/spin.js")')
+    import = pending.fetch(0)
+    assert_raises(RustyRacer::ScriptTerminatedError) { import.resolve(ctx.compile_module('for(;;){}', filename: '/spin.js')) }
+    assert import.settled?
+    refute import.reject(1)
+    assert_equal 2, ctx.eval('1 + 1')
+  end
+
+  # nil clears the handler: an import() rejected then.
+  def test_dynamic_import_handler_cleared_by_nil
+    @iso.dynamic_import_handler = ->(import) { import.reject(1) }
+    @iso.dynamic_import_handler = nil
+    @ctx.eval_void('globalThis.OUT = null; import("/x.js").catch((e) => { OUT = String(e) })')
+    @iso.perform_microtask_checkpoint
+    assert_match(/no dynamic_import_handler/, @ctx.eval('OUT'))
+  end
+
+  # A realm's import-meta handler is handed each module's import.meta as it is
+  # first read, with its url and host-defined value, after `url` is set — the
+  # host's import.meta.resolve, say.
+  def test_import_meta_handler
+    iso = RustyRacer::Isolate.new(host_namespace: 'NS')
+    ctx = iso.context
+    ctx.eval_void(<<~JS)
+      NS.setImportMetaHandler((meta, url, hostDefined) => {
+        meta.resolve = (specifier) => url.replace(/[^/]*$/, '') + specifier.replace('./', '');
+        meta.hostDefined = hostDefined;
+      });
+    JS
+    m = ctx.compile_module('export const out = [import.meta.url, import.meta.resolve("./b.js"), import.meta.hostDefined, Object.keys(import.meta)];', filename: 'http://x.test/a/m.js', host_defined: 5)
+    m.instantiate { nil }
+    m.evaluate
+    assert_equal ['http://x.test/a/m.js', 'http://x.test/a/b.js', 5, %w[url resolve hostDefined]], m.namespace['out']
+    # (…another realm has none of it)
+    frame = iso.create_context
+    f = frame.compile_module('export const keys = Object.keys(import.meta);', filename: '/f.js')
+    f.instantiate { nil }
+    f.evaluate
+    assert_equal ['url'], f.namespace['keys']
+    # (…a reset realm none: the handler went with its global)
+    iso.context.reset
+    r = ctx.compile_module('export const keys = Object.keys(import.meta);', filename: '/r.js')
+    r.instantiate { nil }
+    r.evaluate
+    assert_equal ['url'], r.namespace['keys']
+    # (…and a handler that throws leaves import.meta as far as it got)
+    ctx.eval_void('NS.setImportMetaHandler(() => { throw new Error("no") })')
+    t = ctx.compile_module('export const keys = Object.keys(import.meta);', filename: '/t.js')
+    t.instantiate { nil }
+    t.evaluate
+    assert_equal ['url'], t.namespace['keys']
+  end
+
   def test_module_cached_data_round_trip
     src = "export const x = 1 + 2;"
     # produce a bytecode cache

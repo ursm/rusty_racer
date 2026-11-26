@@ -242,6 +242,43 @@ exception"), at once for a throw and as it settles for an `await`:
 
 Classic `<script>`s work the same way: `ctx.compile("1 + 1").run` # => 2.
 
+The resolve block is handed each request's import attributes too —
+`{ |specifier, referrer, attributes| … }`, `{"type" => "json"}` for
+`import x from "./x.json" with { type: "json" }` — and `app.requests` lists them
+without linking: `[["./dep.js", {}]]`.
+
+A module whose value the host makes — HTML's JSON, CSS and text module scripts —
+is a *synthetic* module exporting `default` alone:
+
+```ruby
+ctx.synthetic_module("some text", filename: "/a.txt")              # a Ruby value
+ctx.synthetic_module(json: '{"a": 1}', filename: "/a.json")         # %JSON.parse% (ParseError if it is no JSON)
+ctx.synthetic_module(call: ["@makeSheet", css], filename: "/a.css") # what a function returns
+```
+
+`import()` is the host's to answer, now or later: the isolate's
+`dynamic_import_handler` is handed a `RustyRacer::DynamicImport` per call —
+`specifier`, `attributes`, `referrer` (the calling script's filename),
+`host_defined` (the value that script was compiled with: `compile` /
+`compile_module` take `host_defined:`, a primitive, to tell scripts of one name
+apart) and `context` (the realm it was called in) — and its promise waits until
+the host settles it, on whatever later turn its fetch lands:
+
+```ruby
+iso.dynamic_import_handler = ->(import) { pending << import }   # start a fetch, return
+# … later:
+import.resolve(mod) { |specifier, referrer, attributes| dep }   # linked (by the block) and evaluated
+import.reject_with("@steps.typeError", "no such module")         # rejected with what a function makes
+import.reject(42)                                                # … or with a value
+```
+
+`dynamic_import_resolver = ->(specifier, referrer, context) { module }` remains,
+answering each `import()` at once. A realm's `import.meta` gets its `url`; a
+namespace's `setImportMetaHandler(fn)` adds whatever else the host makes —
+`fn(meta, url, hostDefined)` is called as a module of that realm first reads it,
+`import.meta.resolve` for one.
+
+
 ### Resource limits
 
 An isolate can cap untrusted code on both axes. Each limit terminates the
@@ -335,7 +372,7 @@ Also available:
   never fires. It drains every pending task without blocking, then a microtask
   checkpoint; with nothing pending it is a no-op. The callbacks are ordinary JS,
   so the pump is capped by `timeout_ms` like an `eval`.
-- **`Isolate#terminate`**, **`Isolate#dynamic_import_resolver=`**,
+- **`Isolate#terminate`**, **`Isolate#dynamic_import_handler=`** / **`#dynamic_import_resolver=`**,
   **`Context#reset`** (below), and **`Platform.set_flags!`**.
 
 ### `Context#reset`
