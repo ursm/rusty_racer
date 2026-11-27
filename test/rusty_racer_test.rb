@@ -2435,6 +2435,22 @@ class RustyRacerTest < Minitest::Test
     assert_equal 2, ctx.eval('1 + 1')
   end
 
+  # A DynamicImport's Context reads as disposed once its realm is; attributes are frozen; a Symbol is no host_defined:.
+  def test_dynamic_import_context_and_attributes_after_their_realm
+    realm = @iso.create_context
+    pending = []
+    @iso.dynamic_import_handler = ->(import) { pending << import }
+    realm.eval_void('import("/x.js", { with: { type: "json" } })')
+    import = pending.fetch(0)
+    assert import.attributes.frozen?
+    realm.dispose
+    assert import.context.disposed?
+    refute import.reject(1)
+    assert_raises(ArgumentError) { @ctx.compile('1', host_defined: :sym) }
+    m = @ctx.compile_module('import "/d.js";', filename: '/m.js')
+    assert m.requests.dig(0, 1).frozen?
+  end
+
   # nil clears the handler: an import() rejected then.
   def test_dynamic_import_handler_cleared_by_nil
     @iso.dynamic_import_handler = ->(import) { import.reject(1) }

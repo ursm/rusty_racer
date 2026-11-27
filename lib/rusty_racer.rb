@@ -109,13 +109,12 @@ module RustyRacer
     # referring script's name and host-defined value, the realm it was called in
     # — which the handler settles now or later (a fetch begun now, settled on a
     # later task): #resolve with a Module, #reject / #reject_with with a value.
-    # Until then the import()'s promise is pending. A handler that raises
-    # rejects it with an Error of its message, unless it settled it first; nil
-    # clears it, an import() then rejected.
-    # The native side keeps the proc alive itself (in the isolate's roots array,
-    # marked by its wrappers), so it is NOT held in an ivar here: that second
-    # reference would outlive `dispose`, which exists to drop whatever the handler
-    # captured the moment the isolate can no longer call it.
+    # Until then the import()'s promise is pending. Whatever leaves the handler
+    # other than by returning — any exception, an Interrupt or a Timeout
+    # included — rejects it with an Error of its message, unless it settled it
+    # first, and goes no further; nil clears the handler, an import() then
+    # rejected. The native side keeps the proc alive (in the isolate's roots
+    # array, marked by its wrappers), so `dispose` drops whatever it captured.
     def dynamic_import_handler=(handler)
       _set_dynamic_import_handler(handler)
     end
@@ -184,10 +183,12 @@ module RustyRacer
     # Compile a classic <script>; returns a RustyRacer::Script to #run.
     # cached_data:/produce_cache: are the bytecode cache (see #compile_module).
     # eager: (see #compile_module).
-    # host_defined: a primitive (Integer, Float, String, true, false) its
-    # ScriptOrigin carries, which an import() it makes is handed
+    # host_defined: a primitive (Integer, Float, String, true, false; not a
+    # Symbol) its ScriptOrigin carries, which an import() it makes is handed
     # (DynamicImport#host_defined) — how a host tells one referring script from
-    # another of the same name.
+    # another of the same name. Code an `eval` or `new Function` of it compiles
+    # carries its value too — but V8 caches such code by its source, so the
+    # same source evaluated by another script may keep the first one's.
     def compile(source, filename: '<compile>', cached_data: nil, produce_cache: false, eager: false, host_defined: nil)
       _compile(source, filename, cached_data, produce_cache, eager, host_defined)
     end
@@ -240,6 +241,10 @@ module RustyRacer
     end
   end
 
+  # A compiled (or synthetic) ES module. Defined natively besides: #requests ->
+  # [[specifier, attributes], ...], what the module imports (V8
+  # GetModuleRequests), in source order, each with its frozen import attributes —
+  # the requests linking it asks its resolve block for, one by one.
   class Module
     # instantiate { |specifier, referrer_url, attributes| dependency_module } —
     # the block resolves each import to an already-compiled Module; attributes
@@ -260,10 +265,6 @@ module RustyRacer
     def evaluate(report: nil)
       _evaluate(report&.to_s)
     end
-
-    # #requests -> [[specifier, attributes], ...]: what the module imports (V8
-    # GetModuleRequests), in source order, each with its import attributes —
-    # the requests linking it asks its resolve block for, one by one.
 
     # The V8 module status: :uninstantiated, :instantiating, :instantiated,
     # :evaluating, :evaluated or :errored.
@@ -286,12 +287,18 @@ module RustyRacer
     # fulfil the import() with `module`'s namespace once it is evaluated:
     # linked first, where it is not yet, by the block (as Module#instantiate's
     # is), then evaluated (its top-level await awaited). A link or evaluation
-    # error — a block that raised included — rejects the import() with it.
+    # error — a block that raised included — rejects the import() with it. A
+    # module still linking or evaluating (an import() of itself, settled at once
+    # from inside the handler) rejects it as busy: settle such a one later, from
+    # a later turn. An evaluation terminated (a timeout, Isolate#terminate)
+    # raises ScriptTerminatedError and leaves the import() pending for good.
     def resolve(mod, &block)
       _resolve(mod, block)
     end
 
-    # #reject(value): reject the import() with `value`, marshalled into its realm.
+    # #reject(value): reject the import() with `value`, marshalled into its realm
+    # as any argument is (nil, true/false, numbers, Strings, Arrays, Hashes, …,
+    # HOST_OBJECT) — a plain value: an Error of the realm's own is #reject_with's.
     # #reject_with(path, *args): reject it with what the function at `path` (as
     # Context#call names one, in its realm) returns — `'@steps.typeError'`, say,
     # for an error of the host's own making — or with what it throws.

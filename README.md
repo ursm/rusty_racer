@@ -272,6 +272,16 @@ import.reject_with("@steps.typeError", "no such module")         # rejected with
 import.reject(42)                                                # … or with a value
 ```
 
+Whatever leaves the handler other than by returning — an exception, an
+`Interrupt` or a `Timeout` too — rejects the `import()` with its message (unless
+the handler settled it first) and goes no further. A module still evaluating
+(an `import()` of itself settled from inside its handler) rejects as busy:
+settle such a one on a later turn. An evaluation that is terminated raises
+`ScriptTerminatedError` from `resolve` and leaves the promise pending. Code an
+`eval` / `new Function` compiles carries its script's `host_defined:` value, but
+V8 caches it by source, so another script's identical source may keep the first
+one's.
+
 `dynamic_import_resolver = ->(specifier, referrer, context) { module }` remains,
 answering each `import()` at once. A realm's `import.meta` gets its `url`; a
 namespace's `setImportMetaHandler(fn)` adds whatever else the host makes —

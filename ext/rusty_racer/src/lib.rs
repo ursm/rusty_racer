@@ -268,9 +268,9 @@ fn proc_root_index(index: usize) -> isize {
     ROOT_FIRST_PROC + index as isize
 }
 
-// Import attributes as a Ruby Hash (String => String), in source order — none,
-// the one frozen empty Hash (NO_ATTRIBUTES): what almost every request has,
-// handed to a resolve block per import edge, made once.
+// Import attributes as a frozen Ruby Hash (String => String), in source order —
+// none, the one frozen empty Hash (NO_ATTRIBUTES): what almost every request
+// has, handed to a resolve block per import edge, made once.
 fn attributes_hash(ruby: &Ruby, attributes: &[(String, String)]) -> Result<RHash, Error> {
     if attributes.is_empty() {
         return Ok(ruby.get_inner(&NO_ATTRIBUTES));
@@ -279,6 +279,7 @@ fn attributes_hash(ruby: &Ruby, attributes: &[(String, String)]) -> Result<RHash
     for (key, value) in attributes {
         hash.aset(key.as_str(), value.as_str())?;
     }
+    hash.freeze();
     Ok(hash)
 }
 static NO_ATTRIBUTES: magnus::value::Lazy<RHash> = magnus::value::Lazy::new(|ruby| {
@@ -1414,9 +1415,10 @@ fn drop_context_artifacts(state: &mut IsolateState, context_id: i32) {
         .retain(|_, entry| entry.context_id != context_id);
     // Its import() promises are no script's to see any more.
     state.imports.by_id.retain(|_, (_, cid)| *cid != context_id);
-    for exports in state.synthetic.by_hash.values_mut() {
+    state.synthetic.by_hash.retain(|_, exports| {
         exports.retain(|(_, _, cid)| *cid != context_id);
-    }
+        !exports.is_empty()
+    });
     // A promise-reject recorder created in this context is unusable now.
     if state
         .realms
@@ -1760,25 +1762,38 @@ fn synthetic_evaluation_steps<'s>(
 ) -> Option<v8::Local<'s, v8::Value>> {
     v8::callback_scope!(unsafe scope, context);
     let hash = module.get_identity_hash().get();
-    let at = scope
-        .get_slot::<IsolateState>()?
-        .synthetic
-        .by_hash
-        .get(&hash)?
-        .iter()
-        .position(|(weak, _, _)| weak.to_local(scope) == Some(module));
+    // (…V8 told of every failure by an exception: an empty return with none pending is a CHECK)
+    let at = scope.get_slot::<IsolateState>().and_then(|state| {
+        state
+            .synthetic
+            .by_hash
+            .get(&hash)?
+            .iter()
+            .position(|(weak, _, _)| weak.to_local(scope) == Some(module))
+    });
     let kept = at.and_then(|at| {
-        let exports = istate!(scope).synthetic.by_hash.get_mut(&hash)?;
+        let by_hash = &mut istate!(scope).synthetic.by_hash;
+        let exports = by_hash.get_mut(&hash)?;
         let (_, value, _) = exports.remove(at);
+        if exports.is_empty() {
+            by_hash.remove(&hash);
+        }
         Some(value)
     });
-    let value: v8::Local<v8::Value> = match kept {
-        Some(value) => v8::Local::new(scope, value),
-        None => v8::undefined(scope).into(),
+    let Some(value) = kept else {
+        throw_js_error(scope, "the synthetic module's value is gone with its realm");
+        return None;
     };
-    let name = v8::String::new(scope, "default")?;
+    let value = v8::Local::new(scope, value);
+    let Some(name) = v8::String::new(scope, "default") else {
+        throw_js_error(scope, "out of memory");
+        return None;
+    };
     module.set_synthetic_module_export(scope, name, value)?;
-    let resolver = v8::PromiseResolver::new(scope)?;
+    let Some(resolver) = v8::PromiseResolver::new(scope) else {
+        throw_js_error(scope, "out of memory");
+        return None;
+    };
     let undefined = v8::undefined(scope).into();
     resolver.resolve(scope, undefined);
     Some(resolver.get_promise(scope).into())
@@ -2028,6 +2043,10 @@ struct Core {
     // Set with each push there, so the request boundary looks at the lock only
     // when there is something under it.
     handles_released: AtomicBool,
+    // The extra realms disposed so far (ids are never reused), so any Context
+    // wrapper of one — not only the one dispose was called on, a
+    // DynamicImport#context's too — reads as disposed.
+    disposed_realms: Mutex<std::collections::HashSet<i32>>,
     // Default per-eval/call timeout (ms); 0 = none. eval(timeout_ms:)'s explicit
     // value overrides it. Guards against an in-V8 infinite loop without a watchdog.
     default_timeout_ms: u64,
@@ -3090,6 +3109,7 @@ impl Isolate {
             procs: Mutex::new(ProcTable::default()),
             released: Mutex::new(Vec::new()),
             handles_released: AtomicBool::new(false),
+            disposed_realms: Mutex::new(std::collections::HashSet::new()),
             default_timeout_ms: timeout_ms,
             memory_limit,
             watchdog,
@@ -3749,6 +3769,7 @@ impl Core {
         let reply = self.run(ruby, Request::DisposeContext { context_id })?;
         self.reply_value(ruby, reply)?;
         self.release_context_procs(ruby, context_id);
+        self.disposed_realms.lock().unwrap().insert(context_id);
         Ok(())
     }
 
@@ -4286,7 +4307,7 @@ impl Context {
     }
     fn check_live(&self, ruby: &Ruby) -> Result<(), Error> {
         // id 0's lifetime is the isolate's; extras also track their own dispose.
-        if self.disposed.load(Ordering::SeqCst) || self.core.is_disposed() {
+        if self.disposed() {
             return Err(Error::new(
                 err_class(ruby, "DisposedError"),
                 "disposed context",
@@ -4477,7 +4498,9 @@ impl Context {
         Ok(())
     }
     fn disposed(&self) -> bool {
-        self.disposed.load(Ordering::SeqCst) || self.core.is_disposed()
+        self.disposed.load(Ordering::SeqCst)
+            || self.core.is_disposed()
+            || self.core.disposed_realms.lock().unwrap().contains(&self.id)
     }
 }
 
@@ -4898,6 +4921,15 @@ fn host_defined_arg(ruby: &Ruby, value: Value) -> Result<Option<JsVal>, Error> {
     if value.is_nil() {
         return Ok(None);
     }
+    // (…a Symbol marshals as a String would, but names nothing a script was given: refused, as any other value is)
+    if magnus::Symbol::from_value(value).is_some()
+        || magnus::value::StaticSymbol::from_value(value).is_some()
+    {
+        return Err(Error::new(
+            ruby.exception_arg_error(),
+            "host_defined: must be nil, an Integer, a Float, a String, true or false",
+        ));
+    }
     match ruby_to_jsval(value)? {
         v @ (JsVal::Bool(_)
         | JsVal::Int(_)
@@ -4972,7 +5004,7 @@ fn module_id_of(ruby: &Ruby, core: &Core, value: Value) -> Result<Option<i32>, E
     if !std::ptr::eq(Arc::as_ptr(&obj.core), core as *const Core) {
         return Err(Error::new(
             err_class(ruby, "Error"),
-            "module resolver returned a Module from a different Context",
+            "module resolver returned a Module of another isolate",
         ));
     }
     if obj.disposed.load(Ordering::SeqCst) {
