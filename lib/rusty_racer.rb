@@ -244,7 +244,10 @@ module RustyRacer
   # A compiled (or synthetic) ES module. Defined natively besides: #requests ->
   # [[specifier, attributes], ...], what the module imports (V8
   # GetModuleRequests), in source order, each with its frozen import attributes —
-  # the requests linking it asks its resolve block for, one by one.
+  # the requests linking it asks its resolve block for, one by one; #script_id,
+  # the id V8's stack frames name its code by (StackFrame::GetScriptId) — how an
+  # embedder walking the stack tells which module is running — nil for a
+  # synthetic or an errored module.
   class Module
     # instantiate { |specifier, referrer_url, attributes| dependency_module } —
     # the block resolves each import to an already-compiled Module; attributes

@@ -3887,6 +3887,11 @@ impl Core {
     }
 
     // [[specifier, attributes], …], each request's attributes a Hash (attributes_hash).
+    fn module_script_id(&self, ruby: &Ruby, module_id: i32) -> Result<Value, Error> {
+        let reply = self.run(ruby, Request::ModuleScriptId { module_id })?;
+        self.reply_value(ruby, reply)
+    }
+
     fn module_requests(&self, ruby: &Ruby, module_id: i32) -> Result<Value, Error> {
         let JsVal::Array { items, .. } =
             (match self.run(ruby, Request::ModuleRequests { module_id })? {
@@ -4617,6 +4622,13 @@ impl JsModule {
         rb_self.check_live(ruby)?;
         rb_self.core.module_graph_async(ruby, rb_self.module_id)
     }
+    // The module's script id (V8 Module::ScriptId) — what StackFrame#script_id /
+    // an embedder's stack walk names its code by — or nil: a synthetic module, an
+    // errored one.
+    fn script_id(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
+        rb_self.check_live(ruby)?;
+        rb_self.core.module_script_id(ruby, rb_self.module_id)
+    }
     // [[specifier, attributes], …]: the module's requests (V8 GetModuleRequests),
     // each with its import attributes as a Hash, in source order — what linking
     // it will ask its resolve block for. A synthetic module has none.
@@ -5201,6 +5213,7 @@ pub fn install_classes(ruby: &Ruby) -> Result<(), Error> {
     jsmodule.define_method("_status", method!(JsModule::status, 0))?;
     jsmodule.define_method("graph_async?", method!(JsModule::graph_async, 0))?;
     jsmodule.define_method("requests", method!(JsModule::requests, 0))?;
+    jsmodule.define_method("script_id", method!(JsModule::script_id, 0))?;
     jsmodule.define_method("cached_data", method!(JsModule::cached_data, 0))?;
     jsmodule.define_method("cache_rejected?", method!(JsModule::cache_rejected, 0))?;
     jsmodule.define_method("create_code_cache", method!(JsModule::create_code_cache, 0))?;

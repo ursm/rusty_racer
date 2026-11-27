@@ -160,6 +160,12 @@ pub(crate) enum Request {
         export: SyntheticExport,
         timeout_ms: u64,
     },
+    // The module's script id (v8::Module::ScriptId): what a stack frame of its
+    // code names it by (StackFrame::GetScriptId); none for a synthetic module
+    // or an errored one.
+    ModuleScriptId {
+        module_id: i32,
+    },
     // The module's requests (v8::Module::GetModuleRequests): each specifier and
     // its import attributes, in source order.
     ModuleRequests {
@@ -526,6 +532,7 @@ fn request_realm(state: &IsolateState, request: &Request) -> Option<i32> {
         | Request::DisposeContext { .. }
         | Request::ModuleStatus { .. }
         | Request::ModuleRequests { .. }
+        | Request::ModuleScriptId { .. }
         | Request::ModuleGraphAsync { .. }
         | Request::ScriptCodeCache { .. }
         | Request::ModuleCodeCache { .. }
@@ -620,6 +627,7 @@ fn dispatch_one(
             timeout_ms,
         } => op_create_synthetic_module(scope, context_id, filename, export, timeout_ms, outermost),
         Request::ModuleRequests { module_id } => op_module_requests(scope, module_id),
+        Request::ModuleScriptId { module_id } => op_module_script_id(scope, module_id),
         Request::SettleImport {
             import_id,
             settle,
@@ -1765,6 +1773,18 @@ fn op_create_synthetic_module(
         istate!(scope).modules.by_id.remove(&id);
     }
     VmReply::Done(outcome)
+}
+
+// Module#script_id: the module's script id, nil where it has none (a synthetic
+// or an errored module). No context is entered: it reads the module's script.
+fn op_module_script_id(scope: &mut v8::PinScope<'_, '_, ()>, module_id: i32) -> VmReply {
+    let Some((g, _)) = module_handle(istate!(scope), module_id) else {
+        return VmReply::Done(Err(VmError::Runtime("unknown module".into())));
+    };
+    let module = v8::Local::new(scope, &g);
+    VmReply::Done(Ok(module
+        .script_id()
+        .map_or(JsVal::Null, |id| JsVal::Int(i64::from(id)))))
 }
 
 // Module#requests: [[specifier, {key => value, …}], …] — V8's module requests,

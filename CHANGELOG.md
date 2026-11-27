@@ -17,6 +17,10 @@
 - **Import attributes** reach the resolve block of `Module#instantiate` (a third
   argument, `{"type" => "json"}`), and `Module#requests` lists a module's
   requests with theirs without linking it.
+- **`Module#script_id`**: the id V8's stack frames name the module's code by
+  (nil for a synthetic or errored module), so an embedder walking the stack
+  (an embedder linking rusty_racer reads `StackFrame::GetScriptId`) can tell
+  which module script is running — HTML's active script, say.
 - **Synthetic modules:** `Context#synthetic_module(value)`, `(json: text)` —
   ECMA-262's JSON module, parsed by the realm's own `JSON.parse` whatever a page
   made of the global — and `(call: [path, *args])` make a module exporting

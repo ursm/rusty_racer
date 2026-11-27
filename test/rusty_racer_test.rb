@@ -2451,6 +2451,16 @@ class RustyRacerTest < Minitest::Test
     assert m.requests.dig(0, 1).frozen?
   end
 
+  # Module#script_id names a module's script as V8's stack frames do — one per module, nil for a synthetic one.
+  def test_module_script_id
+    a = @ctx.compile_module('export const a = 1;', filename: '/a.js')
+    b = @ctx.compile_module('export const b = 1;', filename: '/a.js')
+    assert_kind_of Integer, a.script_id
+    refute_equal a.script_id, b.script_id
+    assert_nil @ctx.synthetic_module(1, filename: '/s').script_id
+    assert_equal a.script_id, a.script_id
+  end
+
   # nil clears the handler: an import() rejected then.
   def test_dynamic_import_handler_cleared_by_nil
     @iso.dynamic_import_handler = ->(import) { import.reject(1) }
