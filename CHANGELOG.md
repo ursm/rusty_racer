@@ -20,7 +20,9 @@
 - **`Module#script_id`**: the id V8's stack frames name the module's code by
   (nil for a synthetic or errored module), so an embedder walking the stack
   (an embedder linking rusty_racer reads `StackFrame::GetScriptId`) can tell
-  which module script is running — HTML's active script, say.
+  which module script is running — HTML's active script, say. **`Script#script_id`**
+  is a classic script's. Modules or scripts V8's compilation cache shares (one
+  source under one filename) share the id.
 - **Synthetic modules:** `Context#synthetic_module(value)`, `(json: text)` —
   ECMA-262's JSON module, parsed by the realm's own `JSON.parse` whatever a page
   made of the global — and `(call: [path, *args])` make a module exporting

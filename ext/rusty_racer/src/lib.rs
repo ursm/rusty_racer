@@ -4049,6 +4049,11 @@ impl Core {
         code_cache_from_reply(ruby, reply)
     }
 
+    fn unbound_script_id(&self, ruby: &Ruby, script_id: i32) -> Result<Value, Error> {
+        let reply = self.run(ruby, Request::UnboundScriptId { script_id })?;
+        self.reply_value(ruby, reply)
+    }
+
     fn module_code_cache(&self, ruby: &Ruby, module_id: i32) -> Result<Option<Vec<u8>>, Error> {
         let reply = self.run(ruby, Request::ModuleCodeCache { module_id })?;
         code_cache_from_reply(ruby, reply)
@@ -4624,7 +4629,8 @@ impl JsModule {
     }
     // The module's script id (V8 Module::ScriptId) — what StackFrame#script_id /
     // an embedder's stack walk names its code by — or nil: a synthetic module, an
-    // errored one.
+    // errored one. Modules V8's compilation cache shares (the same source and
+    // filename) share it.
     fn script_id(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
         rb_self.check_live(ruby)?;
         rb_self.core.module_script_id(ruby, rb_self.module_id)
@@ -4689,6 +4695,13 @@ impl Script {
     fn run_void(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
         rb_self.check_live(ruby)?;
         rb_self.core.run_script(ruby, rb_self.script_id, true)
+    }
+    // The script's V8 script id (UnboundScript::GetId), as Module#script_id: what
+    // a stack frame of its code names it by. Scripts V8's compilation cache
+    // shares (the same source and origin) share it.
+    fn script_id(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
+        rb_self.check_live(ruby)?;
+        rb_self.core.unbound_script_id(ruby, rb_self.script_id)
     }
     fn cached_data(ruby: &Ruby, rb_self: &Self) -> Value {
         code_cache_value(ruby, rb_self.cached_data.as_ref())
@@ -5174,6 +5187,7 @@ pub fn install_classes(ruby: &Ruby) -> Result<(), Error> {
     let script = module.define_class("Script", ruby.class_object())?;
     script.define_method("run", method!(Script::run, 0))?;
     script.define_method("run_void", method!(Script::run_void, 0))?;
+    script.define_method("script_id", method!(Script::script_id, 0))?;
     script.define_method("cached_data", method!(Script::cached_data, 0))?;
     script.define_method("cache_rejected?", method!(Script::cache_rejected, 0))?;
     script.define_method("create_code_cache", method!(Script::create_code_cache, 0))?;

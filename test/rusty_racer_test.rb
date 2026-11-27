@@ -2461,6 +2461,23 @@ class RustyRacerTest < Minitest::Test
     assert_equal a.script_id, a.script_id
   end
 
+  # Modules V8's compilation cache shares share their script id.
+  def test_module_script_id_shared_by_the_compilation_cache
+    a = @ctx.compile_module('export const a = 1;', filename: '/a.js')
+    b = @ctx.compile_module('export const a = 1;', filename: '/a.js')
+    assert_equal a.script_id, b.script_id
+  end
+
+  # Script#script_id names a classic script as V8's stack frames do — one per
+  # script, shared by the compilation cache as a module's is.
+  def test_script_id
+    a = @ctx.compile('function sa() { return new Error().stack }', filename: '/a.js')
+    b = @ctx.compile('globalThis.sb = 1', filename: '/a.js')
+    assert_kind_of Integer, a.script_id
+    refute_equal a.script_id, b.script_id
+    assert_equal a.script_id, @ctx.compile('function sa() { return new Error().stack }', filename: '/a.js').script_id
+  end
+
   # nil clears the handler: an import() rejected then.
   def test_dynamic_import_handler_cleared_by_nil
     @iso.dynamic_import_handler = ->(import) { import.reject(1) }

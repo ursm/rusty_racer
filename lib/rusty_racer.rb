@@ -247,7 +247,9 @@ module RustyRacer
   # the requests linking it asks its resolve block for, one by one; #script_id,
   # the id V8's stack frames name its code by (StackFrame::GetScriptId) — how an
   # embedder walking the stack tells which module is running — nil for a
-  # synthetic or an errored module.
+  # synthetic or an errored module. Modules V8's compilation cache shares share
+  # it: two compiles of one source under one filename answer the same id
+  # (Script#script_id, a classic script's, likewise).
   class Module
     # instantiate { |specifier, referrer_url, attributes| dependency_module } —
     # the block resolves each import to an already-compiled Module; attributes

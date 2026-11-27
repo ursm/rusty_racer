@@ -231,6 +231,11 @@ pub(crate) enum Request {
     ScriptCodeCache {
         script_id: i32,
     },
+    // The script's V8 script id (v8::UnboundScript::GetId): what a stack frame
+    // of its code names it by (StackFrame::GetScriptId).
+    UnboundScriptId {
+        script_id: i32,
+    },
     ModuleCodeCache {
         module_id: i32,
     },
@@ -535,6 +540,7 @@ fn request_realm(state: &IsolateState, request: &Request) -> Option<i32> {
         | Request::ModuleScriptId { .. }
         | Request::ModuleGraphAsync { .. }
         | Request::ScriptCodeCache { .. }
+        | Request::UnboundScriptId { .. }
         | Request::ModuleCodeCache { .. }
         | Request::HeapStatistics
         | Request::LowMemoryNotification
@@ -672,6 +678,7 @@ fn dispatch_one(
         // can't serialize, or when the realm was reset/disposed out from under
         // the script (its handle is gone): produce nil, not an error.
         Request::ScriptCodeCache { script_id } => op_script_code_cache(scope, script_id),
+        Request::UnboundScriptId { script_id } => op_unbound_script_id(scope, script_id),
         // Same, for a module: get_unbound_module_script gives the shared
         // compiled script, which evaluate() fills with inner-function bytecode.
         // It needs the module's context entered (unlike UnboundScript), so
@@ -1652,6 +1659,24 @@ fn op_script_code_cache(scope: &mut v8::PinScope<'_, '_, ()>, script_id: i32) ->
         }
     };
     VmReply::CodeCache(outcome)
+}
+
+// rusty_v8 doesn't wrap v8::UnboundScript::GetId, so link V8's exported member
+// function directly (`this` is the first argument), as stack.rs does its own.
+unsafe extern "C" {
+    #[link_name = "_ZNK2v813UnboundScript5GetIdEv"]
+    fn v8__UnboundScript__GetId(script: *const v8::UnboundScript) -> i32;
+}
+
+// Script#script_id: the script's V8 script id. No context is entered: it reads
+// the unbound script.
+fn op_unbound_script_id(scope: &mut v8::PinScope<'_, '_, ()>, script_id: i32) -> VmReply {
+    let Some((g, _)) = script_handle(istate!(scope), script_id) else {
+        return VmReply::Done(Err(VmError::Runtime("unknown script".into())));
+    };
+    let unbound = v8::Local::new(scope, &g);
+    let id = unsafe { v8__UnboundScript__GetId(&*unbound) };
+    VmReply::Done(Ok(JsVal::Int(i64::from(id))))
 }
 
 fn op_module_code_cache(scope: &mut v8::PinScope<'_, '_, ()>, module_id: i32) -> VmReply {
