@@ -38,6 +38,15 @@
   the realm that took its id.
 - A two-parameter lambda as a resolve block is still handed two arguments, one
   with an optional or rest parameter as many as it takes.
+- A resolver that raises rejects the `import()` with an `Error` of its own
+  message (it was a generic "import() was not resolved to a module").
+- The attributes a resolve block is handed (and `Module#requests` lists) are
+  frozen Hashes.
+- `host_defined:` refuses a Symbol (`ArgumentError`), as it refuses any value
+  that is no Integer, Float, String, true or false.
+- A `Context` wrapper of an extra realm reads `disposed?` once that realm is
+  disposed through any wrapper — `DynamicImport#context`'s too — and refuses
+  operations as a disposed one does.
 
 ## 0.2.8
 
