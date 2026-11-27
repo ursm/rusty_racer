@@ -148,6 +148,35 @@ pub(crate) enum Request {
         // instead of V8's default lazy top-level-only compile. Ignored when
         // cached_data is set (V8 forbids ConsumeCodeCache + EagerCompile).
         eager: bool,
+        // A primitive its ScriptOrigin carries as host-defined options, which V8
+        // hands the dynamic-import hook of an import() it makes.
+        host_defined: Option<JsVal>,
+    },
+    // A synthetic module (v8::Module::CreateSyntheticModule) exporting
+    // `default` alone, of the value `export` makes, in the context.
+    CreateSyntheticModule {
+        context_id: i32,
+        filename: String,
+        export: SyntheticExport,
+        timeout_ms: u64,
+    },
+    // The module's script id (v8::Module::ScriptId): what a stack frame of its
+    // code names it by (StackFrame::GetScriptId); none for a synthetic module
+    // or an errored one.
+    ModuleScriptId {
+        module_id: i32,
+    },
+    // The module's requests (v8::Module::GetModuleRequests): each specifier and
+    // its import attributes, in source order.
+    ModuleRequests {
+        module_id: i32,
+    },
+    // Settle a waiting import() (ImportReg) with `settle`; replies whether it
+    // was still waiting.
+    SettleImport {
+        import_id: u64,
+        settle: Settle,
+        timeout_ms: u64,
     },
     // instantiate: V8 walks imports, calling back to the Ruby resolve block
     // (parked in the slot for the op) per edge via resolve_imported.
@@ -185,6 +214,7 @@ pub(crate) enum Request {
         cached_data: Option<Vec<u8>>,
         produce_cache: bool,
         eager: bool,
+        host_defined: Option<JsVal>,
     },
     // Bind the script to its context and run it; returns the completion value
     // (unless |void| — see Eval).
@@ -199,6 +229,11 @@ pub(crate) enum Request {
     // — the only way (as of V8-150) to get inner-function bytecode into a cache,
     // since create_code_cache at compile time only sees the top level.
     ScriptCodeCache {
+        script_id: i32,
+    },
+    // The script's V8 script id (v8::UnboundScript::GetId): what a stack frame
+    // of its code names it by (StackFrame::GetScriptId).
+    UnboundScriptId {
         script_id: i32,
     },
     ModuleCodeCache {
@@ -223,6 +258,25 @@ pub(crate) enum Request {
     PumpMessageLoop {
         timeout_ms: u64,
     },
+}
+
+// What a synthetic module's default export is: a value marshalled from Ruby, the
+// value %JSON.parse% makes of a JSON text (ECMA-262 ParseJSONModule), or what
+// the function at a path (as Context#call names one) returns, called with args.
+pub(crate) enum SyntheticExport {
+    Value(JsVal),
+    Json(String),
+    Call { path: String, args: Vec<JsVal> },
+}
+
+// How a waiting import() is settled: with a module (linked by the block
+// DynamicImport#resolve parked, and evaluated), rejected with a value
+// marshalled from Ruby, or rejected with what the function at a path returns
+// (or throws), called with args.
+pub(crate) enum Settle {
+    Module(i32),
+    Reject(JsVal),
+    RejectWith { path: String, args: Vec<JsVal> },
 }
 
 // compile_module result: the module's id plus any produced bytecode cache and
@@ -274,7 +328,7 @@ pub(crate) fn run_source(
     let Some(code) = v8::String::new(tc, source) else {
         return Err(VmError::Parse("source too large".into(), None));
     };
-    let origin = script_origin(tc, filename);
+    let origin = script_origin(tc, filename, None);
     let script = match v8::Script::compile(tc, code, Some(&origin)) {
         Some(script) => script,
         None if tc.has_terminated() => return Err(VmError::Terminated),
@@ -464,7 +518,11 @@ fn request_realm(state: &IsolateState, request: &Request) -> Option<i32> {
         | Request::Attach { context_id, .. }
         | Request::AttachMany { context_id, .. }
         | Request::CompileModule { context_id, .. }
+        | Request::CreateSyntheticModule { context_id, .. }
         | Request::CompileScript { context_id, .. } => Some(*context_id),
+        Request::SettleImport { import_id, .. } => {
+            state.imports.by_id.get(import_id).map(|(_, cid)| *cid)
+        }
         Request::DrainMicrotasks { .. } => Some(0),
         Request::InstantiateModule { module_id, .. }
         | Request::EvaluateModule { module_id, .. }
@@ -478,8 +536,11 @@ fn request_realm(state: &IsolateState, request: &Request) -> Option<i32> {
         | Request::CreateContext
         | Request::DisposeContext { .. }
         | Request::ModuleStatus { .. }
+        | Request::ModuleRequests { .. }
+        | Request::ModuleScriptId { .. }
         | Request::ModuleGraphAsync { .. }
         | Request::ScriptCodeCache { .. }
+        | Request::UnboundScriptId { .. }
         | Request::ModuleCodeCache { .. }
         | Request::HeapStatistics
         | Request::LowMemoryNotification
@@ -554,6 +615,7 @@ fn dispatch_one(
             cached_data,
             produce_cache,
             eager,
+            host_defined,
         } => op_compile_module(
             scope,
             context_id,
@@ -562,7 +624,21 @@ fn dispatch_one(
             cached_data,
             produce_cache,
             eager,
+            host_defined,
         ),
+        Request::CreateSyntheticModule {
+            context_id,
+            filename,
+            export,
+            timeout_ms,
+        } => op_create_synthetic_module(scope, context_id, filename, export, timeout_ms, outermost),
+        Request::ModuleRequests { module_id } => op_module_requests(scope, module_id),
+        Request::ModuleScriptId { module_id } => op_module_script_id(scope, module_id),
+        Request::SettleImport {
+            import_id,
+            settle,
+            timeout_ms,
+        } => op_settle_import(scope, import_id, settle, timeout_ms, outermost),
         Request::InstantiateModule { module_id } => op_instantiate_module(scope, module_id),
         Request::EvaluateModule {
             module_id,
@@ -579,6 +655,7 @@ fn dispatch_one(
             cached_data,
             produce_cache,
             eager,
+            host_defined,
         } => op_compile_script(
             scope,
             context_id,
@@ -587,6 +664,7 @@ fn dispatch_one(
             cached_data,
             produce_cache,
             eager,
+            host_defined,
         ),
         Request::RunScript {
             script_id,
@@ -600,6 +678,7 @@ fn dispatch_one(
         // can't serialize, or when the realm was reset/disposed out from under
         // the script (its handle is gone): produce nil, not an error.
         Request::ScriptCodeCache { script_id } => op_script_code_cache(scope, script_id),
+        Request::UnboundScriptId { script_id } => op_unbound_script_id(scope, script_id),
         // Same, for a module: get_unbound_module_script gives the shared
         // compiled script, which evaluate() fills with inner-function bytecode.
         // It needs the module's context entered (unlike UnboundScript), so
@@ -811,6 +890,9 @@ fn forget_released_handles(scope: &mut v8::PinScope<'_, '_, ()>) {
             }
             Released::Script(id) => {
                 state.scripts.by_id.remove(&id);
+            }
+            Released::Import(id) => {
+                state.imports.by_id.remove(&id);
             }
         }
     }
@@ -1079,6 +1161,7 @@ fn op_compile_module(
     cached_data: Option<Vec<u8>>,
     produce_cache: bool,
     eager: bool,
+    host_defined: Option<JsVal>,
 ) -> VmReply {
     let ctx = context_for(istate!(scope), context_id);
     let outcome = match ctx {
@@ -1090,7 +1173,8 @@ fn op_compile_module(
             match v8::String::new(tc, &source) {
                 None => Err(VmError::Runtime("module source too large".into())),
                 Some(code) => {
-                    let origin = module_origin(tc, &filename);
+                    let options = host_defined_options(tc, host_defined.as_ref());
+                    let origin = module_origin(tc, &filename, options);
                     // Consume a supplied bytecode cache (skip reparse),
                     // eager-compile every function, or compile fresh
                     // (lazy). cached_data wins: V8 forbids combining
@@ -1117,17 +1201,19 @@ fn op_compile_module(
                             } else {
                                 None
                             };
-                            let hash = module.get_identity_hash().get();
-                            let g = v8::Global::new(tc, module);
-                            let weak = v8::Weak::new(tc, module);
-                            let id = {
-                                let m = &mut istate!(tc).modules;
-                                let id = m.next_id;
-                                m.next_id += 1;
-                                m.by_id.insert(id, (g, context_id));
-                                m.add_url(hash, weak, filename.clone());
-                                id
-                            };
+                            let host_defined = host_defined.map(|value| {
+                                let value = jsval_to_js(tc, value);
+                                v8::Global::new(tc, value)
+                            });
+                            let id = register_module(
+                                tc,
+                                module,
+                                context_id,
+                                ModuleOrigin {
+                                    url: filename.clone(),
+                                    host_defined,
+                                },
+                            );
                             Ok(Compiled {
                                 id,
                                 cached_data: produced,
@@ -1456,6 +1542,7 @@ fn op_compile_script(
     cached_data: Option<Vec<u8>>,
     produce_cache: bool,
     eager: bool,
+    host_defined: Option<JsVal>,
 ) -> VmReply {
     let ctx = context_for(istate!(scope), context_id);
     let outcome = match ctx {
@@ -1467,7 +1554,8 @@ fn op_compile_script(
             match v8::String::new(tc, &source) {
                 None => Err(VmError::Runtime("script source too large".into())),
                 Some(code) => {
-                    let origin = script_origin(tc, &filename);
+                    let options = host_defined_options(tc, host_defined.as_ref());
+                    let origin = script_origin(tc, &filename, options);
                     let (mut src, opts) = compile_source(code, &origin, &cached_data, eager);
                     match v8::script_compiler::compile_unbound_script(
                         tc,
@@ -1573,6 +1661,24 @@ fn op_script_code_cache(scope: &mut v8::PinScope<'_, '_, ()>, script_id: i32) ->
     VmReply::CodeCache(outcome)
 }
 
+// rusty_v8 doesn't wrap v8::UnboundScript::GetId, so link V8's exported member
+// function directly (`this` is the first argument), as stack.rs does its own.
+unsafe extern "C" {
+    #[link_name = "_ZNK2v813UnboundScript5GetIdEv"]
+    fn v8__UnboundScript__GetId(script: *const v8::UnboundScript) -> i32;
+}
+
+// Script#script_id: the script's V8 script id. No context is entered: it reads
+// the unbound script.
+fn op_unbound_script_id(scope: &mut v8::PinScope<'_, '_, ()>, script_id: i32) -> VmReply {
+    let Some((g, _)) = script_handle(istate!(scope), script_id) else {
+        return VmReply::Done(Err(VmError::Runtime("unknown script".into())));
+    };
+    let unbound = v8::Local::new(scope, &g);
+    let id = unsafe { v8__UnboundScript__GetId(&*unbound) };
+    VmReply::Done(Ok(JsVal::Int(i64::from(id))))
+}
+
 fn op_module_code_cache(scope: &mut v8::PinScope<'_, '_, ()>, module_id: i32) -> VmReply {
     let mh = module_handle(istate!(scope), module_id);
     let handle = mh.and_then(|(g, cid)| context_for(istate!(scope), cid).map(|cx| (g, cx)));
@@ -1587,4 +1693,259 @@ fn op_module_code_cache(scope: &mut v8::PinScope<'_, '_, ()>, module_id: i32) ->
         }
     };
     VmReply::CodeCache(outcome)
+}
+
+// Context#synthetic_module: a module exporting `default` alone (v8::Module::
+// CreateSyntheticModule — what HTML makes of a JSON, CSS or text module script),
+// filed as a compiled one is, under |filename|; its value made now — JSON
+// parsed (a JSON text that is none: a parse error, as a module's SyntaxError
+// is), a function called — and set as the module evaluates
+// (synthetic_evaluation_steps).
+fn op_create_synthetic_module(
+    scope: &mut v8::PinScope<'_, '_, ()>,
+    context_id: i32,
+    filename: String,
+    export: SyntheticExport,
+    timeout_ms: u64,
+    outermost: bool,
+) -> VmReply {
+    // (…the id it was filed under, taken back where the op ends terminated after all — a watchdog firing once the
+    // function returned — as no wrapper will ever let go of it: op_resolve_function's `registered`)
+    let mut registered = None;
+    let outcome = run_js_bracketed(
+        scope,
+        outermost,
+        timeout_ms,
+        "synthetic_module",
+        |scope, outermost| {
+            let Some(cx) = context_for(istate!(scope), context_id) else {
+                return (
+                    false,
+                    Err(VmError::Runtime("context disposed or unknown".into())),
+                );
+            };
+            let context = v8::Local::new(scope, &cx);
+            let scope = &mut v8::ContextScope::new(scope, context);
+            v8::tc_scope!(let tc, scope);
+            let (ran_js, value) = match export {
+                SyntheticExport::Value(value) => (false, Ok(jsval_to_js(tc, value))),
+                SyntheticExport::Json(text) => match v8::String::new(tc, &text) {
+                    None => (false, Err(VmError::Runtime("JSON source too large".into()))),
+                    Some(text) => match v8::json::parse(tc, text) {
+                        Some(value) => (true, Ok(value)),
+                        None if tc.has_terminated() => (true, Err(VmError::Terminated)),
+                        None => {
+                            let exception = tc.exception();
+                            (
+                                true,
+                                Err(parse_error(
+                                    tc,
+                                    exception,
+                                    None,
+                                    &filename,
+                                    "JSON parse error",
+                                )),
+                            )
+                        }
+                    },
+                },
+                SyntheticExport::Call { path, args } => match resolve_function(tc, &path) {
+                    Err(failure) => (true, Err(failure.unwrap_or_else(|| caught!(&mut *tc)))),
+                    Ok((function, receiver)) => {
+                        let argv: Vec<v8::Local<v8::Value>> =
+                            args.into_iter().map(|a| jsval_to_js(tc, a)).collect();
+                        match function.call(tc, receiver, &argv) {
+                            Some(value) => (true, Ok(value)),
+                            None => (true, Err(caught!(&mut *tc))),
+                        }
+                    }
+                },
+            };
+            let value = match value {
+                Ok(value) => value,
+                Err(e) => return (ran_js, Err(e)),
+            };
+            let (Some(name), Some(default)) = (
+                v8::String::new(tc, &filename),
+                v8::String::new(tc, "default"),
+            ) else {
+                return (
+                    ran_js,
+                    Err(VmError::Runtime("module name too large".into())),
+                );
+            };
+            let module = v8::Module::create_synthetic_module(
+                tc,
+                name,
+                &[default],
+                synthetic_evaluation_steps,
+            );
+            let hash = module.get_identity_hash().get();
+            let (weak, kept) = (v8::Weak::new(tc, module), v8::Global::new(tc, value));
+            istate!(tc).synthetic.add(hash, weak, kept, context_id);
+            let origin = ModuleOrigin {
+                url: filename.clone(),
+                host_defined: None,
+            };
+            let id = register_module(tc, module, context_id, origin);
+            registered = Some(id);
+            // (…what the function queued drained, as any op's at the outermost)
+            auto_drain(tc, outermost);
+            (ran_js, Ok(JsVal::Int(id as i64)))
+        },
+    );
+    if let (Err(_), Some(id)) = (&outcome, registered) {
+        istate!(scope).modules.by_id.remove(&id);
+    }
+    VmReply::Done(outcome)
+}
+
+// Module#script_id: the module's script id, nil where it has none (a synthetic
+// or an errored module). No context is entered: it reads the module's script.
+fn op_module_script_id(scope: &mut v8::PinScope<'_, '_, ()>, module_id: i32) -> VmReply {
+    let Some((g, _)) = module_handle(istate!(scope), module_id) else {
+        return VmReply::Done(Err(VmError::Runtime("unknown module".into())));
+    };
+    let module = v8::Local::new(scope, &g);
+    VmReply::Done(Ok(module
+        .script_id()
+        .map_or(JsVal::Null, |id| JsVal::Int(i64::from(id)))))
+}
+
+// Module#requests: [[specifier, {key => value, …}], …] — V8's module requests,
+// each with its import attributes, as the source has them.
+fn op_module_requests(scope: &mut v8::PinScope<'_, '_, ()>, module_id: i32) -> VmReply {
+    let Some((g, cid)) = module_handle(istate!(scope), module_id) else {
+        return VmReply::Done(Err(VmError::Runtime("unknown module".into())));
+    };
+    let Some(cx) = context_for(istate!(scope), cid) else {
+        return VmReply::Done(Err(VmError::Runtime("module's context is gone".into())));
+    };
+    let context = v8::Local::new(scope, &cx);
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let module = v8::Local::new(scope, &g);
+    let requests = module.get_module_requests();
+    let mut ids = 0u32..;
+    let mut items = Vec::with_capacity(requests.length());
+    for i in 0..requests.length() {
+        let Some(request) = requests
+            .get(scope, i)
+            .and_then(|r| v8::Local::<v8::ModuleRequest>::try_from(r).ok())
+        else {
+            continue;
+        };
+        let specifier = request.get_specifier().to_rust_string_lossy(scope);
+        let attributes = request.get_import_attributes();
+        let entries = import_attributes_of(scope, attributes, 3)
+            .into_iter()
+            .map(|(key, value)| (key, JsVal::Str(value)))
+            .collect();
+        let attributes = JsVal::Obj {
+            id: ids.next().unwrap_or(0),
+            entries,
+        };
+        items.push(JsVal::Array {
+            id: ids.next().unwrap_or(0),
+            items: vec![JsVal::Str(specifier), attributes],
+        });
+    }
+    VmReply::Done(Ok(JsVal::Array {
+        id: ids.next().unwrap_or(0),
+        items,
+    }))
+}
+
+// DynamicImport#resolve / #reject / #reject_with: the waiting import() |import_id|
+// settled — replying whether it was still waiting (its realm reset or disposed,
+// or settled already: it is not). Linking a module runs the resolve block
+// DynamicImport#resolve parked; evaluating it, and a reject_with function, run
+// JS, so this is bracketed as an evaluation is.
+fn op_settle_import(
+    scope: &mut v8::PinScope<'_, '_, ()>,
+    import_id: u64,
+    settle: Settle,
+    timeout_ms: u64,
+    outermost: bool,
+) -> VmReply {
+    let outcome = run_js_bracketed(
+        scope,
+        outermost,
+        timeout_ms,
+        "import",
+        |scope, outermost| {
+            let Some((resolver, cid)) = istate!(scope).imports.by_id.remove(&import_id) else {
+                return (false, Ok(JsVal::Bool(false)));
+            };
+            let Some(cx) = context_for(istate!(scope), cid) else {
+                return (false, Ok(JsVal::Bool(false)));
+            };
+            let context = v8::Local::new(scope, &cx);
+            let scope = &mut v8::ContextScope::new(scope, context);
+            let resolver = v8::Local::new(scope, resolver);
+            match settle {
+                Settle::Module(module_id) => match module_handle(istate!(scope), module_id) {
+                    Some((g, mcid)) if mcid == cid => {
+                        let module = v8::Local::new(scope, &g);
+                        let settling = std::mem::replace(&mut istate!(scope).settling_import, true);
+                        finish_dynamic_import(scope, module, resolver);
+                        istate!(scope).settling_import = settling;
+                    }
+                    Some(_) => reject_with_error(
+                        scope,
+                        resolver,
+                        "import() settled with a module of another realm",
+                    ),
+                    None => reject_with_error(
+                        scope,
+                        resolver,
+                        "import() settled with an unknown module",
+                    ),
+                },
+                Settle::Reject(value) => {
+                    let value = jsval_to_js(scope, value);
+                    resolver.reject(scope, value);
+                }
+                Settle::RejectWith { path, args } => {
+                    v8::tc_scope!(let tc, scope);
+                    let made = match resolve_function(tc, &path) {
+                        Ok((function, receiver)) => {
+                            let argv: Vec<v8::Local<v8::Value>> =
+                                args.into_iter().map(|a| jsval_to_js(tc, a)).collect();
+                            function.call(tc, receiver, &argv)
+                        }
+                        Err(Some(e)) => {
+                            let message = match e {
+                                VmError::Runtime(m) => m,
+                                _ => format!("`{path}` could not be called"),
+                            };
+                            if let Some(message) = v8::String::new(tc, &message) {
+                                let error = v8::Exception::error(tc, message);
+                                tc.throw_exception(error);
+                            }
+                            None
+                        }
+                        Err(None) => None,
+                    };
+                    // (…what the function throws rejects it as well, its value)
+                    match made {
+                        Some(value) => {
+                            resolver.reject(tc, value);
+                        }
+                        None if tc.has_terminated() => {}
+                        None => {
+                            if let Some(exception) = tc.exception() {
+                                resolver.reject(tc, exception);
+                            }
+                        }
+                    }
+                }
+            }
+            if scope.is_execution_terminating() {
+                return (true, Err(VmError::Terminated));
+            }
+            auto_drain(scope, outermost);
+            (true, Ok(JsVal::Bool(true)))
+        },
+    );
+    VmReply::Done(outcome)
 }
